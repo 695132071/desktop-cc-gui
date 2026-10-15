@@ -2350,6 +2350,7 @@ export const en: Messages = {
       serverName: "Server: {{name}}",
       protocol: "Protocol {{version}}",
       toolList: "Tools: {{tools}}",
+      toolListTruncated: "Tools ({{count}} of {{total}} shown): {{tools}}",
       checkedAt: "Checked at {{time}} · {{ms}} ms",
     },
   },

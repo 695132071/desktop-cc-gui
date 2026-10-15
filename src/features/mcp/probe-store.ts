@@ -76,8 +76,8 @@ export const useMcpProbeStore = create<McpProbeStore>((set, get) => ({
     try {
       const result = await mcpApi.probe(entry, workspace);
       // 边界校验：缺字段的响应不能当成「已连接」写进状态，否则一条坏响应
-      // 就会把整个列表画崩。
-      if (!result || typeof result.status !== "string") {
+      // 就会把整个列表画崩（数量展示依赖 `toolCount`，缺了会显示成 NaN）。
+      if (!result || typeof result.status !== "string" || typeof result.toolCount !== "number") {
         throw new Error("MCP 检测返回了无法识别的结果");
       }
       set((state) => ({

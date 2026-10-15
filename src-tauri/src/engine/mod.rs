@@ -1341,7 +1341,7 @@ pub async fn interrupt_session(
         .await
         .map_err(|e| e.to_string())
 }
-/// Answer a pending question card. Five transports share this command:
+/// Answer a pending question card. Multiple transports share this command:
 /// - claude (control protocol): the answers merge into the parked tool input
 ///   and ride stdin as a `control_response`.
 /// - omp (rpc-ui): the parked value carries the dialog method; the answer is
@@ -1352,6 +1352,8 @@ pub async fn interrupt_session(
 /// - grok (ACP) and codex (app-server): the parked value carries the server
 ///   request's JSON-RPC id — codex additionally the question-text→id map its
 ///   protocol answers by; the answer is the response frame on the CLI's stdin.
+/// - Codex 异步提问：app-server item id 是原始 call id；回答通过 `turn/steer`
+///   发送，并由正在运行的 app-server pump 确认。
 /// `answers` maps each question's text to the chosen option label — an array
 /// of labels for multiSelect questions. `None` means the user
 /// skipped/dismissed. Accepts either the run id or the conversation session
@@ -1409,6 +1411,42 @@ pub async fn answer_question(
             .processes
             .write_line(&session_id, frame.to_string())
             .await?;
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.remove(&request_id);
+        }
+        return Ok(());
+    }
+    // Codex 异步提问附在 AgentMessage 上，不是挂起的 JSON-RPC 服务端请求。
+    // 将选择发给当前回合，收到 Codex 确认后再收起提问卡。
+    if let Some(app) = input.get("codexAppAsync") {
+        let rpc_id = codex_app::next_async_question_rpc_id();
+        let frame = codex_app::async_answer_request(app, &rpc_id, answers.as_ref())?;
+        let response = state
+            .processes
+            .register_pending_rpc_reply(&entry.run_id, &rpc_id)?;
+        if let Err(error) = state
+            .processes
+            .write_line(&session_id, frame.to_string())
+            .await
+        {
+            state
+                .processes
+                .remove_pending_rpc_reply(&entry.run_id, &rpc_id);
+            return Err(error);
+        }
+        let reply = tokio::time::timeout(codex_app::ASYNC_QUESTION_REPLY_TIMEOUT, response)
+            .await
+            .map_err(|_| {
+                state
+                    .processes
+                    .remove_pending_rpc_reply(&entry.run_id, &rpc_id);
+                "Codex did not acknowledge the question answer; it is still available to retry"
+                    .to_string()
+            })?
+            .map_err(|_| "Codex app-server stopped before acknowledging the answer".to_string())??;
+        if reply.get("turnId").and_then(Value::as_str).is_none() {
+            return Err("Codex returned an invalid turn/steer response".to_string());
+        }
         if let Ok(mut questions) = entry.questions.lock() {
             questions.remove(&request_id);
         }

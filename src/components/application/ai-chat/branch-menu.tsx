@@ -52,27 +52,30 @@ export function BranchMenu({
     <AriaDialogTrigger isOpen={isOpen} onOpenChange={setOpen}>
       <AriaButton
         ref={triggerRef}
-        className="flex cursor-pointer items-center gap-1 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+        className="flex max-w-full min-w-0 cursor-pointer items-center gap-1 overflow-hidden rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
       >
         <GitMerge
           className="size-3.5 shrink-0 -scale-y-100 text-foreground-icon-tertiary"
           aria-hidden
         />
-        <span className="flex items-center">
+        <span className="flex min-w-0 items-center overflow-hidden">
           {repoName && (
             <>
-              <span className="text-caption-1-medium whitespace-nowrap text-text-secondary">
+              <span className="min-w-0 truncate text-caption-1-medium text-text-secondary">
                 {repoName}
               </span>
               <span
-                className="px-1 text-caption-1-regular text-text-tertiary"
+                className="shrink-0 px-1 text-caption-1-regular text-text-tertiary"
                 aria-hidden
               >
                 ·
               </span>
             </>
           )}
-          <span className="text-caption-1-regular whitespace-nowrap text-text-tertiary">
+          <span
+            title={repoName ? `${repoName} · ${currentName ?? "…"}` : currentName}
+            className="min-w-0 truncate text-caption-1-regular text-text-tertiary"
+          >
             {currentName ?? "…"}
           </span>
           <ChevronDown

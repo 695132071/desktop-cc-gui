@@ -484,7 +484,7 @@ export function StatusBar({
   onBranchSelect?: (name: string) => void;
   folders?: string[];
   selectedFolder?: string;
-  onFolderSelect?: (name: string) => void;
+  onFolderSelect?: (index: number) => void;
   usagePct?: number;
   contextMax?: number;
   contextSegments?: ContextSegment[];
@@ -538,7 +538,7 @@ export function StatusBar({
   );
   return (
     <div className="flex h-[26px] w-full items-center justify-between select-none">
-      <div className="flex items-center gap-3">
+      <div className="flex min-w-0 items-center gap-3">
         {folders && folders.length > 0 && (
           <ProjectFolderMenu
             folders={folders}
@@ -575,7 +575,7 @@ export function StatusBar({
           );
         })}
       </div>
-      <div className="flex items-center gap-3">
+      <div className="flex shrink-0 items-center gap-3">
         <ProxyQuickToggle />
         {/* Context meter is always on: 0% until the first usage report. */}
         <AriaDialogTrigger

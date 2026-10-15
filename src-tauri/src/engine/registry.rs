@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
 // ==================== Process registry ====================
 
@@ -52,7 +52,10 @@ pub struct ChildEntry {
 }
 
 #[derive(Default)]
-pub struct ProcessRegistry(pub Mutex<HashMap<String, ChildEntry>>);
+pub struct ProcessRegistry(
+    pub Mutex<HashMap<String, ChildEntry>>,
+    Mutex<HashMap<(String, String), oneshot::Sender<Result<Value, String>>>>,
+);
 /// Count in-flight runs, not map entries: one run is keyed twice (run id +
 /// session alias), so `map.len()` would halve the real concurrency limit.
 /// Reservations (pid 0, pre-spawn) count too — a spawn storm must not slip
@@ -67,6 +70,72 @@ pub(crate) fn active_run_count(map: &HashMap<String, ChildEntry>) -> usize {
 /// Two concurrent runs of one session must never evict each other's entries:
 /// an evicted child leaks (no key routes an interrupt to it).
 impl ProcessRegistry {
+    /// 注册答题命令需要等待的 JSON-RPC 回复，并按运行 id 隔离 app-server 连接。
+    pub(crate) fn register_pending_rpc_reply(
+        &self,
+        run_id: &str,
+        request_id: &str,
+    ) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = self
+            .1
+            .lock()
+            .map_err(|_| "pending RPC reply state is poisoned".to_string())?;
+        let key = (run_id.to_string(), request_id.to_string());
+        if pending.contains_key(&key) {
+            return Err("a reply is already pending for this RPC request".to_string());
+        }
+        pending.insert(key, sender);
+        Ok(receiver)
+    }
+
+    /// 处理 app-server 读取循环收到的回复。
+    pub(crate) fn resolve_pending_rpc_reply(
+        &self,
+        run_id: &str,
+        request_id: &str,
+        result: Result<Value, String>,
+    ) -> bool {
+        let sender = self
+            .1
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&(run_id.to_string(), request_id.to_string())));
+        match sender {
+            Some(sender) => sender.send(result).is_ok(),
+            None => false,
+        }
+    }
+
+    /// 移除写入失败或等待超时的答题请求。
+    pub(crate) fn remove_pending_rpc_reply(&self, run_id: &str, request_id: &str) {
+        if let Ok(mut pending) = self.1.lock() {
+            pending.remove(&(run_id.to_string(), request_id.to_string()));
+        }
+    }
+
+    /// app-server 回合在回复前结束时，唤醒仍在等待的答题命令。
+    pub(crate) fn settle_pending_rpc_replies(&self, run_id: &str) {
+        let pending = match self.1.lock() {
+            Ok(mut pending) => {
+                let keys: Vec<_> = pending
+                    .keys()
+                    .filter(|(pending_run, _)| pending_run.as_str() == run_id)
+                    .cloned()
+                    .collect();
+                keys.into_iter()
+                    .filter_map(|key| pending.remove(&key))
+                    .collect::<Vec<_>>()
+            }
+            Err(_) => return,
+        };
+        for sender in pending {
+            let _ = sender.send(Err(
+                "Codex turn ended before the answer was acknowledged".to_string(),
+            ));
+        }
+    }
+
     /// Clone the entry registered under `key` (run id or session id).
     pub(crate) fn get(&self, key: &str) -> Option<ChildEntry> {
         self.0.lock().ok().and_then(|map| map.get(key).cloned())

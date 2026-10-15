@@ -2292,6 +2292,7 @@ export const zh = {
       serverName: "服务：{{name}}",
       protocol: "协议 {{version}}",
       toolList: "工具：{{tools}}",
+      toolListTruncated: "工具（共 {{total}} 个，列出前 {{count}} 个）：{{tools}}",
       checkedAt: "检测于 {{time}} · 耗时 {{ms}} ms",
     },
   },

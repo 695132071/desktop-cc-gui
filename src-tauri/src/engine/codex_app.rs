@@ -4,11 +4,10 @@
 //! The exec transport (`codex.rs`) launches the same CLI one-shot: it resolves
 //! its own `requestUserInput` prompts from the defaults baked into the run, so a
 //! question never reaches the app's card UI. The app-server is a resident
-//! JSON-RPC peer instead — it *asks* by sending a server→client request and
-//! parks the turn until an answer arrives on stdin. This module owns that
-//! channel: the pump that reads stdout, the projection of the protocol's items
-//! onto the app's event kinds, and `answer_frame`, the response the shared
-//! answer command writes when the user picks an option.
+//! JSON-RPC peer instead — it asks either with a server→client request that
+//! parks the turn, or with question metadata attached to an `agentMessage`.
+//! Blocking answers return on stdin; async answers steer the active turn. This
+//! module owns the pump, item projection, and both answer routes.
 //!
 //! Wire (verified against the installed CLI, whose shipped JSON schema is the
 //! source of truth here): `initialize {clientInfo}` → `thread/start
@@ -42,7 +41,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,8 +80,11 @@ const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Grace for the CLI to react to `turn/interrupt` with its own terminal
 /// notification before the process tree is killed anyway.
 const INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(super) const ASYNC_QUESTION_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_ASYNC_QUESTION_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 /// What a pump call is waiting for.
+#[derive(Clone, Copy)]
 enum Expect<'a> {
     /// The reply to the request whose id key is carried here.
     Reply(&'a str),
@@ -266,12 +268,12 @@ impl AppServer {
             };
             let id = value.get("id").filter(|id| !id.is_null());
             if value.get("method").is_none() {
-                // A reply. Anything we are not waiting for is dropped: a resume
-                // can deliver a leftover frame for an earlier request.
-                let Expect::Reply(key) = expect else {
-                    continue;
-                };
-                if jsonrpc_id_key(id.unwrap_or(&Value::Null)).as_deref() != Some(key) {
+                // 当前 pump 可能在等待另一个请求或回合结束，因此也要转发未匹配的
+                // 回复；答题命令等待的 turn/steer 确认由这个循环读取 stdout。
+                let expected = matches!(expect, Expect::Reply(key)
+                    if jsonrpc_id_key(id.unwrap_or(&Value::Null)).as_deref() == Some(key));
+                if !expected {
+                    let _ = on_message(&value);
                     continue;
                 }
                 if let Some(error) = value.get("error") {
@@ -303,6 +305,22 @@ impl AppServer {
 /// Classify and project one decoded frame.
 fn route(core: &TurnCore, state: &mut TurnState, view: &mut TurnView, value: &Value) -> Handled {
     let Some(method) = value.get("method").and_then(Value::as_str) else {
+        if let Some(request_id) = value.get("id").and_then(Value::as_str) {
+            let result = if let Some(error) = value.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex rejected the question answer");
+                Err(format!(
+                    "Codex did not accept the question answer: {}",
+                    super::reader::redact_secrets(message)
+                ))
+            } else {
+                Ok(value.get("result").cloned().unwrap_or(Value::Null))
+            };
+            core.registry
+                .resolve_pending_rpc_reply(&core.run_id, request_id, result);
+        }
         return Handled::Ignore;
     };
     let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -510,12 +528,37 @@ fn handle_item(
     let item_id = item.get("id").and_then(Value::as_str);
     match kind {
         "agentMessage" => {
-            if !completed || view.streamed_message.as_deref() == item_id {
+            if !completed {
                 return;
             }
-            let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-            if !text.trim().is_empty() {
-                core.dispatch_event(state, assistant_message(text.to_string()));
+            if view.streamed_message.as_deref() != item_id {
+                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                if !text.trim().is_empty() {
+                    core.dispatch_event(state, assistant_message(text.to_string()));
+                }
+            }
+            let cards = async_question_cards(item);
+            if !cards.is_empty() {
+                let thread_id = thread_id
+                    .map(str::to_string)
+                    .or_else(|| state.native_session_id.clone());
+                if let (Some(request_id), Some(thread_id), Some(turn_id)) = (
+                    item_id.map(str::trim).filter(|id| !id.is_empty()),
+                    thread_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty()),
+                    view.turn_id.as_deref().map(str::trim).filter(|id| !id.is_empty()),
+                ) {
+                    park_async_question(
+                        core,
+                        state,
+                        request_id,
+                        thread_id,
+                        turn_id,
+                        cards,
+                    );
+                }
             }
         }
         // The completed plan item is the AUTHORITATIVE plan body (the schema
@@ -745,6 +788,154 @@ fn park_question(
             json!({ "codexApp": { "rpcId": id, "ids": ids } }),
         );
     }
+}
+
+/// 将 app-server 异步 AgentMessage 提问元数据转换为通用提问卡数据。
+fn async_question_cards(item: &Value) -> Vec<Value> {
+    let Some(questions) = item.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let title = question
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())?;
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .map(|label| json!({ "label": label }))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            Some(json!({
+                "question": title,
+                "header": format!("Q{}", index + 1),
+                "options": options,
+            }))
+        })
+        .collect()
+}
+
+/// 发布异步提问，并保存用户答复时 steer 当前回合所需的 app-server 标识。
+fn park_async_question(
+    core: &TurnCore,
+    state: &mut TurnState,
+    request_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    cards: Vec<Value>,
+) {
+    let input = json!({ "questions": cards });
+    core.dispatch_event(
+        state,
+        EngineEvent::Question {
+            request_id: request_id.to_string(),
+            tool_use_id: Some(request_id.to_string()),
+            input: input.clone(),
+        },
+    );
+    if let Some(entry) = core.registry.get(&core.run_id) {
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.insert(
+                request_id.to_string(),
+                json!({
+                    "codexAppAsync": {
+                        "callId": request_id,
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "questions": input["questions"],
+                    }
+                }),
+            );
+        }
+    }
+}
+
+/// 为异步提问构造 `turn/steer` 请求。
+/// app-server 将这类问题附在 AgentMessage 上，而不是作为挂起的 JSON-RPC
+/// 服务端请求，因此回答作为用户输入发到当前回合，并在文本中保留原始 call id。
+pub(super) fn async_answer_request(
+    parked: &Value,
+    rpc_id: &str,
+    answers: Option<&Value>,
+) -> Result<Value, String> {
+    let call_id = parked
+        .get("callId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "async question context is missing the call id".to_string())?;
+    let thread_id = parked
+        .get("threadId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "async question context is missing the thread id".to_string())?;
+    let turn_id = parked
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "async question context is missing the turn id".to_string())?;
+    let message = match answers {
+        None => format!("The user skipped your async question (call_id: {call_id})."),
+        Some(answers) => {
+            let answer_map = answers
+                .as_object()
+                .ok_or_else(|| "Codex answers must be an object".to_string())?;
+            let question_titles: std::collections::HashSet<&str> = parked
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|question| question.get("question").and_then(Value::as_str))
+                .collect();
+            if let Some(unknown) = answer_map
+                .keys()
+                .find(|title| !question_titles.contains(title.as_str()))
+            {
+                return Err(format!("Codex did not ask a question titled {unknown:?}"));
+            }
+            for value in answer_map.values() {
+                let valid = value.as_str().is_some()
+                    || value
+                        .as_array()
+                        .is_some_and(|labels| labels.iter().all(Value::is_string));
+                if !valid {
+                    return Err("Codex answers must contain strings or arrays of strings".into());
+                }
+            }
+            let encoded = serde_json::to_string(answers)
+                .map_err(|error| format!("serialize Codex answers: {error}"))?;
+            format!(
+                "The user answered your async question (call_id: {call_id}). Answers by question title: {encoded}"
+            )
+        }
+    };
+    Ok(json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "method": "turn/steer",
+        "params": {
+            "threadId": thread_id,
+            "expectedTurnId": turn_id,
+            "input": [{ "type": "text", "text": message }],
+        },
+    }))
+}
+
+pub(super) fn next_async_question_rpc_id() -> String {
+    format!(
+        "ccgui-async-question-{}",
+        NEXT_ASYNC_QUESTION_RPC_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Build the CLI's response to a parked question.
@@ -1242,6 +1433,7 @@ async fn settle(
         }
         super::reader::expire_parked_plans(core, state, &key);
     }
+    core.registry.settle_pending_rpc_replies(&core.run_id);
     // A killed turn is not an error: it was interrupted on purpose, and the
     // marker below only exists to end this pump.
     if let Err(error) = result {
@@ -2362,6 +2554,70 @@ mod tests {
     }
 
     #[test]
+    fn async_question_cards_project_titles_and_string_options() {
+        let cards = async_question_cards(&json!({
+            "questions": [
+                { "title": "  Which route?  ", "options": ["Direct", "Queue"] },
+                { "title": "Free-form?", "options": null },
+                { "title": "   ", "options": ["ignored"] },
+            ],
+        }));
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0]["question"], json!("Which route?"));
+        assert_eq!(cards[0]["header"], json!("Q1"));
+        assert_eq!(
+            cards[0]["options"],
+            json!([{ "label": "Direct" }, { "label": "Queue" }])
+        );
+        assert_eq!(cards[1]["question"], json!("Free-form?"));
+        assert_eq!(cards[1]["options"], json!([]));
+    }
+
+    #[test]
+    fn async_answer_request_steers_the_live_turn_with_the_call_id() {
+        let parked = json!({
+            "callId": "call_123",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "questions": [{ "question": "Which route?", "options": [{ "label": "Direct" }] }],
+        });
+        let frame = async_answer_request(
+            &parked,
+            "ccgui-async-question-7",
+            Some(&json!({ "Which route?": "Direct" })),
+        )
+        .unwrap();
+        assert_eq!(frame["jsonrpc"], json!("2.0"));
+        assert_eq!(frame["id"], json!("ccgui-async-question-7"));
+        assert_eq!(frame["method"], json!("turn/steer"));
+        assert_eq!(frame["params"]["threadId"], json!("thread_1"));
+        assert_eq!(frame["params"]["expectedTurnId"], json!("turn_1"));
+        let text = frame["params"]["input"][0]["text"]
+            .as_str()
+            .expect("steering input is text");
+        assert!(text.contains("call_123"));
+        assert!(text.contains("Which route?"));
+        assert!(text.contains("Direct"));
+    }
+
+    #[test]
+    fn async_answer_request_rejects_unknown_question_titles() {
+        let parked = json!({
+            "callId": "call_123",
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "questions": [{ "question": "Which route?" }],
+        });
+        let error = async_answer_request(
+            &parked,
+            "ccgui-async-question-7",
+            Some(&json!({ "Another question?": "Direct" })),
+        )
+        .unwrap_err();
+        assert!(error.contains("Another question?"), "{error}");
+    }
+
+    #[test]
     fn sandbox_for_mirrors_the_exec_permission_mapping() {
         assert_eq!(sandbox_for(Some("bypass")), "danger-full-access");
         assert_eq!(sandbox_for(Some("manual")), "read-only");
@@ -2604,6 +2860,91 @@ require('node:readline').createInterface({input: process.stdin}).on('line', line
             frame["result"],
             json!({ "answers": { "q1": { "answers": ["Alpha"] } } })
         );
+    }
+
+    #[tokio::test]
+    async fn completed_agent_message_parks_async_question_even_after_text_streamed() {
+        let (core, registry, emitter) = test_core();
+        let mut state = TurnState::new(Some("thread_1".to_string()));
+        let mut view = TurnView {
+            streamed_message: Some("call_123".to_string()),
+            turn_id: Some("turn_1".to_string()),
+            ..TurnView::default()
+        };
+        let handled = route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread_1",
+                    "turnId": "turn_1",
+                    "item": {
+                        "id": "call_123",
+                        "type": "agentMessage",
+                        "text": "Choose one.",
+                        "questions": [{ "title": "Which route?", "options": ["Direct", "Queue"] }],
+                    },
+                },
+            }),
+        );
+        assert!(matches!(handled, Handled::Ignore));
+        let events = flushed(&core, &emitter);
+        let question = events
+            .iter()
+            .find(|(kind, _)| kind == "question")
+            .expect("async questions must reach the card UI");
+        assert_eq!(question.1["requestId"], json!("call_123"));
+        assert_eq!(question.1["toolUseId"], json!("call_123"));
+        assert_eq!(
+            question.1["input"]["questions"][0]["question"],
+            json!("Which route?")
+        );
+        assert!(
+            !events.iter().any(|(kind, _)| kind == "message"),
+            "the already streamed message must not be duplicated"
+        );
+        let entry = registry.get("test-run").expect("registry entry");
+        let parked = entry
+            .questions
+            .lock()
+            .unwrap()
+            .get("call_123")
+            .cloned()
+            .expect("the async answer context must be parked");
+        let app = parked.get("codexAppAsync").expect("async Codex context");
+        assert_eq!(app["threadId"], json!("thread_1"));
+        assert_eq!(app["turnId"], json!("turn_1"));
+        assert_eq!(app["callId"], json!("call_123"));
+        let frame = async_answer_request(
+            app,
+            "ccgui-async-question-8",
+            Some(&json!({ "Which route?": "Queue" })),
+        )
+        .unwrap();
+        assert_eq!(frame["method"], json!("turn/steer"));
+        assert!(frame["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Queue"));
+    }
+
+    #[tokio::test]
+    async fn route_resolves_an_async_question_steer_reply() {
+        let (core, registry, _emitter) = test_core();
+        let reply = registry
+            .register_pending_rpc_reply("test-run", "steer-1")
+            .unwrap();
+        let mut state = TurnState::new(None);
+        let mut view = TurnView::default();
+        route(
+            &core,
+            &mut state,
+            &mut view,
+            &json!({ "jsonrpc": "2.0", "id": "steer-1", "result": { "turnId": "turn_1" } }),
+        );
+        assert_eq!(reply.await.unwrap().unwrap()["turnId"], json!("turn_1"));
     }
 
     #[tokio::test]

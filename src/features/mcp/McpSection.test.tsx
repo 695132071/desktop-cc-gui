@@ -93,11 +93,12 @@ function claudeProject(): McpConfigEntry {
   };
 }
 
-function connectedProbe(tools = ["a"]) {
+function connectedProbe(tools = ["a"], toolCount = tools.length) {
   return {
     status: "connected" as const,
     message: null,
     tools,
+    toolCount,
     serverName: "fake",
     protocolVersion: "2025-06-18",
     elapsedMs: 7,
@@ -480,6 +481,7 @@ describe("McpSection", () => {
         status: "needs_auth",
         message: "服务要求认证（HTTP 401）",
         tools: [],
+        toolCount: 0,
         serverName: null,
         protocolVersion: null,
         elapsedMs: 5,
@@ -513,6 +515,16 @@ describe("McpSection", () => {
     });
   });
 
+  it("shows the declared tool count even when the name list is truncated", async () => {
+    // 详情列表封顶 40 个名字，但数量必须是服务声明的实际总数。
+    const names = Array.from({ length: 40 }, (_, index) => `tool-${index}`);
+    api.probe.mockResolvedValue(connectedProbe(names, 139));
+    await renderSection();
+    await vi.waitFor(() => {
+      expect(document.body.textContent).toContain("已连接 · 139 个工具");
+    });
+  });
+
   it("skips disabled entries and shows the needs-sign-in state", async () => {
     api.inventory.mockResolvedValue(
       payload({
@@ -533,6 +545,7 @@ describe("McpSection", () => {
             status: "needs_auth" as const,
             message: "服务要求认证（HTTP 401）",
             tools: [],
+            toolCount: 0,
             serverName: null,
             protocolVersion: null,
             elapsedMs: 5,
@@ -552,6 +565,7 @@ describe("McpSection", () => {
       status: "failed",
       message: "启动失败：No such file or directory",
       tools: [],
+      toolCount: 0,
       serverName: null,
       protocolVersion: null,
       elapsedMs: 3,

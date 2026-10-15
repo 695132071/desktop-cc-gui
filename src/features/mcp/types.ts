@@ -145,7 +145,10 @@ export type McpProbeStatus = "connected" | "needs_auth" | "failed" | "unsupporte
 export interface McpProbeResult {
   status: McpProbeStatus;
   message: string | null;
+  /** 工具名（最多 40 个，详情列表用）。 */
   tools: string[];
+  /** `tools/list` 声明的工具总数：数量展示用它，不受列表截断影响。 */
+  toolCount: number;
   serverName: string | null;
   protocolVersion: string | null;
   elapsedMs: number;

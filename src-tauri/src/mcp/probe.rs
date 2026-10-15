@@ -19,8 +19,11 @@ use tokio::io::{AsyncReadExt, BufReader};
 const STDIO_TIMEOUT: Duration = Duration::from_secs(25);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(12);
 /// 单行协议消息上限：服务把日志或大对象写到 stdout 时不至于撑爆内存。
-const MAX_LINE: usize = 1 << 20;
-/// tools/list 返回的条目上限。
+/// 与引擎读 CLI stdout 用同一个上限（`engine::MAX_LINE_BYTES`）——合法的
+/// `tools/list` 也可能很大（rea 的 139 个工具实测 ≈1.9 MB），旧值 1 MiB
+/// 会把整条响应丢掉，界面上看起来像「连不上」。
+const MAX_LINE: usize = crate::engine::MAX_LINE_BYTES;
+/// tools/list 详情里最多列出的工具名数量（`tool_count` 计数不受它影响）。
 const MAX_TOOLS: usize = 40;
 const CLIENT_NAME: &str = "ccgui";
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -66,7 +69,11 @@ pub(crate) struct McpProbeResult {
     /// connected | needs_auth | failed | unsupported
     pub status: String,
     pub message: Option<String>,
+    /// 工具名，最多 `MAX_TOOLS` 个（详情列表用）。
     pub tools: Vec<String>,
+    /// `tools/list` 声明的工具总数：不受 `MAX_TOOLS` 截断影响，界面上的
+    /// 数量必须用它（rea 这类服务声明 139 个，列表里只列前 40 个）。
+    pub tool_count: usize,
     pub server_name: Option<String>,
     pub protocol_version: Option<String>,
     pub elapsed_ms: u64,
@@ -94,6 +101,7 @@ impl Default for McpProbeResult {
             status: "failed".to_string(),
             message: None,
             tools: Vec::new(),
+            tool_count: 0,
             server_name: None,
             protocol_version: None,
             elapsed_ms: 0,
@@ -148,6 +156,11 @@ async fn probe_stdio_within(target: &ProbeTarget, timeout: Duration) -> McpProbe
     // 自己的进程组：npx / uvx 还会再拉子进程，收尾时要整组杀掉。
     #[cfg(unix)]
     cmd.process_group(0);
+    // Windows：GUI 进程 spawn 控制台子进程会弹一个可见控制台窗口（uv.exe /
+    // node.exe / cmd.exe 都是控制台程序）。stdio 已重定向，窗口纯属噪音——
+    // 页面「打开即检测」会同时拉起所有 stdio 服务，不压制就满屏窗口。
+    #[cfg(windows)]
+    crate::engine::hide_console(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => return McpProbeResult::failed(format!("启动失败：{error}")),
@@ -157,15 +170,17 @@ async fn probe_stdio_within(target: &ProbeTarget, timeout: Duration) -> McpProbe
         finish_process(pid, &mut child).await;
         return McpProbeResult::failed("无法建立 stdio 通道");
     };
-    let handshake = tokio::time::timeout(timeout, stdio_handshake(&mut stdin, stdout)).await;
+    let mut reader = LineReader::new(stdout);
+    let handshake = tokio::time::timeout(timeout, stdio_handshake(&mut stdin, &mut reader)).await;
     drop(stdin);
     finish_process(pid, &mut child).await;
     match handshake {
         Ok(Ok(result)) => result,
         Ok(Err(message)) => McpProbeResult::failed(message),
         Err(_) => McpProbeResult::failed(format!(
-            "连接超时（{}s 内没完成握手）",
-            timeout.as_secs()
+            "连接超时（{}s 内没完成握手）{}",
+            timeout.as_secs(),
+            overlong_note(&reader)
         )),
     }
 }
@@ -181,18 +196,17 @@ async fn finish_process(pid: u32, child: &mut tokio::process::Child) {
 
 async fn stdio_handshake(
     stdin: &mut tokio::process::ChildStdin,
-    stdout: tokio::process::ChildStdout,
+    reader: &mut LineReader<tokio::process::ChildStdout>,
 ) -> Result<McpProbeResult, String> {
-    let mut reader = LineReader::new(stdout);
     write_message(stdin, &initialize_request()).await?;
-    let initialized = read_result(&mut reader, 1).await?;
+    let initialized = read_result(reader, 1).await?;
     write_message(stdin, &notification("notifications/initialized")).await?;
     write_message(
         stdin,
         &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     )
     .await?;
-    let tools = read_result(&mut reader, 2).await?;
+    let tools = read_result(reader, 2).await?;
     Ok(assemble(initialized, tools))
 }
 
@@ -218,16 +232,27 @@ async fn write_message(
 struct LineReader<R> {
     inner: BufReader<R>,
     buffer: Vec<u8>,
+    /// 单行字节上限（不含换行符）。
+    limit: usize,
     /// 当前行超长：丢弃到下一个换行。
     dropping: bool,
+    /// 超限被整行丢弃的行数：握手失败时用它给出真实原因，而不是
+    /// 「服务没有返回可识别的响应」这种与事实不符的描述。
+    dropped: usize,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
     fn new(inner: R) -> Self {
+        Self::with_limit(inner, MAX_LINE)
+    }
+
+    fn with_limit(inner: R, limit: usize) -> Self {
         Self {
             inner: BufReader::new(inner),
             buffer: Vec::new(),
+            limit,
             dropping: false,
+            dropped: 0,
         }
     }
 
@@ -247,8 +272,9 @@ impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
             }
             if self.dropping {
                 self.buffer.clear();
-            } else if self.buffer.len() > MAX_LINE {
+            } else if self.buffer.len() > self.limit {
                 self.dropping = true;
+                self.dropped += 1;
                 self.buffer.clear();
             }
             let mut chunk = [0u8; 8192];
@@ -269,8 +295,8 @@ impl<R: tokio::io::AsyncRead + Unpin> LineReader<R> {
 
 /// 读到 id 匹配的 JSON-RPC 响应；跳过服务打在 stdout 的日志/横幅与
 /// 无关通知。
-async fn read_result(
-    reader: &mut LineReader<tokio::process::ChildStdout>,
+async fn read_result<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut LineReader<R>,
     id: i64,
 ) -> Result<Value, String> {
     let mut line = Vec::new();
@@ -281,7 +307,7 @@ async fn read_result(
             .await
             .map_err(|error| format!("读取服务输出失败：{error}"))?;
         if read == 0 {
-            return Err("服务在握手完成前结束了".to_string());
+            return Err(format!("服务在握手完成前结束了{}", overlong_note(reader)));
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             continue;
@@ -297,7 +323,20 @@ async fn read_result(
         }
         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
-    Err("服务没有返回可识别的响应".to_string())
+    Err(format!("服务没有返回可识别的响应{}", overlong_note(reader)))
+}
+
+/// 超限被丢弃行的说明：附加在失败原因上，避免把「响应太大被丢弃」写成
+/// 「服务没有返回可识别的响应」这种误导性描述。
+fn overlong_note<R: tokio::io::AsyncRead + Unpin>(reader: &LineReader<R>) -> String {
+    if reader.dropped == 0 {
+        return String::new();
+    }
+    format!(
+        "（有 {} 行输出超过 {} MiB 上限，已被丢弃）",
+        reader.dropped,
+        reader.limit / (1024 * 1024)
+    )
 }
 
 // ===== HTTP / SSE =====
@@ -481,9 +520,9 @@ fn assemble(initialized: Value, tools: Value) -> McpProbeResult {
         .and_then(|info| info.get("name"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    result.tools = tools
-        .get("tools")
-        .and_then(Value::as_array)
+    let items = tools.get("tools").and_then(Value::as_array);
+    result.tool_count = items.map_or(0, Vec::len);
+    result.tools = items
         .map(|items| {
             items
                 .iter()

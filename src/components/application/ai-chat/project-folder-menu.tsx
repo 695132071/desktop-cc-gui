@@ -34,7 +34,10 @@ export function ProjectFolderMenu({
   /** Workspace folder display names, e.g. "desktop-cc-gui". */
   folders: string[];
   selectedName?: string;
-  onSelect?: (name: string) => void;
+  /** Receives the index into `folders`, not the name: duplicate display
+   *  names (identical aliases or folder basenames) must still resolve to
+   *  the entry the user actually clicked. */
+  onSelect?: (index: number) => void;
 }) {
   const { t } = useTranslation();
   // `isNonModal` popovers don't dismiss on outside press and don't toggle
@@ -45,11 +48,14 @@ export function ProjectFolderMenu({
     <AriaDialogTrigger isOpen={isOpen} onOpenChange={setOpen}>
       <AriaButton
         ref={triggerRef}
-        className="flex cursor-pointer items-center gap-1 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+        className="flex max-w-full min-w-0 cursor-pointer items-center gap-1 overflow-hidden rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
       >
         <FolderSymlink className="size-3.5 shrink-0 text-foreground-icon-tertiary" aria-hidden />
-        <span className="flex items-center">
-          <span className="text-caption-1-regular whitespace-nowrap text-text-tertiary">
+        <span className="flex min-w-0 items-center overflow-hidden">
+          <span
+            title={selectedName}
+            className="min-w-0 truncate text-caption-1-regular text-text-tertiary"
+          >
             {selectedName ?? t("chat.noProjectSelected")}
           </span>
           <ChevronDown
@@ -75,13 +81,13 @@ export function ProjectFolderMenu({
               {t("chat.workspaces")}
             </span>
             <div className="flex max-h-64 w-full flex-col gap-1 overflow-y-auto">
-              {folders.map((folder) => (
+              {folders.map((folder, index) => (
                 <button
-                  key={folder}
+                  key={index}
                   type="button"
                   aria-pressed={folder === selectedName}
                   onClick={() => {
-                    onSelect?.(folder);
+                    onSelect?.(index);
                     close();
                   }}
                   className={cx(

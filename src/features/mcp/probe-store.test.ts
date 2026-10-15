@@ -41,6 +41,7 @@ function connected(tools: string[] = []): McpProbeResult {
     status: "connected",
     message: null,
     tools,
+    toolCount: tools.length,
     serverName: "fake",
     protocolVersion: "2025-06-18",
     elapsedMs: 4,
@@ -88,6 +89,17 @@ describe("probe store", () => {
     api.probe.mockRejectedValueOnce(new Error("boom"));
     await useMcpProbeStore.getState().probe(entry(), null);
     expect(useMcpProbeStore.getState().error).toBe("boom");
+  });
+
+  it("rejects a response without the tool count instead of drawing a broken badge", async () => {
+    api.probe.mockResolvedValueOnce({
+      ...connected(["a"]),
+      toolCount: undefined,
+    } as unknown as McpProbeResult);
+    await useMcpProbeStore.getState().probe(entry(), null);
+    const state = useMcpProbeStore.getState();
+    expect(state.results[entry().id]).toBeUndefined();
+    expect(state.error).toContain("无法识别");
   });
 
   it("runs checks in parallel up to the cap, then reuses fresh results", async () => {

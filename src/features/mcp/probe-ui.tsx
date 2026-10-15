@@ -48,8 +48,8 @@ export function ProbeStatusChip({ entry }: { entry: McpConfigEntry }) {
     return (
       <span className={cx(BADGE, TONE.connected)} title={result.serverName ?? undefined}>
         <Check className="size-3" aria-hidden />
-        {result.tools.length > 0
-          ? t("mcp.probe.connectedTools", { count: result.tools.length })
+        {result.toolCount > 0
+          ? t("mcp.probe.connectedTools", { count: result.toolCount })
           : t("mcp.probe.connected")}
       </span>
     );
@@ -162,7 +162,13 @@ export function ProbeDetail({
           ) : null}
           {state.result.tools.length > 0 ? (
             <p className="break-all font-mono text-caption-1-regular text-text-tertiary">
-              {t("mcp.probe.toolList", { tools: state.result.tools.join(", ") })}
+              {state.result.toolCount > state.result.tools.length
+                ? t("mcp.probe.toolListTruncated", {
+                    total: state.result.toolCount,
+                    count: state.result.tools.length,
+                    tools: state.result.tools.join(", "),
+                  })
+                : t("mcp.probe.toolList", { tools: state.result.tools.join(", ") })}
             </p>
           ) : null}
           <p className="text-caption-1-regular text-text-tertiary">
