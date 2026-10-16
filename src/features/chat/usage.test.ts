@@ -124,6 +124,18 @@ describe("mergeUsage", () => {
     });
 });
 
+  it("folds a window-only report into the previous tokens instead of replacing them", () => {
+    const merged = mergeUsage(
+      { contextWindow: 1_000_000, model_context_window: 1_000_000 },
+      { input_tokens: 900_000, output_tokens: 50, total_tokens: 900_050, model_context_window: 200_000 },
+    );
+    expect(merged).toMatchObject({
+      input_tokens: 900_000,
+      total_tokens: 900_050,
+      model_context_window: 1_000_000,
+    });
+  });
+
 describe("usageBreakdown", () => {
   /** 验证空用量安全返回 null */
   it("returns null when usage cannot be parsed", () => {
