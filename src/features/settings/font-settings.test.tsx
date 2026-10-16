@@ -429,11 +429,14 @@ describe("General section rows", () => {
     platform.isWeb = true;
     await mount({ fontFamily: "custom", fontFile: "/tmp/desktop-only.ttf" });
     const trigger = row("fontFamily").querySelector("button")!;
-    expect(trigger.textContent).toContain(i18n.t("settings.fontDefault"));
+    // Web 端读不到上传文件，但下拉框仍如实显示「自定义」（禁用态），不伪装成默认。
+    expect(trigger.textContent).toContain(i18n.t("settings.fontCustom"));
     await press(trigger);
     const options = [...document.querySelectorAll('[role="option"]')].map((el) => el.textContent?.trim());
     expect(options).toContain(i18n.t("settings.fontCustomFamily"));
-    expect(options).not.toContain(i18n.t("settings.fontCustom"));
+    expect(options).toContain(i18n.t("settings.fontCustom"));
+    const uploadOption = [...document.querySelectorAll('[role="option"]')].find((el) => el.textContent?.trim() === i18n.t("settings.fontCustom"))!;
+    expect(uploadOption.getAttribute("aria-disabled")).toBe("true");
     const familyOption = [...document.querySelectorAll('[role="option"]')].find((el) => el.textContent?.trim() === i18n.t("settings.fontCustomFamily"))!;
     await press(familyOption);
     await editSize("fontFamily", '"Microsoft YaHei", sans-serif');

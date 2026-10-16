@@ -643,7 +643,7 @@ function FontFamilyRow({
   const normalized = normalizeFontMode(value);
   const uploaded = normalized === CUSTOM_FONT_VALUE;
   const savedText = uploaded ? "" : normalized;
-  const savedMode = uploaded ? (isWeb ? "default" : "custom") : normalized ? "family" : "default";
+  const savedMode = uploaded ? "custom" : normalized ? "family" : "default";
   const [pendingMode, setPendingMode] = useState<"custom" | "family" | null>(null);
   const [text, setText] = useState(savedText);
   const [invalid, setInvalid] = useState(false);
@@ -678,7 +678,12 @@ function FontFamilyRow({
               setPendingMode("family");
             } else if (key === "custom") {
               setPendingMode("custom");
-              if (filePath && !uploaded) void onModeChange(CUSTOM_FONT_VALUE);
+              if (filePath && !uploaded) {
+                void onModeChange(CUSTOM_FONT_VALUE).then((saved) => {
+                  // 保存失败时回退到实际生效的选项，与 default 分支行为一致。
+                  if (!saved) setPendingMode(null);
+                });
+              }
             } else {
               setPendingMode(null);
               setText("");
@@ -688,7 +693,11 @@ function FontFamilyRow({
           triggerClassName={SELECT_TRIGGER}
         >
           <SelectItem id="default">{t("settings.fontDefault")}</SelectItem>
-          {!isWeb && <SelectItem id="custom">{t("settings.fontCustom")}</SelectItem>}
+          {(!isWeb || uploaded) && (
+            <SelectItem id="custom" isDisabled={isWeb}>
+              {t("settings.fontCustom")}
+            </SelectItem>
+          )}
           <SelectItem id="family">{t("settings.fontCustomFamily")}</SelectItem>
         </Select>
         <Collapsible open={mode === "family"} seconds={0.2} className="w-full">
