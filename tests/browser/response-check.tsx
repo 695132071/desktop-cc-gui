@@ -70,10 +70,18 @@ const SCENARIOS: Record<string, Scenario> = {
     ],
     expected: { verdict: "match", visible: true },
   },
+  daily: {
+    label: "日构建版本",
+    events: [
+      { kind: "launch", data: { model: "ds4.1", effort: null } },
+      { kind: "served", data: { model: "deepseek/ds4.1-1017", effort: null } },
+    ],
+    expected: { verdict: "match", visible: true },
+  },
   unreported: {
     label: "未上报",
     events: [{ kind: "launch", data: { model: "claude-opus-5-5", effort: "xhigh" } }],
-    expected: { verdict: "unknown", visible: false },
+    expected: { verdict: "unknown", visible: true },
   },
   settled: {
     label: "已结算",
