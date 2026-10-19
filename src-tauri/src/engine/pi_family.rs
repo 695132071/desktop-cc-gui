@@ -162,6 +162,16 @@ if (SERVED_MODEL_FILE) {
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
 		const response = await originalFetch(...args);
+		const input = args[0];
+		const url =
+			typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.href
+					: (input as Request).url;
+		if (!/(?:\/responses|\/chat\/completions|\/messages|\/complete)(?:[?#]|$)/.test(url)) {
+			return response;
+		}
 		try {
 			const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 			if (contentType.includes("text/event-stream")) {
