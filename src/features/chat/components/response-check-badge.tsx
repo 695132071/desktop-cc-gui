@@ -19,8 +19,8 @@ import {
  * when it does not. Hovering opens the same rows as a card, mirroring how
  * a gateway reports "requested vs upstream".
  *
- * Renders nothing until a side was actually reported — an absent report is
- * unknown, never a pass.
+ * Renders nothing until the run reported a request side — an absent response
+ * side stays unknown ("未上报"), never a pass.
  */
 export function ResponseCheckBadge({
   check,

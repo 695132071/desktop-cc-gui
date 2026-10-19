@@ -857,18 +857,19 @@ fn parse_pi_family_line(line: &str, out: &mut Vec<EngineEvent>) {
             }
             // What actually served the turn, when the runtime can tell:
             // `upstreamModel` is the id recovered from the response itself
-            // (thinking signature / router), while `model` is the runtime's
-            // record — which becomes the served id on a server-side fallback.
-            // Emitted as evidence; a runtime that knows nothing reports
-            // nothing rather than echoing the request.
+            // (thinking signature / router). `model` is only the runtime's
+            // request record — for OpenAI-compatible providers it stays the
+            // requested id, so treating it as served would echo the request
+            // and make the check pass without any response evidence. Emit
+            // only the recovered id; a runtime that knows nothing reports
+            // nothing.
             let served_model = value
                 .get("message")
                 .and_then(|m| m.get("upstreamModel"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .or_else(|| reported_model.clone());
+                .map(str::to_string);
             if served_model.is_some() || reported_effort.is_some() {
                 out.push(EngineEvent::Served {
                     model: served_model,
@@ -1352,8 +1353,9 @@ mod tests {
             "got {out:?}"
         );
 
-        // No upstream id recovered: the runtime's record is the served model
-        // (it becomes the fallback target on a server-side fallback).
+        // No upstream id recovered: `message.model` is the runtime's request
+        // record, not evidence of what served the turn. Echoing it here made
+        // the response check report the request as its own response.
         let mut out = Vec::new();
         parse_pi_family_line(
             &serde_json::json!({
@@ -1364,9 +1366,25 @@ mod tests {
             &mut out,
         );
         assert!(
+            !out.iter()
+                .any(|e| matches!(e, EngineEvent::Served { model: Some(_), .. })),
+            "the requested id must not be reported as served: {out:?}"
+        );
+
+        // Effort is still independent evidence even when the model is unknown.
+        let mut out = Vec::new();
+        parse_pi_family_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "model": "kimi-k2", "thinking_effort": "high" }
+            })
+            .to_string(),
+            &mut out,
+        );
+        assert!(
             out.iter().any(|e| matches!(
                 e,
-                EngineEvent::Served { model: Some(model), effort: None } if model == "kimi-k2"
+                EngineEvent::Served { model: None, effort: Some(level) } if level == "high"
             )),
             "got {out:?}"
         );

@@ -39,7 +39,7 @@ export interface ResponseCheckView {
   /** "mismatch" when a reported side disagrees; "unknown" when a request
    *  alias is unresolved or nothing is comparable; otherwise "match". */
   verdict: "match" | "mismatch" | "unknown";
-  /** Visible when evidence can be compared or an alias needs clarification. */
+  /** Visible when the run reported a request side or evidence can be compared. */
   visible: boolean;
 }
 
@@ -59,7 +59,10 @@ function snapshotFree(model: string): string {
   return model
     .replace(/-latest$/, "")
     .replace(/-\d{8}$/, "")
-    .replace(/-\d{4}-\d{2}-\d{2}$/, "");
+    .replace(/-\d{4}-\d{2}-\d{2}$/, "")
+    // Aggregators also stamp daily builds as `-MMDD` (`ds4.1-1017`); it is a
+    // date revision of the same family, not a substituted model.
+    .replace(/-\d{4}$/, "");
 }
 
 export function compareModel(
@@ -112,10 +115,15 @@ export function checkResponseSelection(
         : model !== "unknown" || effort !== "unknown"
           ? "match"
           : "unknown";
+  // A reported request with no response evidence still has something to say:
+  // the card shows the requested side and marks the missing side unreported.
+  // Hiding it made an engine that never reports a served id look verified.
+  const requestedReported =
+    requested.model !== null || requested.effort !== null;
   return {
     model,
     effort,
     verdict,
-    visible: verdict !== "unknown" || unresolvedAlias,
+    visible: requestedReported || verdict !== "unknown" || unresolvedAlias,
   };
 }
