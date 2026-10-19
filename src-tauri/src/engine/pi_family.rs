@@ -1524,7 +1524,7 @@ mod tests {
             })
             .to_string(),
             &mut out,
-            Some(&run_id),
+            Some(run_id.as_str()),
         );
         let _ = std::fs::remove_file(&path);
         assert!(
