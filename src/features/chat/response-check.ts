@@ -11,11 +11,11 @@
  *    reroute target.
  *
  * A side that never reported stays `null` and can never produce a verdict:
- * an unreported field is unknown, not a pass. Comparisons tolerate the
- * naming variants a gateway legitimately introduces (a provider prefix, a
- * `-latest`/date snapshot suffix, `xhigh` vs `extra-high`) — a snapshot
- * difference is a "variant", not a substitution — while a genuine
- * difference stays a mismatch.
+ * an unreported field is unknown, not a pass. Only the provider prefix and
+ * the picker's `[1m]` tag are ignored — the bare model name, including any
+ * date/build suffix, must match exactly (`deepseek-v4.1-flash` and
+ * `deepseek-v4.1-flash-1017` are different ids). Reasoning levels remain
+ * separator/case-insensitive (`xhigh` vs `extra-high`).
  */
 
 export interface SelectionSide {
@@ -31,7 +31,7 @@ export interface ResponseCheckState {
   served: SelectionSide;
 }
 
-export type SelectionVerdict = "match" | "variant" | "mismatch" | "unknown";
+export type SelectionVerdict = "match" | "mismatch" | "unknown";
 
 export interface ResponseCheckView {
   model: SelectionVerdict;
@@ -54,26 +54,12 @@ function bareModel(id: string): string {
   return bare.replace(/\[1m\]$/, "");
 }
 
-/** `-latest` and dated snapshots name the same family. */
-function snapshotFree(model: string): string {
-  return model
-    .replace(/-latest$/, "")
-    .replace(/-\d{8}$/, "")
-    .replace(/-\d{4}-\d{2}-\d{2}$/, "")
-    // Aggregators also stamp daily builds as `-MMDD` (`ds4.1-1017`); it is a
-    // date revision of the same family, not a substituted model.
-    .replace(/-\d{4}$/, "");
-}
-
 export function compareModel(
   requested: string | null,
   served: string | null,
 ): SelectionVerdict {
   if (!requested || !served) return "unknown";
-  const a = bareModel(requested);
-  const b = bareModel(served);
-  if (a === b) return "match";
-  return snapshotFree(a) === snapshotFree(b) ? "variant" : "mismatch";
+  return bareModel(requested) === bareModel(served) ? "match" : "mismatch";
 }
 
 /** Separator/case-insensitive; `extra-high` is the same level as `xhigh`. */

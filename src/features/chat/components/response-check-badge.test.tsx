@@ -92,21 +92,22 @@ describe("ResponseCheckBadge", () => {
     expect(button.className).toContain("text-foreground-icon-quaternary");
   });
 
-  it("treats a dated snapshot as the requested family, not a substitution", () => {
+  it("flags a date-suffixed id as a different model", () => {
     render({
       requested: { model: "claude-opus-4-5", effort: null },
       served: { model: "claude-opus-4-5-20251101", effort: null },
     });
-    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应一致");
+    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应不一致");
+    expect(trigger()!.className).toContain("text-text-warning-primary");
   });
 
-  it("treats a daily -MMDD build as a dated variant", () => {
+  it("flags a daily build suffix as a different model", () => {
     render({
-      requested: { model: "ds4.1", effort: null },
-      served: { model: "deepseek/ds4.1-1017", effort: null },
+      requested: { model: "ds/deepseek-v4.1-flash", effort: null },
+      served: { model: "deepseek/deepseek-v4.1-flash-1017", effort: null },
     });
-    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应一致");
-    expect(trigger()!.className).not.toContain("text-text-warning-primary");
+    expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：与响应不一致");
+    expect(trigger()!.className).toContain("text-text-warning-primary");
   });
 
   it("keeps a green check when the model matches but effort is unreported", () => {

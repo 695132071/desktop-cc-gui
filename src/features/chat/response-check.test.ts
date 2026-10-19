@@ -15,18 +15,18 @@ describe("compareModel", () => {
     );
   });
 
-  it("reads a dated snapshot as a variant of the requested family", () => {
+  it("treats a date or build suffix as a different model id", () => {
     expect(compareModel("claude-opus-4-5", "claude-opus-4-5-20251101")).toBe(
-      "variant",
+      "mismatch",
     );
     expect(compareModel("claude-opus-4-5-latest", "claude-opus-4-5")).toBe(
-      "variant",
+      "mismatch",
     );
-    // Aggregators also use a daily -MMDD build suffix.
-    expect(compareModel("ds4.1", "ds4.1-1017")).toBe("variant");
+    // Only the provider prefix is ignored; the id itself must match exactly.
     expect(
-      compareModel("deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-1017"),
-    ).toBe("variant");
+      compareModel("ds/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-1017"),
+    ).toBe("mismatch");
+    expect(compareModel("ds4.1", "ds4.1-1017")).toBe("mismatch");
   });
 
   it("flags a different model", () => {
