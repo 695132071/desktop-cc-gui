@@ -1176,6 +1176,10 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     if state.awaiting_followup {
         crate::mcp::mark_run_ended(&ctx.core.run_id);
     }
+    // The provider-model sidecar belongs to this run only.
+    let _ = std::fs::remove_file(crate::engine::pi_family::served_models_path(
+        &ctx.core.run_id,
+    ));
     // Pending questions die with the run: settle their cards so the UI never
     // leaves an answerable question pointing at a dead process.
     for key in [

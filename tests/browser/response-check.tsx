@@ -78,6 +78,14 @@ const SCENARIOS: Record<string, Scenario> = {
     ],
     expected: { verdict: "match", visible: true },
   },
+  gateway: {
+    label: "网关实际模型",
+    events: [
+      { kind: "launch", data: { model: "happycoding/deepseek-v4.1-flash", effort: "max" } },
+      { kind: "served", data: { model: "deepseek/deepseek-v4.1-flash-1017", effort: null } },
+    ],
+    expected: { verdict: "match", visible: true },
+  },
   unreported: {
     label: "未上报",
     events: [{ kind: "launch", data: { model: "claude-opus-5-5", effort: "xhigh" } }],
