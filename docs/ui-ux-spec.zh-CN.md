@@ -53,7 +53,7 @@
 - 用户可见文案一律从 `src/i18n/zh.ts`、`src/i18n/en.ts` 取，两个语言文件同步新增 key，组件里不写死中文。
 - 图标按钮必须同时有 `aria-label`（可访问名）和 `title`（指针悬停）。可访问名用**动作名**（"刷新"、"重新加载"），不用"点这里"。
 - 需要解释性文案、快捷键或多行说明时才用 `Tooltip`（`src/components/base/tooltip/tooltip.tsx`）：它基于 react-aria，trigger 必须是 react-aria 组件或包在 `Focusable` 里的元素；触屏上不可达，所以**关键信息不能只放在 tooltip 里**。
-- 原生 `title` 提示由 `NativeTitleTooltip`（`src/components/base/tooltip/native-title-tooltip.tsx`，挂在 `App.tsx`）全局接管：它监听 `document.body`（覆盖 portal 到 body 的右键菜单、对话框），把 `title` 文案搬进 `data-native-tooltip` 并置空原属性，改渲染与 `TooltipContent` 同一视觉的气泡（500ms 延迟、150ms 进入过渡、`z-[130]`，高于对话框 z-110 / 右键菜单 z-120），同时把文案复制为 `aria-description` 保住读屏描述。写控件时仍直接写 `title` 即可，不要手动操作 `data-native-tooltip`；Esc / 滚动 / 按下 / 目标卸载都会收起。
+- 原生 `title` 提示由 `NativeTitleTooltip`（`src/components/base/tooltip/native-title-tooltip.tsx`，挂在 `App.tsx`）全局接管：它监听 `document.body`（覆盖 portal 到 body 的右键菜单、对话框），把 `title` 文案搬进 `data-native-tooltip` 并置空原属性，改渲染与 `TooltipContent` 同一视觉的气泡（500ms 延迟、150ms 进入过渡、`z-[100001]`）。**气泡必须高于 react-aria 自己的弹层**：它给 Popover 的默认 `z-index` 是 100000（实测），原值 `z-[130]` 只考虑了对话框 z-110 / 右键菜单 z-120，于是弹层内部的 `title`（例如状态栏分支列表的行）悬停时气泡被弹层整个盖住，而弹层外的同类元素看起来完全正常——排查时先量两者的 `z-index` 与「气泡中心最上层元素」再改样式。它同时把文案复制为 `aria-description` 保住读屏描述。写控件时仍直接写 `title` 即可，不要手动操作 `data-native-tooltip`；Esc / 滚动 / 按下 / 目标卸载都会收起。
 
 ### 2.4 展开 / 收起动效
 
@@ -296,7 +296,7 @@ const feedback = useRunningFeedback(store.loading);
 
 | 版本 | 时间 | 内容 |
 |---|---|---|
-| v0.85 | 2026-10-21 | 状态栏分支列表新增搜索过滤（复用 `git.searchBranches` 占位与 `git.noMatchingBranches` 空态，打开即聚焦、关闭清空过滤条件）与被截断行名的原生 `title` 全名提示；搜索框与滚动列表平级；焦点随打开进入弹层，Esc 从此可关闭该弹层；§3 更新 |
+| v0.85 | 2026-10-21 | 状态栏分支列表新增搜索过滤（复用 `git.searchBranches` 占位与 `git.noMatchingBranches` 空态，打开即聚焦、关闭清空过滤条件）与整行原生 `title` 全名提示；搜索框是弹层第一个元素、与滚动列表平级；焦点随打开进入弹层，Esc 从此可关闭该弹层；另修原生 `title` 气泡被 react-aria 弹层（默认 z-index 100000）盖住的问题——气泡与弹层重叠时提示完全不可见；§2.3、§3 更新 |
 | v0.84 | 2026-10-16 | 字体设置新增独立「自定义字体族」分类（仅占位示例），保留上传分类；统一聊天代码、编辑器、差异视图和终端的代码字体/字号，补齐字体加载后量度与 PTY 尺寸同步；§2、§3 更新 |
 | v0.83 | 2026-10-10 | 首启缺前提的三个表面统一：①「新建会话」在零工作区时登记目录后**接着开出待发会话**（`use-chat-sidebar.ts` 的 `handleAddWorkspace` 返回选中路径，`handleNewSession` 链式 `startNewChat`，与 worktree 创建完成的既有范式一致；取消选择不留空标签页）；②发送键的「前置条件未满足」禁用改为 `aria-disabled` + 点击守卫 + 解释性 tooltip（`Composer` / `ComposerToolbar` 新增 `disabledReason`，原生 `disabled` 收不到 hover 读不到提示）；③空态按前提分流（零工作区说「还没有工作区，请先在侧栏添加」+ 下一步指引，有工作区无会话才说「选择或新建一个会话开始」）；④无归属草稿（`drafts[""]`，新增 `UNBOUND_DRAFT_KEY`）在第一个会话建立时搬到该会话键上并清空键（只搬一次、不覆盖目标已有草稿），同一状态下输入框占位提示改口说明缺什么。另修 Claude 的 1M 变体后缀：`<家族>[1m]` 命中 `ANTHROPIC_DEFAULT_<家族>_MODEL` 时，启动模型与 `comparisonModel` 都保留后缀（与渠道侧 `claude_channel` 的既有行为对齐）；DSH 驱动读取 `request/context` 的 `contextWindow`（模型目录与 TokenUsage 都不带窗口），usage 与回合结束载荷带上真实窗口，用量环不再回落 200k 假定值。§3 补规则 |
 | v0.82 | 2026-10-10 | 输入框支持粘贴文件：从 Finder / Explorer 复制的文件与拖拽同一条路由（图片成附件，其他文件变 `@path` 引用），新增 `clipboard_file_paths` 原生探测（macOS NSPasteboard file URL / Windows CF_HDROP），事件自带 `text/uri-list` 时兜底；截图字节管线与纯文本粘贴行为不变；§3 补规则 |
