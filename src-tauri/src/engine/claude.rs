@@ -21,6 +21,11 @@ pub struct ClaudeEngine {
     /// Post-compaction remaining context tokens from `compact_boundary` event,
     /// used to report accurate post-compaction usage instead of the turn's billing usage.
     compact_post_tokens: Mutex<Option<i64>>,
+    /// A `task_notification` with status `stopped` was just seen: a resumed
+    /// process stops its predecessor's background task and reports that as an
+    /// empty zero-turn `result` before it answers the new message. That result
+    /// ends nothing the user asked for.
+    stopped_task_result_pending: Mutex<bool>,
 }
 
 struct PendingTool {
@@ -37,6 +42,7 @@ impl ClaudeEngine {
             tool_names: Mutex::new(HashMap::new()),
             tool_paths: Mutex::new(HashMap::new()),
             compact_post_tokens: Mutex::new(None),
+            stopped_task_result_pending: Mutex::new(false),
         }
     }
 }
@@ -281,6 +287,18 @@ impl Engine for ClaudeEngine {
                             .unwrap_or_default();
                         out.push(EngineEvent::McpServers { servers, tools });
                     }
+                } else if subtype == Some("task_notification") {
+                    if value.get("status").and_then(Value::as_str) == Some("stopped") {
+                        if let Ok(mut lock) = self.stopped_task_result_pending.lock() {
+                            *lock = true;
+                        }
+                    }
+                } else if subtype == Some("background_tasks_changed") {
+                    let pending = value
+                        .get("tasks")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    out.push(EngineEvent::BackgroundTasks { pending });
                 } else if subtype == Some("compact_boundary") {
                     if let Some(post_tokens) = value
                         .get("compactMetadata")
@@ -412,6 +430,23 @@ impl Engine for ClaudeEngine {
                 }
             }
             "result" => {
+                let stopped_task_result = self
+                    .stopped_task_result_pending
+                    .lock()
+                    .map(|mut lock| std::mem::take(&mut *lock))
+                    .unwrap_or(false);
+                if stopped_task_result
+                    && value.get("num_turns").and_then(Value::as_u64) == Some(0)
+                    && value.get("is_error").and_then(Value::as_bool) != Some(true)
+                    // Absent or blank: a CLI variant that omits `result` on
+                    // this bookkeeping line must not resurrect the old bug.
+                    && value
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map_or(true, |text| text.trim().is_empty())
+                {
+                    return;
+                }
                 // Structured fallback: the final result lists every denial
                 // of the turn. The frontend dedupes against the tool_result
                 // signal above (same path), so double-reporting is harmless.

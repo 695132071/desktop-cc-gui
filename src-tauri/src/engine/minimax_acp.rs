@@ -1110,6 +1110,7 @@ mod tests {
             engine_id: "minimax".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         (core, registry, emitter)
     }

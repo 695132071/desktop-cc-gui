@@ -910,6 +910,7 @@ mod tests {
             engine_id: "opencode".to_string(),
             run_id: "oc-test-run".to_string(),
             db: None,
+            followup: None,
         };
         // The virtual registry entry the host path creates at send time.
         registry.insert(
