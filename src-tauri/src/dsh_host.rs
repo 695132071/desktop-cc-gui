@@ -57,12 +57,20 @@ const RING_CAP: usize = 8192;
 /// dies with the process, and a host that is killed mid-turn (app exit tears
 /// down its kill-on-close job, `dsh_host_stop`, or an outside kill) leaves no
 /// other trace of why a turn was cut — which is exactly the case this file
-/// exists for.
+/// exists for. The newest `LOG_KEEP_RUNS` files survive; older runs are dropped
+/// on the next spawn.
 const LOG_DIR: &str = "dsh-host-logs";
 /// Rotate one log file at this size so a wedged or chatty host cannot grow it
 /// without bound. The rotated copy keeps the last window before rotation.
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const LOG_KEEP_SUFFIX: &str = ".1";
+/// Per-run logs kept on disk, newest first by the epoch in the file name; older
+/// runs are dropped on the next spawn. One log per spawn means a crash-restart
+/// loop would otherwise only ever grow the directory. A run holds at most
+/// `2 * LOG_MAX_BYTES` (the file plus its `.1`), so the directory stays under
+/// `(LOG_KEEP_RUNS + 1) * 8 MB` — 72 MB here — while still keeping the last few
+/// spawns a diagnosis wants to compare.
+const LOG_KEEP_RUNS: usize = 8;
 /// Launch-token exchange retries while the host finishes binding its
 /// listener: the token line can land before the HTTP server answers.
 const TOKEN_EXCHANGE_ATTEMPTS: usize = 6;
@@ -608,6 +616,10 @@ fn dsh_bin(settings: &AppSettings) -> String {
 struct HostLog {
     path: PathBuf,
     file: Mutex<Option<File>>,
+    /// Bytes written to `path`. Every access happens while `file`'s lock is
+    /// held — that is what makes the over-budget check and the rotation atomic
+    /// with respect to a second drain. Keep both inside the lock; `Relaxed` is
+    /// sufficient only because the lock serializes all of them.
     written: AtomicU64,
 }
 
@@ -616,10 +628,7 @@ impl HostLog {
     /// the epoch (in which case the spawn path skips the sink entirely).
     fn path_for(home: &Path, now: SystemTime) -> Option<PathBuf> {
         let epoch = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
-        Some(
-            home.join(LOG_DIR)
-                .join(format!("dsh-host-{epoch}.log")),
-        )
+        Some(home.join(LOG_DIR).join(run_log_name(epoch)))
     }
 
     /// Open the sink at `path`, creating the directory on the way. Existing
@@ -655,7 +664,54 @@ impl HostLog {
 
     /// Open the sink for a run spawned now, or `None` when it cannot be named.
     fn for_new_run() -> Option<Arc<Self>> {
-        Self::path_for(&crate::paths::app_home(), SystemTime::now()).map(Self::open)
+        Self::for_new_run_at(&crate::paths::app_home(), SystemTime::now())
+    }
+
+    /// `for_new_run` with an injectable home and clock (tests drive a temp one).
+    ///
+    /// Pruning runs before the file is created, so it can never look at the run
+    /// it is about to start — nor at a file a backwards clock would judge oldest
+    /// and delete while we are writing into it.
+    ///
+    /// Boundary this does not cover: two respawns inside the same second share
+    /// one file name, so two sinks with two separate locks can still rotate over
+    /// each other. `ensure` is serialized and the 401 retry path waits 600 ms, so
+    /// it stays a boundary rather than something worth a process-wide registry.
+    fn for_new_run_at(home: &Path, now: SystemTime) -> Option<Arc<Self>> {
+        let path = Self::path_for(home, now)?;
+        if let Some(dir) = path.parent() {
+            Self::prune_old_runs(dir, LOG_KEEP_RUNS);
+        }
+        Some(Self::open(path))
+    }
+
+    /// Remove all but the newest `keep` run logs in `dir`, `.1` rotations with
+    /// them. Ordered by the epoch in the file name, not mtime: appends move
+    /// mtime and any copy or restore rewrites it, while the name records the
+    /// spawn this file exists for. Failures are ignored — a log we cannot delete
+    /// (a viewer holding it open on Windows) must never fail a spawn.
+    ///
+    /// A run started before a clock jump backwards can be judged oldest and
+    /// deleted while it is still writing. On Windows the open handle usually
+    /// makes that delete fail silently, and the cost is bounded either way: the
+    /// sink stays usable and the file is retried on the next spawn.
+    fn prune_old_runs(dir: &Path, keep: usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // no directory yet (first run) or unreadable: nothing to prune
+        };
+        let mut runs: Vec<(u64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                Some((run_log_epoch(entry.file_name().to_str()?)?, path))
+            })
+            .collect();
+        runs.sort_unstable_by(|a, b| b.0.cmp(&a.0)); // newest first
+        for (_, path) in runs.into_iter().skip(keep) {
+            // A dropped run's rotated sibling belongs to it; a kept run's stays.
+            let _ = std::fs::remove_file(rotated_path(&path));
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Append one drained line, rotating first when the file is over budget.
@@ -664,11 +720,18 @@ impl HostLog {
     }
 
     /// `line` with an explicit rotation budget (tests drive a small one).
+    ///
+    /// The over-budget check sits **inside** the write lock: stdout and stderr
+    /// drain through two independent tasks into this one sink, so a check taken
+    /// outside the lock let both rotate — the second archived the fresh empty
+    /// file over `.1`, and the retained window (the only trace a killed host
+    /// leaves) was gone. Deciding and rotating under one lock makes every
+    /// rotation cost exactly one written window.
     fn line_capped(&self, line: &str, max_bytes: u64) {
+        let mut guard = lock(&self.file);
         if self.written.load(Ordering::Relaxed) > max_bytes {
-            self.rotate();
+            self.rotate_locked(&mut guard);
         }
-        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
         let Some(file) = guard.as_mut() else {
             return;
         };
@@ -684,18 +747,12 @@ impl HostLog {
     }
 
     /// Move the current file aside as `<path>.1` (replacing the previous
-    /// rotation) and continue in a fresh one. Called from the drain task only.
-    fn rotate(&self) {
-        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+    /// rotation) and continue in a fresh one. The caller already holds the write
+    /// lock — that is what stops a second drain from rotating the file this one
+    /// just created.
+    fn rotate_locked(&self, guard: &mut Option<File>) {
         *guard = None;
-        let rotated = self.path.with_extension(format!(
-            "{}{LOG_KEEP_SUFFIX}",
-            self.path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("log")
-        ));
-        let _ = std::fs::rename(&self.path, &rotated);
+        let _ = std::fs::rename(&self.path, rotated_path(&self.path));
         *guard = OpenOptions::new()
             .create(true)
             .append(true)
@@ -703,6 +760,28 @@ impl HostLog {
             .ok();
         self.written.store(0, Ordering::Relaxed);
     }
+}
+
+/// `<file>.1`: where a rotation parks the previous window. Rotation and pruning
+/// share it, so changing the name shape cannot leave rotated copies behind.
+fn rotated_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}{LOG_KEEP_SUFFIX}",
+        path.extension().and_then(|ext| ext.to_str()).unwrap_or("log")
+    ))
+}
+
+/// Run-log file name (`dsh-host-<epoch>.log`) and the parse back to its spawn
+/// epoch: naming and pruning share one judgement so they cannot drift apart.
+fn run_log_name(epoch: u64) -> String {
+    format!("dsh-host-{epoch}.log")
+}
+
+fn run_log_epoch(name: &str) -> Option<u64> {
+    name.strip_prefix("dsh-host-")?
+        .strip_suffix(".log")?
+        .parse()
+        .ok()
 }
 
 /// 一行 host 输出在落盘前是否要脱敏：启动令牌行换成固定标记。识别器复用
@@ -1183,6 +1262,124 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "third line that is long enough\n"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// stdout 与 stderr 各跑一个 drain 任务（Tauri 的 tokio 是多线程 runtime，两者
+    /// 真并发），而超预算判断原先在锁外：两个 drain 会各自认定「该轮转」，第二次轮转
+    /// 把刚建好、几乎为空的文件改名覆盖 `.1`——正好毁掉这份日志唯一要留的「死前
+    /// 窗口」。这里由测试线程先持锁，把交错逼到近似确定：两个线程都先穿过判断、再卡在
+    /// 锁上（200ms 等待窗），解锁后旧实现几乎必然各轮转一次（修复后只会轮转一次）；
+    /// 调度极不配合时旧实现可能侥幸通过，但修复后的实现在任何调度下都通过。
+    #[test]
+    fn host_log_rotates_once_when_two_drains_hit_the_budget() {
+        let home = std::env::temp_dir().join(format!(
+            "ccgui-next-host-log-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = HostLog::path_for(&home, SystemTime::now()).unwrap();
+        let log = HostLog::open(path.clone());
+        // Two lines take the file over the 16-byte budget.
+        log.line_capped("first line\n", 16);
+        log.line_capped("second line\n", 16);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "first line\nsecond line\n"
+        );
+
+        let held = lock(&log.file);
+        let entered = Arc::new(AtomicU64::new(0));
+        let mut drains = Vec::new();
+        for line in ["from stdout\n", "from stderr\n"] {
+            let log = Arc::clone(&log);
+            let entered = Arc::clone(&entered);
+            drains.push(std::thread::spawn(move || {
+                entered.fetch_add(1, Ordering::Relaxed);
+                log.line_capped(line, 16);
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while entered.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(200)); // let both park on the lock
+        drop(held);
+        for drain in drains {
+            drain.join().unwrap();
+        }
+
+        // The window from before the budget was hit must survive as `.1`, and
+        // both drains' lines must land in the fresh file.
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("log.1")).unwrap(),
+            "first line\nsecond line\n"
+        );
+        let fresh = std::fs::read_to_string(&path).unwrap();
+        assert!(fresh.contains("from stdout\n"), "{fresh}");
+        assert!(fresh.contains("from stderr\n"), "{fresh}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 一次 spawn 一份日志、只轮转不回收：崩溃重启循环会把 dsh-host-logs 一直撑大。
+    /// 按文件名里的 epoch（不是 mtime）保留最近 LOG_KEEP_RUNS 份，被淘汰那份的 `.1`
+    /// 一起删，当前这轮与解析不出 epoch 的文件都不碰。
+    #[test]
+    fn host_log_prunes_older_runs_beyond_the_keep_count() {
+        let home = std::env::temp_dir().join(format!(
+            "ccgui-next-host-log-prune-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir = home.join(LOG_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let epochs: Vec<u64> = (0..LOG_KEEP_RUNS as u64 + 2)
+            .map(|index| 1_791_979_000 + index)
+            .collect();
+        for epoch in &epochs {
+            std::fs::write(dir.join(run_log_name(*epoch)), "line\n").unwrap();
+        }
+        // Rotations: the dropped run's `.1` goes with it, a kept run's stays.
+        let oldest_rotation = dir.join(format!("{}{LOG_KEEP_SUFFIX}", run_log_name(epochs[0])));
+        let newest_rotation = dir.join(format!(
+            "{}{LOG_KEEP_SUFFIX}",
+            run_log_name(epochs[epochs.len() - 1])
+        ));
+        std::fs::write(&oldest_rotation, "rotated\n").unwrap();
+        std::fs::write(&newest_rotation, "rotated\n").unwrap();
+        let stranger = dir.join("notes.txt");
+        std::fs::write(&stranger, "keep me\n").unwrap();
+
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_979_847);
+        let current = HostLog::for_new_run_at(&home, now).unwrap();
+
+        assert!(current.path.exists());
+        // The two oldest runs go; the third-oldest survives with its rotation.
+        assert!(!dir.join(run_log_name(epochs[0])).exists());
+        assert!(!oldest_rotation.exists());
+        assert!(dir.join(run_log_name(epochs[2])).exists());
+        assert!(newest_rotation.exists());
+        assert!(stranger.exists());
+        let runs = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| run_log_epoch(&entry.file_name().to_string_lossy()).is_some())
+            .count();
+        assert_eq!(runs, LOG_KEEP_RUNS + 1); // keep + the run we just started
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// 首次运行（日志目录还不存在）不能因为「没有目录可清理」而出错：prune 早退，
+    /// 建目录由 open 负责。
+    #[test]
+    fn first_run_without_a_log_directory_still_opens_the_sink() {
+        let home = std::env::temp_dir().join(format!(
+            "ccgui-next-host-log-first-{}",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(!home.join(LOG_DIR).exists(), "前提：目录还不存在");
+        let now = SystemTime::now();
+        let log = HostLog::for_new_run_at(&home, now).unwrap();
+        log.line("first words\n");
+        assert_eq!(std::fs::read_to_string(&log.path).unwrap(), "first words\n");
         let _ = std::fs::remove_dir_all(&home);
     }
 

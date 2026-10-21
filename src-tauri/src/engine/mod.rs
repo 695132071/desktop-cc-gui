@@ -3406,7 +3406,25 @@ mod plan_respond_tests {
         );
     }
 
-    /// cat 子进程把收到的帧落进文件,返回 (child, stdin, 输出路径)。
+    /// 一个把 stdin 原样转到 stdout 的子进程；stdout 落进文件，返回
+    /// (child, stdin, 输出路径)。Unix 用 `cat`；Windows 没有 `cat`，而 `more`
+    /// 会分页并把制表符展开——这三个用例断言的是应用写进原生进程的帧，任何改写
+    /// 都会让断言失去意义，所以让 PowerShell 逐字节复制标准流。
+    fn frame_sink_command() -> tokio::process::Command {
+        if cfg!(windows) {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())",
+            ]);
+            command
+        } else {
+            tokio::process::Command::new("cat")
+        }
+    }
+
     fn spawn_frame_sink(
         tag: &str,
     ) -> (
@@ -3419,7 +3437,7 @@ mod plan_respond_tests {
             std::process::id()
         ));
         let out_file = std::fs::File::create(&out_path).unwrap();
-        let mut child = tokio::process::Command::new("cat")
+        let mut child = frame_sink_command()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::from(out_file))
             .spawn()
