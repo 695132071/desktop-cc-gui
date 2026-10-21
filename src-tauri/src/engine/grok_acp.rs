@@ -582,6 +582,7 @@ mod tests {
             engine_id: "grok".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         (core, registry, emitter)
     }

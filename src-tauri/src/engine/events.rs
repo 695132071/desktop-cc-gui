@@ -163,6 +163,10 @@ pub enum EngineEvent {
         servers: Vec<(String, Option<String>)>,
         tools: Vec<String>,
     },
+    /// Number of background tasks (`run_in_background` Bash/agents) the CLI
+    /// still has running. While non-zero, a `Done` is deferred: the CLI starts
+    /// a follow-up turn on its own when the task finishes. Not streamed.
+    BackgroundTasks { pending: usize },
 }
 /// One todo entry carried to the frontend.
 #[derive(Debug, Clone, Serialize)]
