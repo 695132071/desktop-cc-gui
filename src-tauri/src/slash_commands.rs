@@ -88,7 +88,7 @@ pub(crate) fn parse_meta_line(
 /// renders are read; a `name:` override is honored by the caller via
 /// `name_override`. Unterminated frontmatter means the file has none.
 fn parse_command_frontmatter(content: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let mut segments = content.split_inclusive('\n');
+    let mut segments = content.split_inclusive('\n').peekable();
     let Some(first_segment) = segments.next() else {
         return (None, None, None);
     };
@@ -98,7 +98,7 @@ fn parse_command_frontmatter(content: &str) -> (Option<String>, Option<String>, 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut argument_hint: Option<String> = None;
-    for segment in segments {
+    while let Some(segment) = segments.next() {
         let line = segment.trim_end_matches(['\r', '\n']);
         let trimmed = line.trim();
         if trimmed == "---" {
@@ -110,11 +110,38 @@ fn parse_command_frontmatter(content: &str) -> (Option<String>, Option<String>, 
         // `name` is parsed inline (not via parse_meta_line) so the file can
         // override the path-derived command name.
         if let Some((key, value)) = trimmed.split_once(':') {
-            if key.trim().eq_ignore_ascii_case("name") {
-                if let Some(value) = sanitize_meta_value(value) {
+            let key = key.trim().to_ascii_lowercase();
+            let raw_val = value.trim();
+            if key == "name" {
+                if let Some(value) = sanitize_meta_value(raw_val) {
                     name = Some(value);
                 }
                 continue;
+            } else if key == "description" {
+                if matches!(raw_val, ">" | "|" | ">+" | ">-" | "|+" | "|-") {
+                    let mut collected: Vec<String> = Vec::new();
+                    while let Some(peeked) = segments.peek() {
+                        let peek_line = peeked.trim_end_matches(['\r', '\n']);
+                        let peek_trimmed = peek_line.trim();
+                        if peek_trimmed == "---" {
+                            break;
+                        }
+                        if peek_trimmed.is_empty() {
+                            segments.next();
+                            continue;
+                        }
+                        if peek_line.starts_with(' ') || peek_line.starts_with('\t') {
+                            collected.push(peek_trimmed.to_string());
+                            segments.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !collected.is_empty() {
+                        description = Some(collected.join(" "));
+                    }
+                    continue;
+                }
             }
         }
         parse_meta_line(trimmed, &mut description, &mut argument_hint);
@@ -224,39 +251,114 @@ fn merge_entries_by_priority(sources: Vec<Vec<SlashCommandEntry>>) -> Vec<SlashC
     merged
 }
 
-/// Command directories in priority order: the workspace's `.claude/commands`
-/// first, then the CLI config home's `commands` (honors CLAUDE_CONFIG_DIR —
-/// the same root the history scanner reads).
+/// Candidate workspace-relative directories for commands, in priority order:
+/// Claude (`.claude/commands`), Agents (`.agents/commands`), Codex (`.codex/commands`),
+/// pi/omp (`.agent/commands`), and generic hidden/visible `commands` directories.
+const WORKSPACE_COMMAND_SUBPATHS: &[&[&str]] = &[
+    &[".claude", "commands"],
+    &[".agents", "commands"],
+    &[".codex", "commands"],
+    &[".agent", "commands"],
+    &[".commands"],
+    &["commands"],
+];
+
+/// Candidate workspace-relative directories for skills, in priority order:
+/// - Claude Code (`.claude/skills`)
+/// - Codex CLI and Open Agent standard (`.agents/skills`)
+/// - Codex (`.codex/skills`)
+/// - Project hidden skills (`.skills`)
+/// - Project visible skills (`skills`)
+/// - pi / omp (`.agent/skills`)
+/// - Cursor (`.cursor/skills`)
+/// - GitHub Copilot (`.github/skills`)
+const WORKSPACE_SKILL_SUBPATHS: &[&[&str]] = &[
+    &[".claude", "skills"],
+    &[".agents", "skills"],
+    &[".codex", "skills"],
+    &[".skills"],
+    &["skills"],
+    &[".agent", "skills"],
+    &[".cursor", "skills"],
+    &[".github", "skills"],
+];
+
+/// Command directories in priority order: workspace-relative candidate directories
+/// first, then global homes for Claude, Agents, and Codex. Deduplicates paths that
+/// resolve to the same canonical directory.
 fn commands_dirs(workspace_root: &Path) -> Vec<(PathBuf, &'static str)> {
     let mut dirs: Vec<(PathBuf, &'static str)> = Vec::new();
-    let workspace_dir = workspace_root.join(".claude").join("commands");
-    if workspace_dir.is_dir() {
-        dirs.push((workspace_dir, "workspace"));
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+
+    for parts in WORKSPACE_COMMAND_SUBPATHS {
+        let mut dir = workspace_root.to_path_buf();
+        for part in *parts {
+            dir.push(part);
+        }
+        if dir.is_dir() {
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if seen_paths.insert(canonical) {
+                dirs.push((dir, "workspace"));
+            }
+        }
     }
-    let global_dir =
+
+    let claude_global =
         crate::engine::engine_home(Some("CLAUDE_CONFIG_DIR"), ".claude").join("commands");
-    if global_dir.is_dir() {
-        dirs.push((global_dir, "global"));
+    if claude_global.is_dir() {
+        let canonical = claude_global.canonicalize().unwrap_or_else(|_| claude_global.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((claude_global, "global"));
+        }
+    }
+    let agents_global = crate::engine::engine_home(None, ".agents").join("commands");
+    if agents_global.is_dir() {
+        let canonical = agents_global.canonicalize().unwrap_or_else(|_| agents_global.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((agents_global, "global"));
+        }
+    }
+    let codex_global = crate::engine::codex_home().join("commands");
+    if codex_global.is_dir() {
+        let canonical = codex_global.canonicalize().unwrap_or_else(|_| codex_global.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((codex_global, "global"));
+        }
     }
     dirs
 }
 
-/// Skill directories in priority order: the workspace's `.claude/skills`
-/// first, then the global homes of every CLI the picker can drive —
+/// Skill directories in priority order: workspace-relative candidate directories
+/// first (Claude, Codex, Open Agent standard, root skills, pi/omp, cursor, copilot),
+/// then the global homes of every CLI the picker can drive —
 /// Claude (`$CLAUDE_CONFIG_DIR/skills`), Codex (`$CODEX_HOME/skills` plus
 /// its built-in `.system` tree), the cross-agent `~/.agents/skills`, and
 /// Codex plugin-bundled skills under `$CODEX_HOME/plugins/cache`. `is_dir`
 /// follows symlinks, so cc-switch-managed links inside these roots resolve.
 fn skills_dirs(workspace_root: &Path) -> Vec<(PathBuf, &'static str)> {
     let mut dirs: Vec<(PathBuf, &'static str)> = Vec::new();
-    let workspace_dir = workspace_root.join(".claude").join("skills");
-    if workspace_dir.is_dir() {
-        dirs.push((workspace_dir, "workspace"));
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+
+    for parts in WORKSPACE_SKILL_SUBPATHS {
+        let mut dir = workspace_root.to_path_buf();
+        for part in *parts {
+            dir.push(part);
+        }
+        if dir.is_dir() {
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if seen_paths.insert(canonical) {
+                dirs.push((dir, "workspace"));
+            }
+        }
     }
+
     let claude_global =
         crate::engine::engine_home(Some("CLAUDE_CONFIG_DIR"), ".claude").join("skills");
     if claude_global.is_dir() {
-        dirs.push((claude_global, "global"));
+        let canonical = claude_global.canonicalize().unwrap_or_else(|_| claude_global.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((claude_global, "global"));
+        }
     }
     let codex_home = crate::engine::codex_home();
     let codex_skills = codex_home.join("skills");
@@ -264,14 +366,25 @@ fn skills_dirs(workspace_root: &Path) -> Vec<(PathBuf, &'static str)> {
     // personal ones; both are global scope.
     for dir in [codex_skills, codex_home.join("skills").join(".system")] {
         if dir.is_dir() {
-            dirs.push((dir, "global"));
+            let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if seen_paths.insert(canonical) {
+                dirs.push((dir, "global"));
+            }
         }
     }
     let agents_dir = crate::engine::engine_home(None, ".agents").join("skills");
     if agents_dir.is_dir() {
-        dirs.push((agents_dir, "global"));
+        let canonical = agents_dir.canonicalize().unwrap_or_else(|_| agents_dir.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((agents_dir, "global"));
+        }
     }
-    dirs.extend(codex_plugin_skills_dirs(&codex_home));
+    for (plugin_dir, source) in codex_plugin_skills_dirs(&codex_home) {
+        let canonical = plugin_dir.canonicalize().unwrap_or_else(|_| plugin_dir.clone());
+        if seen_paths.insert(canonical) {
+            dirs.push((plugin_dir, source));
+        }
+    }
     dirs
 }
 
@@ -312,52 +425,77 @@ pub(crate) fn codex_plugin_skills_dirs(codex_home: &Path) -> Vec<(PathBuf, &'sta
 }
 
 /// Discover skills directly under a skills dir: each child directory with
-/// a `SKILL.md` is one skill. Name comes from the frontmatter `name:`
-/// override, else the directory name; description from frontmatter. Skills
-/// take no argument hint — the CLI resolves the body itself.
+/// a `SKILL.md` (or `skill.md`) is one skill. Category directories without
+/// a manifest are recursed boundedly (depth <= 3). Name comes from frontmatter
+/// `name:` override, else directory name; description from frontmatter.
 fn discover_skills_in(dir: &Path, source: &str) -> Vec<SlashCommandEntry> {
     let mut out: Vec<SlashCommandEntry> = Vec::new();
+    discover_skills_in_internal(dir, source, 0, &mut out);
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn discover_skills_in_internal(
+    dir: &Path,
+    source: &str,
+    depth: usize,
+    out: &mut Vec<SlashCommandEntry>,
+) {
+    if depth > 3 {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return out,
+        Err(_) => return,
     };
     for entry in entries.flatten() {
-        let skill_dir = entry.path();
-        let is_dir = std::fs::metadata(&skill_dir)
+        let path = entry.path();
+        let is_dir = std::fs::metadata(&path)
             .map(|m| m.is_dir())
             .unwrap_or(false);
         if !is_dir {
             continue;
         }
-        let manifest = skill_dir.join("SKILL.md");
-        let content = match std::fs::read_to_string(&manifest) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let (name, description, _argument_hint) = parse_command_frontmatter(&content);
-        let resolved = name.or_else(|| {
-            skill_dir
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(|value| value.to_string())
-        });
-        let Some(resolved) = resolved else {
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let normalized = resolved.trim().trim_start_matches('/').to_string();
-        if normalized.is_empty() {
+        // Skip hidden directories (except .system used by Codex) and non-skill trees.
+        if (file_name.starts_with('.') && file_name != ".system")
+            || file_name == "node_modules"
+            || file_name == "target"
+        {
             continue;
         }
-        out.push(SlashCommandEntry {
-            name: normalized,
-            description,
-            argument_hint: None,
-            source: source.to_string(),
-            kind: SlashEntryKind::Skill,
-        });
+        let manifest = if path.join("SKILL.md").is_file() {
+            Some(path.join("SKILL.md"))
+        } else if path.join("skill.md").is_file() {
+            Some(path.join("skill.md"))
+        } else {
+            None
+        };
+        if let Some(manifest_path) = manifest {
+            let content = match std::fs::read_to_string(&manifest_path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            let (name, description, _argument_hint) = parse_command_frontmatter(&content);
+            let resolved = name.unwrap_or_else(|| file_name.to_string());
+            let normalized = resolved.trim().trim_start_matches('/').to_string();
+            if normalized.is_empty() {
+                continue;
+            }
+            out.push(SlashCommandEntry {
+                name: normalized,
+                description,
+                argument_hint: None,
+                source: source.to_string(),
+                kind: SlashEntryKind::Skill,
+            });
+        } else {
+            // Recurse into subdirectories (e.g. category subfolders like engineering/...)
+            discover_skills_in_internal(&path, source, depth + 1, out);
+        }
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
 }
 
 fn list_slash_commands_blocking(
@@ -529,5 +667,119 @@ mod tests {
         assert_eq!(paths, vec![flat.as_path(), nested.as_path()]);
         assert!(dirs.iter().all(|(_, source)| *source == "plugin"));
         assert!(codex_plugin_skills_dirs(&root.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn parses_multiline_block_scalar_description() {
+        let content = "---\nname: lint-fix\ndescription: >\n  Fixes lint errors in codebase.\n  Do not use for general review.\n---\nbody\n";
+        let (name, description, hint) = parse_command_frontmatter(content);
+        assert_eq!(name.as_deref(), Some("lint-fix"));
+        assert_eq!(
+            description.as_deref(),
+            Some("Fixes lint errors in codebase. Do not use for general review.")
+        );
+        assert_eq!(hint, None);
+    }
+
+    #[test]
+    fn discovers_workspace_skills_across_candidate_subpaths() {
+        let ws = scratch_dir("ws-skills");
+        // 1. .agents/skills (Codex CLI / Open Agent standard)
+        let agent_skill = ws.join(".agents").join("skills").join("agent-worker");
+        fs::create_dir_all(&agent_skill).unwrap();
+        fs::write(
+            agent_skill.join("SKILL.md"),
+            "---\ndescription: \"agent worker skill\"\n---\n",
+        )
+        .unwrap();
+
+        // 2. .codex/skills with lowercase skill.md
+        let codex_skill = ws.join(".codex").join("skills").join("codex-worker");
+        fs::create_dir_all(&codex_skill).unwrap();
+        fs::write(
+            codex_skill.join("skill.md"),
+            "---\ndescription: \"codex worker skill\"\n---\n",
+        )
+        .unwrap();
+
+        // 3. .skills
+        let hidden_skill = ws.join(".skills").join("hidden-worker");
+        fs::create_dir_all(&hidden_skill).unwrap();
+        fs::write(hidden_skill.join("SKILL.md"), "---\n---\n").unwrap();
+
+        // 4. skills (project visible root)
+        let visible_skill = ws.join("skills").join("visible-worker");
+        fs::create_dir_all(&visible_skill).unwrap();
+        fs::write(visible_skill.join("SKILL.md"), "---\n---\n").unwrap();
+
+        let dirs = skills_dirs(&ws);
+        let ws_dirs: Vec<&Path> = dirs
+            .iter()
+            .filter(|(_, s)| *s == "workspace")
+            .map(|(p, _)| p.as_path())
+            .collect();
+        assert_eq!(ws_dirs.len(), 4);
+
+        let mut discovered = Vec::new();
+        for (dir, source) in &dirs {
+            if *source == "workspace" {
+                discovered.extend(discover_skills_in(dir, source));
+            }
+        }
+        let names: Vec<&str> = discovered.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"agent-worker"));
+        assert!(names.contains(&"codex-worker"));
+        assert!(names.contains(&"hidden-worker"));
+        assert!(names.contains(&"visible-worker"));
+        assert!(discovered.iter().all(|e| e.source == "workspace"));
+    }
+
+    #[test]
+    fn discovers_nested_category_skills() {
+        let root = scratch_dir("nested-skills");
+        let nested = root.join("analytics").join("dashboard");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\ndescription: \"Analytics dashboard template\"\n---\n",
+        )
+        .unwrap();
+
+        let entries = discover_skills_in(&root, "workspace");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "dashboard");
+        assert_eq!(
+            entries[0].description.as_deref(),
+            Some("Analytics dashboard template")
+        );
+    }
+
+    #[test]
+    fn discovers_workspace_commands_across_candidate_subpaths() {
+        let ws = scratch_dir("ws-commands");
+        let agents_cmd = ws.join(".agents").join("commands");
+        let codex_cmd = ws.join(".codex").join("commands");
+        fs::create_dir_all(&agents_cmd).unwrap();
+        fs::create_dir_all(&codex_cmd).unwrap();
+        fs::write(agents_cmd.join("agent-deploy.md"), "# Deploy\n").unwrap();
+        fs::write(codex_cmd.join("codex-test.md"), "# Test\n").unwrap();
+
+        let dirs = commands_dirs(&ws);
+        let ws_dirs: Vec<&Path> = dirs
+            .iter()
+            .filter(|(_, s)| *s == "workspace")
+            .map(|(p, _)| p.as_path())
+            .collect();
+        assert_eq!(ws_dirs.len(), 2);
+
+        let mut discovered = Vec::new();
+        for (dir, source) in &dirs {
+            if *source == "workspace" {
+                discovered.extend(discover_commands_in(dir, dir, source));
+            }
+        }
+        let names: Vec<&str> = discovered.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"agent-deploy"));
+        assert!(names.contains(&"codex-test"));
     }
 }
