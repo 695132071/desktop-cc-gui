@@ -17,7 +17,7 @@ import type { LucideIcon } from "lucide-react";
 import { PLUGIN_TAB_PREFIX, usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
 import { RELEASE_NOTES_TAB_KEY, useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { fileName, useFilesStore } from "@/features/files/store";
-import { useGitStore } from "@/features/git/store";
+import { useGitStore, type DiffTarget } from "@/features/git/store";
 import type { SessionMeta } from "@/lib/ipc";
 import { sessionKey, useChatStore, type ActiveSession } from "./store";
 import type { ChatPageDialog } from "./ChatPageDialogs";
@@ -31,6 +31,47 @@ const DIFF_TAB_KEY = "diff:";
 // recomputing on every render while the flag is off.
 const NO_BROWSER_TABS: BrowserTab[] = [];
 
+export interface UseChatTabsResult {
+  tabItems: Array<{
+    key: string;
+    label: string;
+    title?: string;
+    icon?: LucideIcon;
+    engine?: string;
+    streaming: boolean;
+    retrying?: boolean;
+    unseen?: boolean;
+    unread?: string;
+    dirty?: boolean;
+    session?: ActiveSession;
+  }>;
+  activeTabKey: string | null;
+  handleTabSelect: (tabKey: string) => void;
+  handleTabClose: (tabKey: string) => void;
+  handleTabCloseAll: () => void;
+  handleTabCloseInactive: (targetKey?: string) => void;
+  handleTabCloseLeft: (targetKey: string) => void;
+  handleTabCloseRight: (targetKey: string) => void;
+  handleTabReorder: (draggedKey: string, targetKey: string, before: boolean) => void;
+  sessionById: Map<string, SessionMeta>;
+  threadStreaming: boolean[];
+  threadRetrying: boolean[];
+  openFiles: string[];
+  activeFilePath: string | null;
+  browserTabs: BrowserTab[];
+  activeBrowserId: string | null;
+  pluginTabs: string[];
+  activePluginTabId: string | null;
+  pluginHubOpen: boolean;
+  pluginHubActive: boolean;
+  missionOpen: boolean;
+  missionActive: boolean;
+  notesOpen: boolean;
+  notesActive: boolean;
+  diffView: { workspacePath: string; target: DiffTarget } | null;
+  closeDiff: () => void;
+}
+
 /** Center tab strip data: session/file/diff tab items, the active key, and
  * the select/close/reorder handlers routing each tab kind to its store.
  * Sidebar/tab-strip slices are low-frequency — they change only on
@@ -39,7 +80,7 @@ export function useChatTabs({
   setDialog,
 }: {
   setDialog: (dialog: ChatPageDialog) => void;
-}) {
+}): UseChatTabsResult {
   const { t } = useTranslation();
   const { active, openTabs, sessions, unseen } = useChatStore(
     useShallow((s) => ({
@@ -321,8 +362,11 @@ export function useChatTabs({
     handleTabClose,
     handleTabCloseAll,
     handleTabCloseInactive,
+    handleTabCloseLeft,
+    handleTabCloseRight,
     handleTabReorder,
   } = useChatTabHandlers({
+    tabItems,
     setDialog,
     sessionTabItems,
     activeTabKey,
@@ -357,6 +401,8 @@ export function useChatTabs({
     handleTabClose,
     handleTabCloseAll,
     handleTabCloseInactive,
+    handleTabCloseLeft,
+    handleTabCloseRight,
     handleTabReorder,
     sessionById,
     threadStreaming,
@@ -447,6 +493,7 @@ function dropTargetIndex(from: number, target: number, before: boolean): number 
 
 interface ChatTabHandlerDeps {
   setDialog: (dialog: ChatPageDialog) => void;
+  tabItems: Array<{ key: string }>;
   sessionTabItems: SessionTabItem[];
   activeTabKey: string | null;
   // Session tabs (chat store).
@@ -464,14 +511,14 @@ interface ChatTabHandlerDeps {
   closeDiff: () => void;
   // Browser tabs (browser store).
   browserTabs: BrowserTab[];
-  activeBrowserId: string | null;
+  activeBrowserId?: string | null;
   activateBrowserTab: (id: string) => void;
   deactivateBrowserTab: () => void;
   closeBrowserTab: (id: string) => void;
   moveBrowserTab: (id: string, toIndex: number) => void;
   // Plugin center tabs (plugin tabs store).
   pluginTabs: string[];
-  activePluginTabId: string | null;
+  activePluginTabId?: string | null;
   activatePluginTab: (id: string) => void;
   deactivatePluginTab: () => void;
   closePluginTab: (id: string) => void;
@@ -483,6 +530,7 @@ interface ChatTabHandlerDeps {
  *  are mutually exclusive in the center area (selecting one deactivates the
  *  others). */
 function useChatTabHandlers({
+  tabItems,
   setDialog,
   sessionTabItems,
   activeTabKey,
@@ -497,13 +545,13 @@ function useChatTabHandlers({
   moveOpenFile,
   closeDiff,
   browserTabs,
-  activeBrowserId,
+  activeBrowserId: _activeBrowserId,
   activateBrowserTab,
   deactivateBrowserTab,
   closeBrowserTab,
   moveBrowserTab,
   pluginTabs,
-  activePluginTabId,
+  activePluginTabId: _activePluginTabId,
   activatePluginTab,
   deactivatePluginTab,
   closePluginTab,
@@ -650,78 +698,91 @@ function useChatTabHandlers({
     [openFiles, moveOpenFile, sessionTabItems, moveTab, browserTabs, moveBrowserTab, pluginTabs, movePluginTab],
   );
 
-  // Tab context menu "Close All": drop every tab. Dirty file tabs cannot be
-  // discarded silently — close everything else first, then route the first
-  // dirty file through the existing save-confirmation dialog (any others
-  // stay open and a repeat Close All walks through them).
+  // Close a specific list of tab keys with the unified invariant:
+  // - Close matching singleton tabs (diff, mission, hub, notes)
+  // - Close matching session tabs (unless streaming)
+  // - Close matching browser and plugin tabs
+  // - Close matching clean files; prompt on the first dirty file
+  const closeKeys = useCallback(
+    (keysToClose: string[]) => {
+      const keysSet = new Set(keysToClose);
+      if (keysSet.has(DIFF_TAB_KEY)) closeDiff();
+      if (keysSet.has(MISSION_WORKBENCH_TAB_KEY)) useMissionStore.getState().close();
+      if (keysSet.has(PLUGIN_HUB_TAB_KEY)) usePluginHubStore.getState().close();
+      if (keysSet.has(RELEASE_NOTES_TAB_KEY)) useReleaseNotesTabStore.getState().close();
+      for (const item of sessionTabItems) {
+        if (keysSet.has(item.key) && !item.streaming) {
+          closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
+        }
+      }
+      for (const tab of browserTabs) {
+        if (keysSet.has(BROWSER_TAB_PREFIX + tab.id)) {
+          closeBrowserTab(tab.id);
+        }
+      }
+      for (const id of pluginTabs) {
+        if (keysSet.has(PLUGIN_TAB_PREFIX + id)) {
+          closePluginTab(id);
+        }
+      }
+      const matchingFiles = openFiles.filter((path) => keysSet.has(FILE_TAB_PREFIX + path));
+      const dirty = matchingFiles.filter((path) => dirtyPaths[path]);
+      for (const path of matchingFiles) {
+        if (!dirtyPaths[path]) closeFile(path);
+      }
+      if (dirty[0]) setDialog({ kind: "closeFile", path: dirty[0] });
+    },
+    [
+      closeDiff,
+      sessionTabItems,
+      closeTab,
+      browserTabs,
+      closeBrowserTab,
+      pluginTabs,
+      closePluginTab,
+      openFiles,
+      dirtyPaths,
+      closeFile,
+      setDialog,
+    ],
+  );
+
   const handleTabCloseAll = useCallback(() => {
-    closeDiff();
-    useMissionStore.getState().close();
-    usePluginHubStore.getState().close();
-    useReleaseNotesTabStore.getState().close();
-    for (const item of sessionTabItems) {
-      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
-    }
-    for (const tab of browserTabs) closeBrowserTab(tab.id);
-    for (const id of pluginTabs) closePluginTab(id);
-    const dirty = openFiles.filter((path) => dirtyPaths[path]);
-    for (const path of openFiles) {
-      if (!dirtyPaths[path]) closeFile(path);
-    }
-    if (dirty[0]) setDialog({ kind: "closeFile", path: dirty[0] });
-  }, [sessionTabItems, closeTab, openFiles, dirtyPaths, closeFile, closeDiff, setDialog, browserTabs, closeBrowserTab, pluginTabs, closePluginTab]);
+    closeKeys(tabItems.map((t) => t.key));
+  }, [closeKeys, tabItems]);
 
-  // Tab context menu "Close Inactive": drop the tabs that are neither in
-  // view nor running. A session tab whose turn is still streaming stays —
-  // closing it would leave the turn running with nothing showing it.
-  // Same dirty-file rule as Close All: unsaved edits are never discarded
-  // silently; the first one routes through the save dialog and the others
-  // stay open. The tab in view keeps its edit either way.
-  const handleTabCloseInactive = useCallback(() => {
-    if (activeTabKey !== DIFF_TAB_KEY) closeDiff();
-    if (activeTabKey !== MISSION_WORKBENCH_TAB_KEY) useMissionStore.getState().close();
-    if (activeTabKey !== PLUGIN_HUB_TAB_KEY) usePluginHubStore.getState().close();
-    if (activeTabKey !== RELEASE_NOTES_TAB_KEY) useReleaseNotesTabStore.getState().close();
-    for (const item of sessionTabItems) {
-      if (item.key === activeTabKey || item.streaming) continue;
-      closeTab(item.tab.engine, item.tab.sessionId, item.tab.workspacePath);
-    }
-    for (const tab of browserTabs) {
-      if (tab.id === activeBrowserId) continue;
-      closeBrowserTab(tab.id);
-    }
-    for (const id of pluginTabs) {
-      if (id === activePluginTabId) continue;
-      closePluginTab(id);
-    }
-    const others = openFiles.filter((path) => FILE_TAB_PREFIX + path !== activeTabKey);
-    const dirty = others.filter((path) => dirtyPaths[path]);
-    for (const path of others) {
-      if (!dirtyPaths[path]) closeFile(path);
-    }
-    if (dirty[0]) setDialog({ kind: "closeFile", path: dirty[0] });
-  }, [
-    activeTabKey,
-    sessionTabItems,
-    closeTab,
-    openFiles,
-    dirtyPaths,
-    closeFile,
-    closeDiff,
-    setDialog,
-    browserTabs,
-    activeBrowserId,
-    closeBrowserTab,
-    pluginTabs,
-    activePluginTabId,
-    closePluginTab,
-  ]);
+  const handleTabCloseInactive = useCallback(
+    (targetKey?: string) => {
+      const preserve = targetKey ?? activeTabKey;
+      closeKeys(tabItems.map((t) => t.key).filter((k) => k !== preserve));
+    },
+    [activeTabKey, closeKeys, tabItems],
+  );
 
+  const handleTabCloseLeft = useCallback(
+    (targetKey: string) => {
+      const index = tabItems.findIndex((t) => t.key === targetKey);
+      if (index <= 0) return;
+      closeKeys(tabItems.slice(0, index).map((t) => t.key));
+    },
+    [closeKeys, tabItems],
+  );
+
+  const handleTabCloseRight = useCallback(
+    (targetKey: string) => {
+      const index = tabItems.findIndex((t) => t.key === targetKey);
+      if (index < 0 || index >= tabItems.length - 1) return;
+      closeKeys(tabItems.slice(index + 1).map((t) => t.key));
+    },
+    [closeKeys, tabItems],
+  );
   return {
     handleTabSelect,
     handleTabClose,
     handleTabCloseAll,
     handleTabCloseInactive,
+    handleTabCloseLeft,
+    handleTabCloseRight,
     handleTabReorder,
 
   };

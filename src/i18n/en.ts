@@ -74,6 +74,8 @@ export const en: Messages = {
     newBrowser: "New browser",
     closeAllTabs: "Close All",
     closeInactiveTabs: "Close Others",
+    closeLeftTabs: "Close Tabs to the Left",
+    closeRightTabs: "Close Tabs to the Right",
     collapseSidebar: "Collapse sidebar",
     expandSidebar: "Expand sidebar",
     resizeSidebar: "Drag to resize sidebar",
