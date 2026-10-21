@@ -1857,6 +1857,35 @@ function recordTurnUsage(
   writeUsageRow(deps, event, key, parsed, 1);
 }
 
+/** A CLI that kept running after `done` (a background task was pending) opened
+ *  a follow-up turn on its own. The run was settled at `done`, so reopen it:
+ *  forget the terminal fact and re-adopt it as running — the follow-up's
+ *  events then flow like any live turn and its own `done` settles it again. */
+function reopenSettledRun(event: ChatEngineEvent, deps: EngineEventDeps): void {
+  const state = deps.get();
+  const key =
+    runRouting.get(event.runId) ??
+    Object.keys(state.bySession).find((candidate) =>
+      state.bySession[candidate]?.settledRunIds?.includes(event.runId),
+    );
+  if (!key) return;
+  settledRuns.delete(event.runId);
+  deps.set((s) => {
+    const cur = s.bySession[key];
+    if (!cur?.settledRunIds?.includes(event.runId)) return {};
+    return {
+      bySession: {
+        ...s.bySession,
+        [key]: {
+          ...cur,
+          settledRunIds: cur.settledRunIds.filter((id) => id !== event.runId),
+        },
+      },
+    };
+  });
+  adoptObservedRun(event, key, deps);
+}
+
 /** Mark a session running off an event of a turn this client never sent: the
  *  phone watching the desktop's run, or the desktop watching the phone's.
  *  Routes the run first so Stop and the orphan sweep reach it, then lifts the
@@ -1916,6 +1945,10 @@ export function handleEngineEvents(
       event.sessionId !== toolBatch.event.sessionId
     )) {
       flushTools();
+    }
+    if (event.kind === "turn_resumed") {
+      reopenSettledRun(event, deps);
+      continue;
     }
     const settled = settledRuns.get(event.runId);
     // Plans outlive their run's terminal event: expire_parked_plans settles

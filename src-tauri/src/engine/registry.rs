@@ -55,6 +55,9 @@ pub struct ChildEntry {
 pub struct ProcessRegistry(
     pub Mutex<HashMap<String, ChildEntry>>,
     Mutex<HashMap<(String, String), oneshot::Sender<Result<Value, String>>>>,
+    /// native session id -> run id of a process that already settled its turn
+    /// but is kept alive for a background task's self-started follow-up turn.
+    Mutex<HashMap<String, String>>,
 );
 /// Count in-flight runs, not map entries: one run is keyed twice (run id +
 /// session alias), so `map.len()` would halve the real concurrency limit.
@@ -237,6 +240,28 @@ impl ProcessRegistry {
                 (plan_id, revision, context)
             })
             .collect()
+    }
+
+    /// Record that `run_id` settled its turn but still waits for the CLI's
+    /// follow-up turn on `session_id`.
+    pub(crate) fn set_awaiting_followup(&self, session_id: &str, run_id: &str) {
+        if let Ok(mut map) = self.2.lock() {
+            map.insert(session_id.to_string(), run_id.to_string());
+        }
+    }
+
+    /// The run no longer waits (follow-up arrived, run settled or exited).
+    pub(crate) fn clear_awaiting_followup(&self, run_id: &str) {
+        if let Ok(mut map) = self.2.lock() {
+            map.retain(|_, waiting| waiting != run_id);
+        }
+    }
+
+    /// Take the run idling on `session_id` for a follow-up turn, if any. A new
+    /// send on that session resumes it in a fresh process, so the idle one
+    /// must go: it would later stream its follow-up into the same session.
+    pub(crate) fn take_awaiting_followup(&self, session_id: &str) -> Option<String> {
+        self.2.lock().ok().and_then(|mut map| map.remove(session_id))
     }
 
     pub(crate) fn insert(&self, key: String, entry: ChildEntry) {
@@ -537,6 +562,26 @@ pub(crate) fn next_virtual_pid() -> u32 {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    /// A send on a session whose process idles for a background follow-up
+    /// retires that process exactly once; any other session is untouched, and
+    /// a run that settled or resumed no longer counts as idle.
+    #[test]
+    fn awaiting_followup_is_taken_once_per_session_and_cleared_by_run() {
+        let registry = ProcessRegistry::default();
+        registry.set_awaiting_followup("s-1", "run-1");
+        registry.set_awaiting_followup("s-2", "run-2");
+
+        assert_eq!(
+            registry.take_awaiting_followup("s-1").as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(registry.take_awaiting_followup("s-1"), None);
+        assert_eq!(registry.take_awaiting_followup("unknown"), None);
+
+        registry.clear_awaiting_followup("run-2");
+        assert_eq!(registry.take_awaiting_followup("s-2"), None);
+    }
 
     /// rekey must COPY (not move) so both the session-id and run-id keys
     /// route an interrupt to the same process. A resume whose

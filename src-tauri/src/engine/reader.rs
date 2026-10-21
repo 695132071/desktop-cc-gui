@@ -154,6 +154,11 @@ pub(crate) struct TurnState {
     gen_explicit: bool,
     /// Generation milliseconds closed but not yet attached to a usage report.
     gen_ms: u64,
+    /// Background tasks the CLI reported as still running.
+    pending_background_tasks: usize,
+    /// `done` went out while a background task was still running and the CLI
+    /// is kept alive: its self-started follow-up turn is still to come.
+    awaiting_followup: bool,
 }
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
@@ -169,6 +174,8 @@ impl TurnState {
             gen_open_since: None,
             gen_explicit: false,
             gen_ms: 0,
+            pending_background_tasks: 0,
+            awaiting_followup: false,
         }
     }
 
@@ -339,6 +346,24 @@ impl TurnCore {
         // the conversation strands under its provisional key.
         if (state.saw_done || state.saw_error) && !matches!(event, EngineEvent::SessionId(_)) {
             return;
+        }
+        // The CLI's follow-up turn (after a background task) streams under a
+        // run the UI already settled: tell it to reopen the run first.
+        if state.awaiting_followup
+            && matches!(
+                event,
+                EngineEvent::Delta(_) | EngineEvent::Thinking(_) | EngineEvent::Message { .. }
+            )
+        {
+            state.awaiting_followup = false;
+            self.registry.clear_awaiting_followup(&self.run_id);
+            state.push(
+                &self.sink,
+                &self.run_id,
+                &self.engine_id,
+                "turn_resumed",
+                Value::Null,
+            );
         }
         match event {
             EngineEvent::Delta(text) => {
@@ -742,16 +767,33 @@ impl TurnCore {
                     tools,
                 );
             }
+            EngineEvent::BackgroundTasks { pending } => {
+                state.pending_background_tasks = pending;
+            }
             EngineEvent::Done { session_id, usage } => {
                 let gen_ms = state.take_gen_ms();
-                state.saw_done = true;
-                crate::mcp::mark_run_ended(&self.run_id);
                 if let Some(id) = session_id {
                     self.adopt_session_id(state, &id, false);
                 }
-                // The turn is over: EOF the interactive stdin so the CLI
-                // exits instead of waiting for a next message forever.
-                self.registry.close_stdin(&self.run_id);
+                if state.pending_background_tasks > 0 {
+                    // A background task is still running: the CLI opens a
+                    // follow-up turn by itself when it finishes. Settle the
+                    // visible turn now so the UI is usable, but keep stdin and
+                    // the reader alive (saw_done stays false) so that turn is
+                    // still received; `turn_resumed` reopens the run for it.
+                    state.awaiting_followup = true;
+                    if let Some(id) = state.native_session_id.as_deref() {
+                        self.registry.set_awaiting_followup(id, &self.run_id);
+                    }
+                } else {
+                    state.saw_done = true;
+                    state.awaiting_followup = false;
+                    self.registry.clear_awaiting_followup(&self.run_id);
+                    crate::mcp::mark_run_ended(&self.run_id);
+                    // The turn is over: EOF the interactive stdin so the CLI
+                    // exits instead of waiting for a next message forever.
+                    self.registry.close_stdin(&self.run_id);
+                }
                 state.push_with_gen_ms(
                     &self.sink,
                     &self.run_id,
@@ -1113,6 +1155,10 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     for path in &ctx.cleanup_files {
         let _ = std::fs::remove_file(path);
     }
+    ctx.core.registry.clear_awaiting_followup(&ctx.core.run_id);
+    if state.awaiting_followup {
+        crate::mcp::mark_run_ended(&ctx.core.run_id);
+    }
     // Pending questions die with the run: settle their cards so the UI never
     // leaves an answerable question pointing at a dead process.
     for key in [
@@ -1161,7 +1207,7 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         );
     }
 
-    if !state.saw_done && !state.saw_error {
+    if !state.saw_done && !state.saw_error && !state.awaiting_followup {
         let killed = ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
         if killed {
             // User-initiated stop: commit whatever streamed so far as a
