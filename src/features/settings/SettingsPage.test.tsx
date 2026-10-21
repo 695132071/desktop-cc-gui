@@ -481,14 +481,18 @@ describe("SettingsPage capabilities rail", () => {
       const skillsRow = railRow(i18n.t("settings.skills"));
       expect(skillsRow?.getAttribute("aria-current")).toBe("page");
       expect(document.body.textContent).toContain(i18n.t("common.loading"));
+      // The wait covers an on-demand transform, not a timeout we expect to hit:
+      // inside a saturated full-suite run (many workers, cold cache) the Skills
+      // chunk has taken >10s to appear. The assertion is unchanged — only the
+      // window it is allowed to need is.
       await vi.waitFor(
         () => {
           expect(document.body.textContent).toContain(i18n.t("skills.desktopOnly"));
         },
-        { timeout: 10000, interval: 50 },
+        { timeout: 40000, interval: 50 },
       );
     },
-    20000,
+    60000,
   );
 });
 
