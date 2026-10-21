@@ -438,10 +438,12 @@ impl Engine for ClaudeEngine {
                 if stopped_task_result
                     && value.get("num_turns").and_then(Value::as_u64) == Some(0)
                     && value.get("is_error").and_then(Value::as_bool) != Some(true)
+                    // Absent or blank: a CLI variant that omits `result` on
+                    // this bookkeeping line must not resurrect the old bug.
                     && value
                         .get("result")
                         .and_then(Value::as_str)
-                        .is_some_and(|text| text.trim().is_empty())
+                        .map_or(true, |text| text.trim().is_empty())
                 {
                     return;
                 }

@@ -8,7 +8,7 @@ use super::grok;
 #[cfg(windows)]
 use super::job;
 use super::plan_review;
-use super::registry::{kill_process_group, ProcessRegistry};
+use super::registry::{kill_process_group, FollowupPrefs, ProcessRegistry};
 use super::Engine;
 use crate::event_sink;
 use serde_json::Value;
@@ -291,6 +291,11 @@ pub(crate) struct TurnCore {
     /// 审批事实源:计划事件到达即落盘(engine/plan_review.rs)。驱动内部与
     /// 测试构造点没有 db 句柄时为 None——那些路径不产生计划事件。
     pub(crate) db: Option<Arc<crate::db::Db>>,
+    /// Launch settings of a chat run eligible for background-follow-up
+    /// parking (`Some` only for chat-sink claude runs). `None` — plugin and
+    /// mission turns, other engines, tests — keeps the old settle behavior:
+    /// stdin closes at `done` and the process exits instead of idling.
+    pub(crate) followup: Option<FollowupPrefs>,
 }
 /// 停住的计划审批随运行消亡:原生请求不再有效,记录过期并推送
 /// PlanReviewSettled,历史 UI 不得假装还能批准(PRD §8 防线 3)。
@@ -775,7 +780,12 @@ impl TurnCore {
                 if let Some(id) = session_id {
                     self.adopt_session_id(state, &id, false);
                 }
-                if state.pending_background_tasks > 0 {
+                let park_prefs = if state.pending_background_tasks > 0 {
+                    self.followup.clone()
+                } else {
+                    None
+                };
+                if let Some(prefs) = park_prefs {
                     // A background task is still running: the CLI opens a
                     // follow-up turn by itself when it finishes. Settle the
                     // visible turn now so the UI is usable, but keep stdin and
@@ -783,7 +793,8 @@ impl TurnCore {
                     // still received; `turn_resumed` reopens the run for it.
                     state.awaiting_followup = true;
                     if let Some(id) = state.native_session_id.as_deref() {
-                        self.registry.set_awaiting_followup(id, &self.run_id);
+                        self.registry
+                            .set_awaiting_followup(id, &self.run_id, prefs);
                     }
                 } else {
                     state.saw_done = true;
@@ -1323,6 +1334,7 @@ mod staging_tests {
             engine_id: "claude".into(),
             run_id: "test".into(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(None);
         for model in [Some("claude-opus-5-5".to_string()), None] {
@@ -1378,6 +1390,7 @@ mod staging_tests {
                     engine_id: "grok".into(),
                     run_id: "test".into(),
                     db: None,
+                    followup: None,
                 },
                 engine_impl: Box::new(grok::GrokEngine),
                 pid: 0,
@@ -1446,6 +1459,7 @@ mod staging_tests {
                 engine_id: "grok".into(),
                 run_id: "run-abort".into(),
                 db: None,
+                followup: None,
             },
             engine_impl: Box::new(grok::GrokEngine),
             pid: 4242,
@@ -1553,6 +1567,7 @@ mod terminal_event_tests {
                     engine_id: engine.into(),
                     run_id: "pa-relay-test".into(),
                     db: None,
+                    followup: None,
                 };
                 let mut state = TurnState::new(None);
                 core.dispatch_event(
@@ -1587,6 +1602,7 @@ mod terminal_event_tests {
             engine_id: "pi".into(),
             run_id: "gen-ms-test".into(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(Some("session".into()));
         let tool_start = || EngineEvent::Message {
@@ -1645,6 +1661,7 @@ mod terminal_event_tests {
                 engine_id: "codex".into(),
                 run_id: "terminal-test".into(),
                 db: None,
+                followup: None,
             };
             let mut state = TurnState::new(Some("session".into()));
             core.dispatch_event(&mut state, EngineEvent::Delta("完成中文与 emoji 🐎".into()));
@@ -1742,6 +1759,7 @@ mod terminal_event_tests {
                     engine_id: "pi".into(),
                     run_id: run_id.into(),
                     db: None,
+                    followup: None,
                 },
                 engine_impl: Box::new(crate::engine::pi_family::pi()),
                 pid,
@@ -1838,6 +1856,7 @@ mod plan_dispatch_tests {
             engine_id: "dsh".into(),
             run_id: "run-plan".into(),
             db: Some(Arc::clone(&db)),
+            followup: None,
         };
         core.registry.insert(
             "run-plan".into(),

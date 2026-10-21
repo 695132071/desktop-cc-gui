@@ -1212,6 +1212,7 @@ mod tests {
             engine_id: "dsh".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(None);
         let mut view = TurnView::default();
@@ -1267,6 +1268,7 @@ mod tests {
             engine_id: "dsh".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         let req = SendRequest {
             session_id: None,
@@ -1356,6 +1358,7 @@ mod tests {
                     engine_id: "dsh".to_string(),
                     run_id: "test-run".to_string(),
                     db: None,
+                    followup: None,
                 };
                 let req = SendRequest {
                     session_id,
@@ -1451,6 +1454,7 @@ mod tests {
             engine_id: "dsh".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         (core, registry, emitter)
     }
