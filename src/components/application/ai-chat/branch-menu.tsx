@@ -1,9 +1,11 @@
 "use client";
 
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Check from "lucide-react/dist/esm/icons/check";
 import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
 import GitMerge from "lucide-react/dist/esm/icons/git-merge";
+import Search from "lucide-react/dist/esm/icons/search";
 import {
   Button as AriaButton,
   Dialog as AriaDialog,
@@ -47,6 +49,30 @@ export function BranchMenu({
   // `isNonModal` popovers don't dismiss on outside press and don't toggle
   // closed on a trigger press — usePopoverState restores both (hook doc).
   const { isOpen, triggerRef, popoverRef, close, setOpen } = usePopoverState();
+  const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // Stale filter text must not survive into the next open: a branch list that
+  // silently lost rows on reopen reads as data loss.
+  useEffect(() => {
+    if (!isOpen) setQuery("");
+  }, [isOpen]);
+
+  // Focus the filter as the popover opens (autoFocus would move focus on load,
+  // which the a11y rules reject). Focus landing inside the popover also makes
+  // Esc reach react-aria's dismiss handler — before this, focus stayed on the
+  // trigger and Esc did nothing.
+  useEffect(() => {
+    if (isOpen) searchRef.current?.focus();
+  }, [isOpen]);
+
+  // An empty query returns the original array, so the unfiltered render path is
+  // what it was before the filter existed.
+  const filteredBranches = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (needle.length === 0) return branches;
+    return branches.filter((branch) => branch.name.toLowerCase().includes(needle));
+  }, [branches, query]);
 
   return (
     <AriaDialogTrigger isOpen={isOpen} onOpenChange={setOpen}>
@@ -97,14 +123,35 @@ export function BranchMenu({
       >
         <AriaDialog aria-label={t("git.branch")} className="outline-none">
           <div className="flex w-full flex-col gap-1.5 pt-1">
-            <span className="pl-2 text-body-medium text-text-secondary">
-              {t("git.branch")}
-            </span>
+            {/* The filter is the popover's first element and a sibling of the
+                scroller, not a child: the list below is the max-h-64 scroll
+                body and would carry the field away with it. No "分支" heading —
+                the trigger already shows the current branch, the placeholder
+                carries the label, and the dialog keeps `aria-label`. */}
+            <div className="flex h-8 w-full items-center gap-1.5 rounded-lg border border-border-button-default px-2 focus-within:ring-2 focus-within:ring-border-focus-ring">
+              <Search
+                className="size-4 shrink-0 text-foreground-icon-secondary"
+                aria-hidden
+              />
+              <input
+                ref={searchRef}
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={t("git.searchBranches")}
+                aria-label={t("git.searchBranches")}
+                className="min-w-0 flex-1 bg-transparent text-body-medium text-text-primary outline-none placeholder:text-text-placeholder"
+              />
+            </div>
             <div className="flex max-h-64 w-full flex-col gap-1 overflow-y-auto">
-              {branches.map((branch) => (
+              {filteredBranches.map((branch) => (
                 <button
                   key={branch.name}
                   type="button"
+                  // Whole-row title, not just the truncated name span: hovering
+                  // any part of the row (icon, clipped text, empty tail) must
+                  // reveal the full branch name. Intercepted by
+                  // NativeTitleTooltip, so write the plain attribute.
+                  title={branch.name}
                   aria-pressed={branch.name === currentName}
                   onClick={() => {
                     // Compare against the displayed current name, not a cached
@@ -140,6 +187,13 @@ export function BranchMenu({
                   )}
                 </button>
               ))}
+              {/* Only the filter can empty a populated list: a branch list that
+                  has not loaded yet renders exactly as it did before. */}
+              {query.trim().length > 0 && filteredBranches.length === 0 && (
+                <span className="px-2 py-1.5 text-body-medium text-text-tertiary">
+                  {t("git.noMatchingBranches")}
+                </span>
+              )}
             </div>
           </div>
         </AriaDialog>
