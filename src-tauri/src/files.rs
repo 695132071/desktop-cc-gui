@@ -90,18 +90,17 @@ fn allowed_roots(db: &crate::db::Db) -> Vec<PathBuf> {
 }
 
 pub(crate) fn ensure_allowed(path: &str, db: &crate::db::Db) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    // No trim: a trailing-space filename is a real, distinct path. Only a
+    // whitespace-only input is rejected as empty.
+    if path.trim().is_empty() {
         return Err("empty path".to_string());
     }
-    let resolved = canonicalize_lenient(Path::new(trimmed))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let roots = allowed_roots(db);
     if roots.iter().any(|root| resolved.starts_with(root)) {
         Ok(resolved)
     } else {
-        Err(format!(
-            "path is outside the registered workspaces: {trimmed}"
-        ))
+        Err(format!("path is outside the registered workspaces: {path}"))
     }
 }
 
@@ -120,7 +119,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// a directory, otherwise its parent (granting a single file would not cover
 /// its siblings, which is never what the file-tree user wants).
 fn grant_dir_for(path: &str) -> Result<PathBuf, String> {
-    let resolved = canonicalize_lenient(Path::new(path.trim()))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let dir = if resolved.is_dir() {
         resolved
     } else {
@@ -869,6 +868,28 @@ mod tests {
         let dir = grant_dir_for(&outside.0.to_string_lossy()).unwrap();
         let want = strip_verbatim_prefix(std::fs::canonicalize(&outside.0).unwrap());
         assert_eq!(dir, want);
+    }
+
+    /// A trailing space is a real part of the filename on Unix; the
+    /// authorization entry points must resolve it verbatim instead of
+    /// trimming it into the sibling file without the space.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_space_path_is_authorized_verbatim() {
+        let scratch = Scratch::new();
+        let plain = scratch.0.join("report");
+        let spaced = scratch.0.join("report ");
+        std::fs::write(&plain, b"plain").unwrap();
+        std::fs::write(&spaced, b"spaced").unwrap();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        db.add_granted_root(&scratch.0.to_string_lossy()).unwrap();
+
+        let resolved = ensure_allowed(&spaced.to_string_lossy(), &db).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&spaced).unwrap());
+
+        let grant = grant_dir_for(&spaced.to_string_lossy()).unwrap();
+        let want = strip_verbatim_prefix(std::fs::canonicalize(&scratch.0).unwrap());
+        assert_eq!(grant, want);
     }
 
     #[test]
