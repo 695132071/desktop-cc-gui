@@ -580,6 +580,13 @@ export interface PasteClipboardResult {
   failed: string[];
 }
 
+/** Host-read OS file clipboard, including its native generation counter.
+ *  The counter is null where no native file clipboard bridge exists. */
+export interface ClipboardFileSnapshot {
+  paths: string[];
+  changeCount: number | null;
+}
+
 export interface SearchHit {
   path: string;
   line: number;
@@ -1503,10 +1510,10 @@ export const ipc = {
    * new paths (same order). Picked paths live outside the sandbox, so the
    * engines' path-based image pipeline cannot read them in place. */
   importAttachments: (paths: string[]) => invoke<string[]>("import_attachments", { paths }),
-  /** Absolute paths of the files on the OS clipboard (Finder / Explorer
-   * copies expose no path to the webview). Empty when the clipboard holds no
-   * file; the web bridge has no OS pasteboard and always answers empty. */
-  clipboardFilePaths: () => invoke<string[]>("clipboard_file_paths"),
+  /** Host-read OS clipboard snapshot (Finder / Explorer file copies expose
+   *  no path to the webview). Rejects on a real read failure; the web bridge
+   *  has no OS pasteboard and returns an empty snapshot with no generation. */
+  clipboardFileSnapshot: () => invoke<ClipboardFileSnapshot>("clipboard_file_snapshot"),
   /** Replace the OS clipboard with a file list, so Finder / Explorer paste
    *  the actual items. Rejects when the host cannot write; the in-app tree
    *  clipboard still carries the item (Linux has no native bridge). */

@@ -763,7 +763,12 @@ pub(super) async fn dispatch(
         // The web bridge has no OS pasteboard to read (and browsers expose no
         // file path to page JavaScript): pasted files stay limited to the
         // flavors the paste event itself carried.
-        "clipboard_file_paths" => ser(Ok::<Vec<String>, String>(Vec::new())),
+        "clipboard_file_snapshot" => ser(Ok::<crate::clipboard::ClipboardFileSnapshot, String>(
+            crate::clipboard::ClipboardFileSnapshot {
+                paths: Vec::new(),
+                change_count: None,
+            },
+        )),
         // Same reason: nothing to write. The tab keeps the in-app tree
         // clipboard, so Copy/Paste inside the tree still works.
         "clipboard_set_file_paths" => ser(Ok::<(), String>(())),

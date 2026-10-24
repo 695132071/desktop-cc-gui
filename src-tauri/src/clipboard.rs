@@ -10,6 +10,17 @@
 //! item here so Finder / Explorer can paste the real file, and reads it back
 //! so a copy made in another app can be pasted into the tree.
 
+use serde::Serialize;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardFileSnapshot {
+    pub paths: Vec<String>,
+    /// Native clipboard generation, used to distinguish an unchanged stale
+    /// file list from a newer copy made outside the app.
+    pub change_count: Option<u64>,
+}
+
 /// Absolute paths of the files on the general clipboard, in pasteboard
 /// order. Empty when the clipboard holds no file (plain text, a screenshot's
 /// raw bytes, an image editor's internal data, ...).
@@ -17,8 +28,8 @@
 /// Runs on the command's thread; Tauri executes synchronous commands on the
 /// main thread, which is what the AppKit pasteboard wants.
 #[tauri::command]
-pub fn clipboard_file_paths() -> Vec<String> {
-    os_file_paths()
+pub fn clipboard_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
+    os_file_snapshot()
 }
 
 /// Replace the general clipboard with a file list, so another app's paste
@@ -29,22 +40,28 @@ pub fn clipboard_file_paths() -> Vec<String> {
 /// clipboard as a dangling reference.
 #[tauri::command]
 pub fn clipboard_set_file_paths(paths: Vec<String>) -> Result<(), String> {
+    set_existing_file_paths(paths, platform::set_file_paths)
+}
+
+fn set_existing_file_paths(
+    paths: Vec<String>,
+    write: impl FnOnce(&[String]) -> Result<(), String>,
+) -> Result<(), String> {
     let existing: Vec<String> = paths
         .into_iter()
-        .map(|path| path.trim().to_string())
         .filter(|path| !path.is_empty() && std::path::Path::new(path).exists())
         .collect();
     if existing.is_empty() {
         return Err("no existing path to put on the clipboard".to_string());
     }
-    platform::set_file_paths(&existing)
+    write(&existing)
 }
 
 /// Host-side read used by file commands: the clipboard is the source of
 /// truth for "paste", and its paths must never travel through the renderer
 /// (that would turn a paste command into an arbitrary-filesystem read).
-pub(crate) fn os_file_paths() -> Vec<String> {
-    platform::file_paths()
+pub(crate) fn os_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
+    platform::file_snapshot()
 }
 
 #[cfg(target_os = "macos")]
@@ -57,9 +74,14 @@ mod platform {
 
     type Writing = ProtocolObject<dyn NSPasteboardWriting>;
 
-    pub(super) fn file_paths() -> Vec<String> {
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
         let pasteboard = NSPasteboard::generalPasteboard();
-        read_file_urls(&pasteboard)
+        let change_count = u64::try_from(pasteboard.changeCount())
+            .map_err(|error| format!("cannot read the clipboard generation: {error}"))?;
+        Ok(super::ClipboardFileSnapshot {
+            paths: read_file_urls(&pasteboard),
+            change_count: Some(change_count),
+        })
     }
 
     pub(super) fn set_file_paths(paths: &[String]) -> Result<(), String> {
@@ -124,24 +146,26 @@ mod platform {
     use windows::core::BOOL;
     use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, POINT};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
-        OpenClipboard, SetClipboardData,
+        CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+        IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     use windows::Win32::System::Ole::CF_HDROP;
     use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
-    pub(super) fn file_paths() -> Vec<String> {
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
         // SAFETY: the clipboard is opened for the shortest possible window
-        // and closed on every path; a concurrent owner just means this read
-        // returns nothing instead of blocking.
+        // and closed on every path; failure to open it is a real read error,
+        // not an empty file list.
         unsafe {
-            if OpenClipboard(None).is_err() {
-                return Vec::new();
-            }
+            OpenClipboard(None).map_err(|e| format!("cannot open the clipboard: {e}"))?;
             let paths = read_hdrop();
+            let change_count = GetClipboardSequenceNumber();
             let _ = CloseClipboard();
-            paths
+            Ok(super::ClipboardFileSnapshot {
+                paths: paths?,
+                change_count: Some(u64::from(change_count)),
+            })
         }
     }
 
@@ -222,13 +246,12 @@ mod platform {
         payload
     }
 
-    unsafe fn read_hdrop() -> Vec<String> {
+    unsafe fn read_hdrop() -> Result<Vec<String>, String> {
         if IsClipboardFormatAvailable(u32::from(CF_HDROP.0)).is_err() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        let Ok(handle) = GetClipboardData(u32::from(CF_HDROP.0)) else {
-            return Vec::new();
-        };
+        let handle = GetClipboardData(u32::from(CF_HDROP.0))
+            .map_err(|e| format!("cannot read the clipboard file list: {e}"))?;
         let drop = HDROP(handle.0);
         // `0xFFFFFFFF` asks for the file count, not a name.
         let count = DragQueryFileW(drop, u32::MAX, None);
@@ -243,7 +266,7 @@ mod platform {
             buf.truncate(written as usize);
             paths.push(String::from_utf16_lossy(&buf));
         }
-        paths
+        Ok(paths)
     }
 }
 
@@ -252,8 +275,11 @@ mod platform {
     /// Linux clipboard file lists would need the GTK/X11 selection stack,
     /// which this app does not link against; the browser side sees file URLs
     /// via `text/uri-list` there, and the composer falls back to that.
-    pub(super) fn file_paths() -> Vec<String> {
-        Vec::new()
+    pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
+        Ok(super::ClipboardFileSnapshot {
+            paths: Vec::new(),
+            change_count: None,
+        })
     }
 
     /// Writing a file list needs the same GTK/X11 selection stack the read
@@ -262,6 +288,33 @@ mod platform {
     /// is unavailable.
     pub(super) fn set_file_paths(_paths: &[String]) -> Result<(), String> {
         Err("this platform has no native file clipboard bridge".to_string())
+    }
+}
+#[cfg(test)]
+mod path_tests {
+    #[cfg(unix)]
+    #[test]
+    fn trailing_space_is_part_of_the_existing_path_not_input_to_trim() {
+        let directory = std::env::temp_dir().join(format!(
+            "ccgui-clipboard-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let selected = directory.join("report ");
+        let other = directory.join("report");
+        std::fs::write(&selected, b"selected").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        let mut written = Vec::new();
+        super::set_existing_file_paths(
+            vec![selected.to_string_lossy().into_owned(), String::new()],
+            |paths| {
+                written.extend_from_slice(paths);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(written, [selected.to_string_lossy()]);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -309,10 +362,7 @@ mod tests {
 
     #[test]
     fn reads_file_urls_in_order() {
-        let pasteboard = write_test_pasteboard(
-            &["/tmp/notes with space.md", "/tmp/pic.png"],
-            None,
-        );
+        let pasteboard = write_test_pasteboard(&["/tmp/notes with space.md", "/tmp/pic.png"], None);
         assert_eq!(
             read_file_urls(&pasteboard),
             vec![
@@ -325,7 +375,10 @@ mod tests {
     #[test]
     fn ignores_web_urls() {
         let pasteboard = write_test_pasteboard(&["/tmp/keep.txt"], Some("https://example.com/a"));
-        assert_eq!(read_file_urls(&pasteboard), vec!["/tmp/keep.txt".to_string()]);
+        assert_eq!(
+            read_file_urls(&pasteboard),
+            vec!["/tmp/keep.txt".to_string()]
+        );
     }
 
     #[test]
@@ -333,9 +386,9 @@ mod tests {
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         pasteboard.clearContents();
         let text = NSString::from_str("just text");
-        pasteboard.writeObjects(&NSArray::from_retained_slice(&[ProtocolObject::from_retained(
-            text,
-        )]));
+        pasteboard.writeObjects(&NSArray::from_retained_slice(&[
+            ProtocolObject::from_retained(text),
+        ]));
         assert!(read_file_urls(&pasteboard).is_empty());
     }
 }

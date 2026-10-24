@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { VisibleNode } from "./FileTreeRow";
 
 const mocks = vi.hoisted(() => ({
-  clipboardFilePaths: vi.fn(),
+  clipboardFileSnapshot: vi.fn(),
   setClipboardFilePaths: vi.fn(),
   pasteClipboardItems: vi.fn(),
   pasteItem: vi.fn(),
@@ -79,12 +79,21 @@ const contextMenuEvent = () =>
 async function flush() {
   for (let i = 0; i < 20; i += 1) await Promise.resolve();
 }
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("file tree clipboard sync", () => {
   beforeEach(() => {
     globalThis.IS_REACT_ACT_ENVIRONMENT = true;
     vi.clearAllMocks();
-    mocks.clipboardFilePaths.mockResolvedValue([]);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: [], changeCount: null });
     mocks.setClipboardFilePaths.mockResolvedValue(undefined);
     mocks.pasteClipboardItems.mockResolvedValue({ created: [], failed: [] });
     mocks.pasteItem.mockResolvedValue({ path: "/repo/notes.md", isDir: false });
@@ -123,7 +132,7 @@ describe("file tree clipboard sync", () => {
   });
 
   it("Paste uses the OS clipboard even when the in-app item differs", async () => {
-    mocks.clipboardFilePaths.mockResolvedValue(["/elsewhere/draft.md"]);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: ["/elsewhere/draft.md"], changeCount: 7 });
     mocks.pasteClipboardItems.mockResolvedValue({
       created: [{ path: "/repo/draft.md", isDir: false }],
       failed: [],
@@ -141,6 +150,142 @@ describe("file tree clipboard sync", () => {
     expect(mocks.pasteItem).not.toHaveBeenCalled();
   });
 
+  it("Paste uses the new tree copy when its OS write failed and the old OS files remain", async () => {
+    const write = deferred<void>();
+    mocks.setClipboardFilePaths.mockReturnValue(write.promise);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: ["/elsewhere/old-a.md"], changeCount: 7 });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/new-b.md")));
+    act(() => hook.result.current.copyItem());
+    await act(async () => {
+      write.reject(new Error("clipboard is occupied"));
+      await flush();
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+
+    expect(mocks.pasteItem).toHaveBeenCalledWith("/repo/new-b.md", "/repo");
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+  });
+
+  it("Paste prefers a newer external copy when its own OS write failed", async () => {
+    mocks.setClipboardFilePaths.mockRejectedValue(new Error("clipboard is occupied"));
+    mocks.clipboardFileSnapshot
+      .mockResolvedValueOnce({ paths: ["/elsewhere/old-a.md"], changeCount: 7 })
+      .mockResolvedValueOnce({ paths: ["/elsewhere/old-a.md"], changeCount: 7 })
+      .mockResolvedValueOnce({ paths: ["/elsewhere/new-c.md"], changeCount: 8 })
+      .mockResolvedValueOnce({ paths: ["/elsewhere/new-c.md"], changeCount: 8 });
+    mocks.pasteClipboardItems.mockResolvedValue({
+      created: [{ path: "/repo/new-c.md", isDir: false }],
+      failed: [],
+    });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+
+    await act(async () => {
+      hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/new-b.md"));
+      await flush();
+      hook.result.current.copyItem();
+      await flush();
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+
+    expect(mocks.pasteClipboardItems).toHaveBeenCalledWith("/repo");
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+  });
+
+  it("Paste waits for an in-flight copy write before choosing its source", async () => {
+    const write = deferred<void>();
+    mocks.setClipboardFilePaths.mockReturnValue(write.promise);
+    mocks.clipboardFileSnapshot.mockResolvedValue({
+      paths: ["/repo/new-b.md"],
+      changeCount: 8,
+    });
+    mocks.pasteClipboardItems.mockResolvedValue({
+      created: [{ path: "/repo/new-b.md", isDir: false }],
+      failed: [],
+    });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/new-b.md")));
+    await act(async () => {
+      hook.result.current.copyItem();
+      await flush();
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+
+    await act(async () => {
+      write.resolve();
+      await flush();
+    });
+    expect(mocks.pasteClipboardItems).toHaveBeenCalledWith("/repo");
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+  });
+
+  it("serializes consecutive copies so an older write cannot finish last", async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    mocks.setClipboardFilePaths
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/a.md")));
+    await act(async () => {
+      hook.result.current.copyItem();
+      await flush();
+    });
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/b.md")));
+    await act(async () => {
+      hook.result.current.copyItem();
+      await flush();
+    });
+    expect(mocks.setClipboardFilePaths).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      first.resolve();
+      await flush();
+    });
+    expect(mocks.setClipboardFilePaths).toHaveBeenLastCalledWith(["/repo/b.md"]);
+    expect(mocks.setClipboardFilePaths).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      second.resolve();
+      await flush();
+    });
+  });
+  it("does not paste the failed tree copy after an external text-only copy", async () => {
+    mocks.setClipboardFilePaths.mockRejectedValue(new Error("clipboard is occupied"));
+    mocks.clipboardFileSnapshot
+      .mockResolvedValueOnce({ paths: ["/elsewhere/old-a.md"], changeCount: 7 })
+      .mockResolvedValueOnce({ paths: ["/elsewhere/old-a.md"], changeCount: 7 })
+      .mockResolvedValueOnce({ paths: [], changeCount: 8 })
+      .mockResolvedValueOnce({ paths: [], changeCount: 8 });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+
+    await act(async () => {
+      hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/new-b.md"));
+      await flush();
+    });
+    await act(async () => {
+      hook.result.current.copyItem();
+      await flush();
+    });
+    await act(async () => {
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+    expect(hook.result.current.notice).toBe("files.pasteUnavailable");
+  });
   it("Paste falls back to the in-app item when the OS clipboard has no files", async () => {
     useFilesStore.setState({ clipboard: { path: "/repo/notes.md", isDir: false } });
 
@@ -153,6 +298,22 @@ describe("file tree clipboard sync", () => {
 
     expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
     expect(mocks.pasteItem).toHaveBeenCalledWith("/repo/notes.md", "/repo");
+  });
+
+  it("Paste reports an OS read failure instead of falling back to a stale tree item", async () => {
+    mocks.clipboardFileSnapshot.mockRejectedValue(new Error("clipboard is occupied"));
+    useFilesStore.setState({ clipboard: { path: "/repo/stale-a.md", isDir: false } });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+
+    await act(async () => {
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+    expect(hook.result.current.notice).toBe("files.opFailed: clipboard is occupied");
   });
 
   it("Paste says so when neither clipboard has a source", async () => {
@@ -170,7 +331,7 @@ describe("file tree clipboard sync", () => {
   });
 
   it("reports items the host could not copy instead of failing silently", async () => {
-    mocks.clipboardFilePaths.mockResolvedValue(["/elsewhere/gone.md"]);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: ["/elsewhere/gone.md"], changeCount: 7 });
     mocks.pasteClipboardItems.mockResolvedValue({
       created: [],
       failed: ["stat /elsewhere/gone.md: not found"],
@@ -189,7 +350,7 @@ describe("file tree clipboard sync", () => {
   });
 
   it("says so when the OS clipboard empties before the host reads it", async () => {
-    mocks.clipboardFilePaths.mockResolvedValue(["/elsewhere/draft.md"]);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: ["/elsewhere/draft.md"], changeCount: 7 });
     mocks.pasteClipboardItems.mockResolvedValue({ created: [], failed: [] });
 
     const hook = renderHook(() => useFileTreeOperations());
@@ -203,7 +364,7 @@ describe("file tree clipboard sync", () => {
   });
 
   it("enables Paste from the OS clipboard alone", async () => {
-    mocks.clipboardFilePaths.mockResolvedValue(["/elsewhere/draft.md"]);
+    mocks.clipboardFileSnapshot.mockResolvedValue({ paths: ["/elsewhere/draft.md"], changeCount: 7 });
     useFilesStore.setState({ clipboard: null });
 
     const hook = renderHook(() => useFileTreeOperations());
@@ -216,5 +377,95 @@ describe("file tree clipboard sync", () => {
     });
 
     expect(hook.result.current.canPaste).toBe(true);
+  });
+
+  it("ignores an older menu clipboard probe that resolves after the latest one", async () => {
+    const first = deferred<{ paths: string[]; changeCount: number }>();
+    const second = deferred<{ paths: string[]; changeCount: number }>();
+    mocks.clipboardFileSnapshot
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    useFilesStore.setState({ clipboard: null });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+
+    act(() => {
+      hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/first"));
+      hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/second"));
+    });
+    await act(async () => {
+      second.resolve({ paths: [], changeCount: 8 });
+      await flush();
+    });
+    expect(hook.result.current.canPaste).toBe(false);
+
+    await act(async () => {
+      first.resolve({ paths: ["/elsewhere/old-a.md"], changeCount: 7 });
+      await flush();
+    });
+    expect(hook.result.current.canPaste).toBe(false);
+  });
+
+  it("ignores a menu clipboard probe that resolves after unmount", async () => {
+    const probe = deferred<{ paths: string[]; changeCount: number }>();
+    mocks.clipboardFileSnapshot.mockReturnValue(probe.promise);
+    useFilesStore.setState({ clipboard: null });
+    const hook = renderHook(() => useFileTreeOperations());
+
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo")));
+    hook.unmount();
+    await act(async () => {
+      probe.resolve({ paths: ["/elsewhere/old-a.md"], changeCount: 7 });
+      await flush();
+    });
+    expect(mocks.setClipboardFilePaths).not.toHaveBeenCalled();
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+  });
+
+  it("restarts Paste source selection when a Copy arrives during its read", async () => {
+    const firstRead = deferred<{ paths: string[]; changeCount: number }>();
+    mocks.clipboardFileSnapshot
+      .mockReturnValueOnce(firstRead.promise)
+      .mockResolvedValue({ paths: ["/repo/new-b.md"], changeCount: 8 });
+    mocks.pasteClipboardItems.mockResolvedValue({
+      created: [{ path: "/repo/new-b.md", isDir: false }],
+      failed: [],
+    });
+    useFilesStore.setState({ clipboard: null });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+    await act(async () => {
+      hook.result.current.paste("/repo");
+      await flush();
+    });
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
+
+    act(() => hook.result.current.openContextMenu(contextMenuEvent(), node("/repo/new-b.md")));
+    await act(async () => {
+      firstRead.resolve({ paths: ["/elsewhere/old-a.md"], changeCount: 7 });
+      await flush();
+      hook.result.current.copyItem();
+      await flush();
+    });
+
+    expect(mocks.pasteClipboardItems).toHaveBeenCalledWith("/repo");
+    expect(mocks.pasteItem).not.toHaveBeenCalled();
+  });
+  it("ignores a menu clipboard probe that resolves after the menu closes", async () => {
+    const probe = deferred<{ paths: string[]; changeCount: number }>();
+    mocks.clipboardFileSnapshot.mockReturnValue(probe.promise);
+    useFilesStore.setState({ clipboard: null });
+    const hook = renderHook(() => useFileTreeOperations());
+    unmount = hook.unmount;
+    act(() => {
+      hook.result.current.openContextMenu(contextMenuEvent(), node("/repo"));
+      hook.result.current.closeMenu();
+    });
+    await act(async () => {
+      probe.resolve({ paths: ["/elsewhere/old-a.md"], changeCount: 7 });
+      await flush();
+    });
+    expect(hook.result.current.canPaste).toBe(false);
+    expect(mocks.pasteClipboardItems).not.toHaveBeenCalled();
   });
 });

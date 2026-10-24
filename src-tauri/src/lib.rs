@@ -459,7 +459,7 @@ pub fn run() {
             engine::images::import_attachments,
             // clipboard file lists (paste of Finder/Explorer copies, and the
             // file tree's Copy/Paste round trip)
-            clipboard::clipboard_file_paths,
+            clipboard::clipboard_file_snapshot,
             clipboard::clipboard_set_file_paths,
             // computer use
             computer_use::computer_use_permission_status,

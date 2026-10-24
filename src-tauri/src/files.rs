@@ -351,7 +351,11 @@ fn copy_destination_name(source: &Path, is_dir: bool, counter: u32) -> Result<St
     })
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_dir_recursive_with(
+    src: &Path,
+    dst: &Path,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
+) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries {
@@ -365,10 +369,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             return Err(format!("cannot copy symlink {}", src_path.display()));
         }
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_with(&src_path, &dst_path, copy_file)?;
         } else {
-            std::fs::copy(&src_path, &dst_path)
-                .map_err(|e| format!("copy {}: {e}", src_path.display()))?;
+            copy_file(&src_path, &dst_path)?;
         }
     }
     Ok(())
@@ -377,11 +380,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 /// Copy `source` into `target_dir`, picking a collision-free destination
 /// (`prefer_original_name` keeps the plain name when it is free — paste;
 /// duplicates always take the " copy" suffix). Returns the destination.
-fn copy_item_into_dir(
+fn copy_item_into_dir_with(
     source: &Path,
     is_dir: bool,
     target_dir: &Path,
     prefer_original_name: bool,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
 ) -> Result<PathBuf, String> {
     if is_dir && target_dir.starts_with(source) {
         return Err("cannot paste a folder into itself or its descendant".to_string());
@@ -400,13 +404,139 @@ fn copy_item_into_dir(
             .find(|candidate| !candidate.exists())
             .ok_or_else(|| "too many copies exist".to_string())?;
     }
+    // A unique staged name isolates concurrent copies; only this operation's
+    // temporary item is ever cleaned up.
+    let temporary = target_dir.join(format!(
+        ".{source_name}.ccgui-copying-{}",
+        uuid::Uuid::new_v4()
+    ));
     if is_dir {
-        copy_dir_recursive(source, &destination)?;
+        std::fs::create_dir(&temporary)
+            .map_err(|error| format!("mkdir {}: {error}", temporary.display()))?;
+    }
+    let copy_result = if is_dir {
+        copy_dir_recursive_with(source, &temporary, copy_file)
     } else {
-        std::fs::copy(source, &destination)
-            .map_err(|e| format!("copy {}: {e}", source.display()))?;
+        copy_file(source, &temporary).map(|_| ())
+    };
+    if let Err(error) = copy_result {
+        return Err(remove_partial_copy(&temporary, is_dir, error));
+    }
+    if let Err(error) = publish_copy(&temporary, &destination) {
+        let error = format!("rename {}: {error}", destination.display());
+        return Err(remove_partial_copy(&temporary, is_dir, error));
     }
     Ok(destination)
+}
+
+/// Publish a complete staged item without replacing a destination that
+/// appeared while it was being copied. All staging paths are siblings of the
+/// destination, so the native rename stays on one filesystem.
+#[cfg(windows)]
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Without MOVEFILE_REPLACE_EXISTING, MoveFileExW refuses to replace an
+    // existing file; existing directories are rejected either way.
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: both NUL-terminated paths are alive for the call; RENAME_EXCL
+    // asks the host filesystem to reject an existing destination atomically.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: AT_FDCWD resolves both relative paths against this process's
+    // unchanged working directory. Absolute staging paths are used in practice.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn remove_partial_copy(path: &Path, is_dir: bool, error: String) -> String {
+    let cleanup = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match cleanup {
+        Ok(()) => error,
+        // A copy may fail before creating its temporary file. There is no
+        // partial item to report in that case.
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup_error) => format!(
+            "{error}; partial copy remains at {}: {cleanup_error}",
+            path.display()
+        ),
+    }
+}
+
+fn copy_item_into_dir(
+    source: &Path,
+    is_dir: bool,
+    target_dir: &Path,
+    prefer_original_name: bool,
+) -> Result<PathBuf, String> {
+    copy_item_into_dir_with(
+        source,
+        is_dir,
+        target_dir,
+        prefer_original_name,
+        &mut |source, destination| {
+            let mut reader = std::fs::File::open(source)
+                .map_err(|e| format!("open {}: {e}", source.display()))?;
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .map_err(|e| format!("create {}: {e}", destination.display()))?;
+            std::io::copy(&mut reader, &mut writer)
+                .map_err(|e| format!("copy {}: {e}", source.display()))
+        },
+    )
 }
 
 #[tauri::command]
@@ -473,28 +603,36 @@ fn copy_clipboard_items_into(sources: &[String], target_dir: &Path) -> PasteClip
     let mut created = Vec::new();
     let mut failed = Vec::new();
     for raw in sources {
-        let source = match canonicalize_lenient(Path::new(raw)) {
+        let original = Path::new(raw);
+        let original_meta = match std::fs::symlink_metadata(original) {
+            Ok(meta) => meta,
+            Err(e) => {
+                failed.push(format!("stat {}: {e}", original.display()));
+                continue;
+            }
+        };
+        if original_meta.file_type().is_symlink() {
+            failed.push(format!("cannot copy symlink {}", original.display()));
+            continue;
+        }
+        let source = match canonicalize_lenient(original) {
             Ok(source) => source,
             Err(e) => {
                 failed.push(e);
                 continue;
             }
         };
-        let meta = match std::fs::symlink_metadata(&source) {
-            Ok(meta) => meta,
+        let is_dir = match std::fs::metadata(&source) {
+            Ok(meta) => meta.is_dir(),
             Err(e) => {
                 failed.push(format!("stat {}: {e}", source.display()));
                 continue;
             }
         };
-        if meta.file_type().is_symlink() {
-            failed.push(format!("cannot copy symlink {}", source.display()));
-            continue;
-        }
-        match copy_item_into_dir(&source, meta.is_dir(), target_dir, true) {
+        match copy_item_into_dir(&source, is_dir, target_dir, true) {
             Ok(destination) => created.push(FileOpResult {
                 path: destination.to_string_lossy().into_owned(),
-                is_dir: meta.is_dir(),
+                is_dir,
             }),
             Err(e) => failed.push(e),
         }
@@ -514,7 +652,8 @@ pub fn paste_clipboard_items(
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", dir.display()));
     }
-    Ok(copy_clipboard_items_into(&crate::clipboard::os_file_paths(), &dir))
+    let snapshot = crate::clipboard::os_file_snapshot()?;
+    Ok(copy_clipboard_items_into(&snapshot.paths, &dir))
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an
@@ -764,6 +903,137 @@ mod tests {
             std::fs::read(destination.0.join("notes.md")).unwrap(),
             b"hi"
         );
+    }
+
+    #[test]
+    fn failed_directory_copy_leaves_no_destination_and_retry_keeps_its_name() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.txt"), b"a").unwrap();
+        std::fs::write(directory.join("b.txt"), b"b").unwrap();
+
+        let mut copies = 0;
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, destination| {
+                copies += 1;
+                if copies == 2 {
+                    Err("injected copy failure after a completed file".to_string())
+                } else {
+                    std::fs::copy(source, destination).map_err(|error| error.to_string())
+                }
+            },
+        );
+        assert_eq!(copies, 2, "the failure must happen after a real file copy");
+        assert!(copied.unwrap_err().contains("injected copy failure"));
+        assert!(!destination.0.join("assets").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+
+        let retry = copy_item_into_dir(&directory, true, &destination.0, true).unwrap();
+        assert_eq!(retry, destination.0.join("assets"));
+        assert_eq!(std::fs::read(retry.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(retry.join("b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn a_file_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("notes.md");
+        std::fs::write(&file, b"new copy").unwrap();
+        let mut competing_file = None;
+
+        let copied = copy_item_into_dir_with(
+            &file,
+            false,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                let competing = destination.0.join("notes.md");
+                std::fs::write(&competing, b"external").unwrap();
+                competing_file = Some(competing);
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(std::fs::read(competing_file.unwrap()).unwrap(), b"external");
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_directory_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("copy.txt"), b"copy").unwrap();
+
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                std::fs::create_dir(destination.0.join("assets")).unwrap();
+                std::fs::write(
+                    destination.0.join("assets").join("external.txt"),
+                    b"external",
+                )
+                .unwrap();
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(
+            std::fs::read(destination.0.join("assets").join("external.txt")).unwrap(),
+            b"external"
+        );
+        assert!(!destination.0.join("assets").join("copy.txt").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn cleanup_failure_reports_the_staged_item_path() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("incomplete");
+        std::fs::create_dir(&directory).unwrap();
+
+        let error = remove_partial_copy(&directory, false, "copy failed".to_string());
+
+        assert!(error.starts_with("copy failed"));
+        assert!(error.contains("partial copy remains at"));
+        assert!(error.contains(&directory.to_string_lossy().to_string()));
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_paste_rejects_top_level_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        std::fs::write(source.0.join("target.txt"), b"target").unwrap();
+        std::fs::create_dir(source.0.join("target-dir")).unwrap();
+        symlink(source.0.join("target.txt"), source.0.join("file-link")).unwrap();
+        symlink(source.0.join("target-dir"), source.0.join("dir-link")).unwrap();
+        let sources = ["file-link", "dir-link"]
+            .map(|name| source.0.join(name).to_string_lossy().into_owned());
+
+        let result = copy_clipboard_items_into(&sources, &destination.0);
+
+        assert!(result.created.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(result.failed.iter().all(|error| error.contains("symlink")));
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
     }
 
     #[test]

@@ -1,13 +1,19 @@
-import { useCallback, useEffect, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { copyText } from "@/lib/clipboard";
-import { ipc } from "@/lib/ipc";
+import { ipc, type ClipboardFileSnapshot } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { joinPath, parentPath, useFilesStore, type TreeClipboard } from "./store";
 import type { FileTreeMenuState } from "./FileTreeContextMenu";
 import type { VisibleNode } from "./FileTreeRow";
 import { useChatStore } from "@/features/chat/store";
 
+interface PendingTreeCopy {
+  id: number;
+  /** Undefined means no unchanged clipboard generation was proven. */
+  beforeChangeCount?: number | null;
+  write: Promise<void>;
+}
 interface PromptState {
   kind: "newFile" | "newFolder" | "rename";
   /** Parent dir for newFile/newFolder; the item itself for rename. */
@@ -61,6 +67,11 @@ export function useFileTreeOperations(): FileTreeOperations {
   const invalidateDir = useFilesStore((s) => s.invalidateDir);
   const selectPath = useFilesStore((s) => s.selectPath);
 
+  const copyIdRef = useRef(0);
+  const pendingCopyRef = useRef<PendingTreeCopy | null>(null);
+  const clipboardWriteRef = useRef<Promise<void>>(Promise.resolve());
+  const clipboardProbeRef = useRef(0);
+  const mountedRef = useRef(true);
   const [menu, setMenu] = useState<FileTreeMenuState | null>(null);
   const [prompt, setPrompt] = useState<PromptState | null>(null);
   const [trashTarget, setTrashTarget] = useState<TrashTarget | null>(null);
@@ -76,8 +87,19 @@ export function useFileTreeOperations(): FileTreeOperations {
     return () => clearTimeout(timer);
   }, [notice]);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      copyIdRef.current += 1;
+      clipboardProbeRef.current += 1;
+    };
+  }, []);
+
   const opFailed = useCallback(
-    (e: unknown) => setNotice(t("files.opFailed", { message: errorText(e) })),
+    (e: unknown) => {
+      if (mountedRef.current) setNotice(t("files.opFailed", { message: errorText(e) }));
+    },
     [t],
   );
 
@@ -86,12 +108,21 @@ export function useFileTreeOperations(): FileTreeOperations {
       event.preventDefault();
       selectPath(node.path, node.isDir);
       setMenu({ x: event.clientX, y: event.clientY, path: node.path, isDir: node.isDir });
-      // Paste's enabled state depends on a clipboard other apps can change
-      // between menus, so every open asks the host again.
+      // Only the latest open may update Paste; closing invalidates the probe.
+      const probeId = ++clipboardProbeRef.current;
+      setSystemClipboard(null);
       void ipc
-        .clipboardFilePaths()
-        .then(setSystemClipboard)
-        .catch(() => setSystemClipboard([]));
+        .clipboardFileSnapshot()
+        .then((snapshot) => {
+          if (mountedRef.current && clipboardProbeRef.current === probeId) {
+            setSystemClipboard(snapshot.paths);
+          }
+        })
+        .catch(() => {
+          if (mountedRef.current && clipboardProbeRef.current === probeId) {
+            setSystemClipboard([]);
+          }
+        });
     },
     [selectPath],
   );
@@ -109,7 +140,10 @@ export function useFileTreeOperations(): FileTreeOperations {
     [root, toggleDir, invalidateDir, selectPath],
   );
 
-  const closeMenu = useCallback(() => setMenu(null), []);
+  const closeMenu = useCallback(() => {
+    clipboardProbeRef.current += 1;
+    setMenu(null);
+  }, []);
 
   const submitPrompt = useCallback(
     async (name: string) => {
@@ -163,22 +197,43 @@ export function useFileTreeOperations(): FileTreeOperations {
   const handlePaste = useCallback(
     async (targetDir: string) => {
       try {
-        // The OS clipboard is the truth: if the user copied something in
-        // Finder / Explorer (or copied a different item in another app)
-        // after our own Copy, a stale in-app item must not win.
-        const systemFiles = await ipc.clipboardFilePaths().catch(() => []);
-        if (systemFiles.length > 0) {
+        // Copy ids are captured around both waits and reads. A Copy that
+        // arrives while Paste is reading invalidates that source decision.
+        let pending = pendingCopyRef.current;
+        if (pending) await pending.write.catch(() => {});
+        let snapshot: ClipboardFileSnapshot;
+        for (;;) {
+          const copyId = copyIdRef.current;
+          pending = pendingCopyRef.current;
+          // The host reads its own snapshot inside pasteClipboardItems;
+          // renderer-supplied source paths never enter the paste command.
+          snapshot = await ipc.clipboardFileSnapshot();
+          if (copyIdRef.current === copyId) break;
+        }
+        if (!mountedRef.current) return;
+        const usePendingCopy =
+          pending &&
+          (snapshot.changeCount === null ||
+            (pending.beforeChangeCount !== undefined &&
+              snapshot.changeCount === pending.beforeChangeCount));
+        if (snapshot.paths.length > 0 && !usePendingCopy) {
           const { created, failed } = await ipc.pasteClipboardItems(targetDir);
           if (created.length > 0) {
             const last = created[created.length - 1];
             await revealInTree(targetDir, last.path, last.isDir);
           }
+          if (!mountedRef.current) return;
           if (failed.length > 0) {
             setNotice(t("files.opFailed", { message: failed.join("; ") }));
           } else if (created.length === 0) {
-            // The clipboard was emptied between the probe and the host read.
             setNotice(t("files.pasteUnavailable"));
           }
+          return;
+        }
+        if (pending && !usePendingCopy) {
+          // A newer external clipboard containing only text must invalidate
+          // the failed write's tree fallback too.
+          setNotice(t("files.pasteUnavailable"));
           return;
         }
         const item = useFilesStore.getState().clipboard;
@@ -207,11 +262,37 @@ export function useFileTreeOperations(): FileTreeOperations {
 
   const copyItem = useCallback(() => {
     if (!menu) return;
-    useFilesStore.getState().setClipboard({ path: menu.path, isDir: menu.isDir });
-    // Mirror the staged item onto the OS clipboard so pasting in Finder /
-    // Explorer copies the real file. Best-effort: the in-app stage above is
-    // what Linux (no native file clipboard) and a refused write fall back to.
-    void ipc.setClipboardFilePaths([menu.path]).catch(() => {});
+    const item = { path: menu.path, isDir: menu.isDir };
+    const id = ++copyIdRef.current;
+    useFilesStore.getState().setClipboard(item);
+    const pending: PendingTreeCopy = { id, write: Promise.resolve() };
+    pendingCopyRef.current = pending;
+    // Serialize native writes: a late write for an older Copy must not
+    // overwrite the newer item. Capture the generation immediately before
+    // this copy's actual native write.
+    const write = clipboardWriteRef.current.catch(() => {}).then(async () => {
+      if (copyIdRef.current !== id) return;
+      const before = await ipc.clipboardFileSnapshot();
+      if (copyIdRef.current !== id) return;
+      try {
+        await ipc.setClipboardFilePaths([item.path]);
+      } catch (error) {
+        const after = await ipc.clipboardFileSnapshot().catch(() => null);
+        pending.beforeChangeCount =
+          after?.changeCount === before.changeCount ? before.changeCount : undefined;
+        throw error;
+      }
+    });
+    pending.write = write;
+    clipboardWriteRef.current = write;
+    void write.then(
+      () => {
+        if (copyIdRef.current === id) pendingCopyRef.current = null;
+      },
+      () => {
+        // Keep the failed copy for the unchanged-generation fallback.
+      },
+    );
   }, [menu]);
 
   const copyPath = useCallback(() => {
