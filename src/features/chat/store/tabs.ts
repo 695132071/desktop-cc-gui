@@ -202,6 +202,7 @@ export function createTabActions(
     startNewChat: (workspacePath) => {
       // One pending chat per workspace+engine: re-focus it instead of
       // piling up empty "new" tabs.
+      const previous = get().active;
       set((s) => {
         const existing = s.openTabs.find(
           (t) =>
@@ -246,6 +247,22 @@ export function createTabActions(
         delete drafts[UNBOUND_DRAFT_KEY];
         return { openTabs, active: tab, pendingRuntimeSwitch, drafts };
       });
+      // New-chat entry points (sidebar, ⌘N, workspace plus) skip activateTab,
+      // so announce the switch here — otherwise plugins keep the previous
+      // session's provider/model (and its sessionId) as the active one.
+      // Re-focusing the same pending tab is not a switch: no event.
+      const tab = get().active;
+      if (
+        tab &&
+        (!previous ||
+          !sameTab(previous, tab.engine, tab.sessionId, tab.workspacePath))
+      ) {
+        emitSessionActivated(
+          tab.engine,
+          tab.sessionId,
+          sessionSelection(get(), tab.engine, tab.sessionId, tab.workspacePath),
+        );
+      }
     },
 
     closeTab: (engine, sessionId, workspacePath) => {
