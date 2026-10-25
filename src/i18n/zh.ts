@@ -1594,6 +1594,7 @@ export const zh = {
         uiPage: "打开独立页面",
         uiTimelineRow: "自定义消息行",
         uiSessionMenu: "会话右键菜单",
+        uiFileLinkMenu: "文件链接右键菜单操作",
         uiSidebarEntry: "侧栏入口",
         uiCenterTab: "中央页签",
         uiConversationMode: "当前聊天内的会话模式",

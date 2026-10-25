@@ -531,6 +531,10 @@ App 市场页 → Rust 拉索引 → 用户点安装 → 从 Release 下载三�
 
 ## 12. 版本更新与兼容性策略
 
+### 文件链接菜单扩展（提案：SDK 0.3.22）
+
+`ctx.ui.registerFileLinkMenuItem({ key?, label(target), icon?, visible?(target), run(target), order? })` 需要 `ui:file-link-menu`。宿主将贡献项放在「打开文件」和所选外部编辑器之间，`order` 仅排序插件项。`target` 是冻结快照 `{ path, resolvedPath, workspacePath }`；`path` 为原始链接路径，`run` 前重新解析并只在 `resolvedPath` 非 null 时派发。解析器可保留尚不存在的候选路径，不提供存在性保证。回调可以返回 Promise；错误不传播到宿主菜单。注册返回 disposer，卸载自动回收，解析期间被替换/移除的旧回调不再派发。此接口是通用 UI 扩展，不包含特定应用或额外的 URL/进程权限；启动外部应用仍须使用声明过的 `exec:<bin>` bridge。依赖本提案的插件必须声明 `sdkVersion: ">=0.3.22"`，API 发布前不得登记为现有客户端可用的市场插件。
+
 ### 12.1 semver 纪律
 
 - **patch**：bug 修复，不变 SDK 用法。

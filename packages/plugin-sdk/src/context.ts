@@ -1,7 +1,7 @@
 import type { ComponentType } from "react";
 import type * as React from "react";
 import type { Disposer } from "./manifest";
-import type { ComposerSlotId, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
+import type { ComposerSlotId, FileLinkMenuTarget, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
 export interface WorkspaceMetadata {
   id: string;
   path: string;
@@ -496,6 +496,17 @@ export interface PluginContext {
       title: () => string;
       keywords?: () => string[];
       run: () => void;
+    }): Disposer;
+    /** Chat file-link actions before the external editor (0.3.22).
+     * Permission: ui:file-link-menu. run receives a non-null resolvedPath
+     * for the clicked link, never the currently active editor's file. */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentType<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
     }): Disposer;
     /** Sidebar session right-click menu row (permission `ui:session-menu`,
      *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 */

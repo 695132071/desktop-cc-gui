@@ -2,6 +2,9 @@ import { useTranslation } from "react-i18next";
 import FileText from "lucide-react/dist/esm/icons/file-text";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
 import Link2 from "lucide-react/dist/esm/icons/link-2";
+import Puzzle from "lucide-react/dist/esm/icons/puzzle";
+import { compareByOrder, fileLinkMenuRegistry, pluginIdFromRegistryKey, useRegistry } from "@ccgui/plugin-sdk";
+import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { copyText } from "@/lib/clipboard";
 import { ipc } from "@/lib/ipc";
@@ -50,6 +53,7 @@ export function FileLinkContextMenu({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const pluginDefs = useRegistry(fileLinkMenuRegistry);
 
   const target =
     OPEN_APP_TARGETS.find((candidate) => candidate.id === readSelectedOpenAppId()) ??
@@ -84,6 +88,44 @@ export function FileLinkContextMenu({
       }),
   };
 
+  const pluginTarget = Object.freeze({
+    path: menu.path,
+    resolvedPath: resolved,
+    workspacePath: menu.workspacePath,
+  });
+  const pluginEntries: ContextMenuEntry[] = [];
+  for (const def of [...pluginDefs].sort(compareByOrder)) {
+    try {
+      if (def.visible?.(pluginTarget) === false) continue;
+      const label = def.label(pluginTarget);
+      if (typeof label !== "string") throw new TypeError("File-link menu label must be a string");
+      const Icon = def.icon ?? Puzzle;
+      pluginEntries.push({
+        id: def.id,
+        label,
+        disabled: !resolved,
+        icon: <PluginBoundary pluginId={pluginIdFromRegistryKey(def.id)}
+          fallback={<Puzzle className="size-4" aria-hidden />}>
+          <Icon className="size-4" aria-hidden />
+        </PluginBoundary>,
+        onSelect: () => act((path) => {
+          // A plugin may unload or replace its registration while resolution
+          // is pending. Do not dispatch its stale callback afterward.
+          if (fileLinkMenuRegistry.get(def.id) !== def) return;
+          try {
+            void Promise.resolve(def.run(Object.freeze({ ...pluginTarget, resolvedPath: path }))).catch(
+              (error: unknown) => console.error(`[plugins] file-link menu ${def.id} action failed`, error),
+            );
+          } catch (error) {
+            console.error(`[plugins] file-link menu ${def.id} action failed`, error);
+          }
+        }),
+      });
+    } catch (error) {
+      console.error(`[plugins] file-link menu ${def.id} failed to resolve`, error);
+    }
+  }
+
   const entries: ContextMenuEntry[] = [
     {
       id: "open-file",
@@ -95,6 +137,7 @@ export function FileLinkContextMenu({
           void useFilesStore.getState().openFile(path);
         }),
     },
+    ...pluginEntries,
     target.kind === "finder"
       ? revealEntry
       : {

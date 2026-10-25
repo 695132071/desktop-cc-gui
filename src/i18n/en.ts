@@ -1651,6 +1651,7 @@ export const en: Messages = {
         uiPage: "Open a standalone page",
         uiTimelineRow: "Custom message rows",
         uiSessionMenu: "Session context menu",
+        uiFileLinkMenu: "File-link context menu actions",
         uiSidebarEntry: "Sidebar entry",
         uiCenterTab: "Center tab",
         uiConversationMode: "Chat-local conversation mode",
