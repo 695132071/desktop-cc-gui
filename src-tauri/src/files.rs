@@ -525,6 +525,9 @@ fn copy_item_into_dir(
         target_dir,
         prefer_original_name,
         &mut |source, destination| {
+            let permissions = std::fs::metadata(source)
+                .map_err(|e| format!("stat {}: {e}", source.display()))?
+                .permissions();
             let mut reader = std::fs::File::open(source)
                 .map_err(|e| format!("open {}: {e}", source.display()))?;
             let mut writer = std::fs::OpenOptions::new()
@@ -532,8 +535,14 @@ fn copy_item_into_dir(
                 .create_new(true)
                 .open(destination)
                 .map_err(|e| format!("create {}: {e}", destination.display()))?;
-            std::io::copy(&mut reader, &mut writer)
-                .map_err(|e| format!("copy {}: {e}", source.display()))
+            let copied = std::io::copy(&mut reader, &mut writer)
+                .map_err(|e| format!("copy {}: {e}", source.display()))?;
+            drop(writer);
+            // io::copy moves bytes only; restore mode bits so executable
+            // scripts and read-only files survive duplicate/paste.
+            std::fs::set_permissions(destination, permissions)
+                .map_err(|e| format!("chmod {}: {e}", destination.display()))?;
+            Ok(copied)
         },
     )
 }
@@ -924,6 +933,25 @@ mod tests {
             std::fs::read(destination.0.join("notes.md")).unwrap(),
             b"hi"
         );
+    }
+
+    /// Regression: duplicate/paste must preserve permission bits — an
+    /// executable script's copy has to stay executable (io::copy alone only
+    /// moves bytes).
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let script = source.0.join("deploy.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let copied = copy_item_into_dir(&script, false, &destination.0, true).unwrap();
+        let mode = std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
     }
 
     #[test]

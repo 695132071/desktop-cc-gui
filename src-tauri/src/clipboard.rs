@@ -35,11 +35,20 @@ pub fn clipboard_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
 /// Replace the general clipboard with a file list, so another app's paste
 /// inserts the actual items (Explorer / Finder semantics, not a path string).
 ///
-/// The renderer may only name paths here: the write exposes nothing back to
-/// it, and a path that does not exist is dropped instead of being put on the
-/// clipboard as a dangling reference.
+/// The renderer may only name paths inside the registered roots
+/// (`ensure_allowed`): anything outside is dropped, so this command cannot
+/// become a write-then-paste bridge that smuggles arbitrary host files into
+/// a workspace. Disallowed and missing paths are dropped alike — the outcome
+/// must not reveal whether an outside path exists.
 #[tauri::command]
-pub fn clipboard_set_file_paths(paths: Vec<String>) -> Result<(), String> {
+pub fn clipboard_set_file_paths(
+    db: tauri::State<'_, std::sync::Arc<crate::db::Db>>,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|path| crate::files::ensure_allowed(path, &db).is_ok())
+        .collect();
     set_existing_file_paths(paths, platform::set_file_paths)
 }
 
