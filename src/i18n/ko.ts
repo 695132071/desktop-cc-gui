@@ -378,7 +378,9 @@ export const ko: Messages = {
     "checkUnreported": "보고되지 않음",
     "checkMismatch": "불일치",
     "checkOkAria": "응답 확인: 응답과 일치",
-    "checkMismatchAria": "응답 확인: 응답과 불일치"
+    "checkMismatchAria": "응답 확인: 응답과 불일치",
+    "pinWorkspace": "워크스페이스 상단 고정",
+    "unpinWorkspace": "워크스페이스 상단 고정 해제"
   },
   "settings": {
     "title": "설정",
