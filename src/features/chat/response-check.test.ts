@@ -15,18 +15,31 @@ describe("compareModel", () => {
     );
   });
 
-  it("treats a date or build suffix as a different model id", () => {
+  it("reads a date or build suffix as a snapshot of the same family", () => {
     expect(compareModel("claude-opus-4-5", "claude-opus-4-5-20251101")).toBe(
-      "mismatch",
+      "snapshot",
     );
     expect(compareModel("claude-opus-4-5-latest", "claude-opus-4-5")).toBe(
-      "mismatch",
+      "snapshot",
     );
-    // Only the provider prefix is ignored; the id itself must match exactly.
+    // The provider prefix is ignored; a dated resolution of the same id is
+    // a snapshot, not a substitution.
     expect(
       compareModel("ds/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-1017"),
+    ).toBe("snapshot");
+    expect(compareModel("ds4.1", "ds4.1-1017")).toBe("snapshot");
+    // Cohere stamps monthly snapshots as `-MM-YYYY`.
+    expect(compareModel("command-r-plus", "command-r-plus-08-2024")).toBe(
+      "snapshot",
+    );
+  });
+
+  it("does not eat a context-length suffix as a date", () => {
+    // `-\d{4}` that is not a plausible MMDD date is part of the id: 8192 is
+    // a real substitution, not a snapshot of 4096.
+    expect(
+      compareModel("qwen2.5-7b-instruct-4096", "qwen2.5-7b-instruct-8192"),
     ).toBe("mismatch");
-    expect(compareModel("ds4.1", "ds4.1-1017")).toBe("mismatch");
   });
 
   it("flags a different model", () => {
@@ -140,6 +153,26 @@ describe("checkResponseSelection", () => {
     expect(view.visible).toBe(true);
   });
 
+  it("reads a dated id of the same family as a neutral snapshot", () => {
+    const view = checkResponseSelection({
+      requested: { model: "claude-sonnet-4-5", effort: "high" },
+      served: { model: "claude-sonnet-4-5-20250929", effort: "high" },
+    });
+    expect(view).toEqual({
+      model: "snapshot",
+      effort: "match",
+      verdict: "snapshot",
+      visible: true,
+    });
+    // A snapshot never outranks a real disagreement on the other axis.
+    expect(
+      checkResponseSelection({
+        requested: { model: "claude-sonnet-4-5", effort: "high" },
+        served: { model: "claude-sonnet-4-5-20250929", effort: "low" },
+      }).verdict,
+    ).toBe("mismatch");
+  });
+
   it("still shows the card when the response side never reported", () => {
     const view = checkResponseSelection({
       requested: { model: "claude-opus-5-5", effort: "xhigh" },
@@ -165,5 +198,28 @@ describe("checkResponseSelection", () => {
     });
     expect(view.effort).toBe("unknown");
     expect(view.verdict).toBe("match");
+  });
+
+  it("stays unknown when the response never reported its model", () => {
+    // omp/pi emit Served{model: None, effort: Some(..)} when only the
+    // thinking level came back: a matching level alone is not a confirmed
+    // model.
+    const view = checkResponseSelection({
+      requested: { model: "deepseek-v4.1-flash", effort: "high" },
+      served: { model: null, effort: "high" },
+    });
+    expect(view).toEqual({
+      model: "unknown",
+      effort: "match",
+      verdict: "unknown",
+      visible: true,
+    });
+    // Same for an unresolved alias whose served model never arrived.
+    expect(
+      checkResponseSelection({
+        requested: { model: "opus", comparisonModel: null, effort: "high" },
+        served: { model: null, effort: "high" },
+      }).verdict,
+    ).toBe("unknown");
   });
 });

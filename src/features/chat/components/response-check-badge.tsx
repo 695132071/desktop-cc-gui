@@ -32,7 +32,11 @@ export function ResponseCheckBadge({
   if (!view.visible) return null;
   const ok = view.verdict !== "mismatch";
   const Icon =
-    view.verdict === "unknown" ? CircleHelp : ok ? CircleCheck : CircleAlert;
+    view.verdict === "unknown" || view.verdict === "snapshot"
+      ? CircleHelp
+      : ok
+        ? CircleCheck
+        : CircleAlert;
   const requested = check?.requested;
   const requestedModel =
     requested?.comparisonModel === null && requested.model
@@ -42,6 +46,7 @@ export function ResponseCheckBadge({
         ? `${requested.model} → ${requested.comparisonModel}`
         : (requested?.model ?? null);
   const mismatch = t("chat.checkMismatch");
+  const snapshot = t("chat.checkSnapshot");
   return (
     <Tooltip delay={200}>
       <Focusable>
@@ -50,9 +55,11 @@ export function ResponseCheckBadge({
           aria-label={
             view.verdict === "unknown"
               ? t("chat.checkUnknownAria")
-              : ok
-                ? t("chat.checkOkAria")
-                : t("chat.checkMismatchAria")
+              : view.verdict === "snapshot"
+                ? t("chat.checkSnapshotAria")
+                : ok
+                  ? t("chat.checkOkAria")
+                  : t("chat.checkMismatchAria")
           }
           className={cx(
             "inline-flex shrink-0 cursor-help items-center justify-center transition-colors",
@@ -77,6 +84,7 @@ export function ResponseCheckBadge({
           value={check?.served.model ?? null}
           verdict={view.model}
           mismatch={mismatch}
+          snapshot={snapshot}
         />
         <CheckRow
           label={t("chat.checkRequestedEffort")}
@@ -99,11 +107,13 @@ function CheckRow({
   value,
   verdict = "unknown",
   mismatch = "",
+  snapshot = "",
 }: {
   label: string;
   value: string | null;
   verdict?: SelectionVerdict;
   mismatch?: string;
+  snapshot?: string;
 }) {
   const { t } = useTranslation();
   const unreported = value === null;
@@ -126,6 +136,11 @@ function CheckRow({
         {verdict === "mismatch" && (
           <span className="whitespace-nowrap text-caption-1-regular">
             {mismatch}
+          </span>
+        )}
+        {verdict === "snapshot" && (
+          <span className="whitespace-nowrap text-caption-1-regular text-text-tertiary">
+            {snapshot}
           </span>
         )}
       </dd>

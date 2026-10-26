@@ -73,7 +73,23 @@ fn served_model_from_sidecar(
 ) -> Option<String> {
     let path = served_models_path(run_id?);
     let text = std::fs::read_to_string(path).ok()?;
-    parse_served_model_sidecar(&text, response_id?)
+    match response_id {
+        Some(id) => parse_served_model_sidecar(&text, id),
+        // The runtime did not name the response id. When the sidecar holds
+        // exactly one observed row, this was a single-request turn and that
+        // row can only belong to it.
+        None => {
+            let rows: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if rows.len() != 1 {
+                return None;
+            }
+            let (_, model) = rows[0].split_once('\t')?;
+            (!model.trim().is_empty()).then(|| model.trim().to_string())
+        }
+    }
 }
 
 /// v2 `rpc_chunk` 分片序列的重组中间态。
@@ -1021,7 +1037,11 @@ fn parse_pi_family_line_with_run(
             // used as served evidence here.
             let response_id = value
                 .get("message")
-                .and_then(|m| m.get("responseId"))
+                .and_then(|m| {
+                    m.get("responseId")
+                        .or_else(|| m.get("response_id"))
+                        .or_else(|| m.get("id"))
+                })
                 .and_then(Value::as_str);
             let served_model = value
                 .get("message")
@@ -1534,6 +1554,85 @@ mod tests {
                     if model == "deepseek/deepseek-v4.1-flash-1017"
             )),
             "the provider-reported model must be used as served evidence: {out:?}"
+        );
+    }
+
+    #[test]
+    fn message_end_accepts_snake_case_and_plain_response_ids() {
+        // Provider/runtime payloads are not consistent about the field name:
+        // the sidecar key is the provider's response id regardless of which
+        // spelling the runtime used on the assistant message.
+        for field in ["response_id", "id"] {
+            let run_id = format!("test-sidecar-{field}-{}", std::process::id());
+            let path = served_models_path(&run_id);
+            std::fs::write(&path, "chatcmpl-1\tserved/model\n").unwrap();
+            let mut out = Vec::new();
+            parse_pi_family_line_with_run(
+                &serde_json::json!({
+                    "type": "message_end",
+                    "message": {
+                        "model": "requested-model",
+                        field: "chatcmpl-1"
+                    }
+                })
+                .to_string(),
+                &mut out,
+                Some(run_id.as_str()),
+            );
+            let _ = std::fs::remove_file(&path);
+            assert!(
+                out.iter().any(|e| matches!(
+                    e,
+                    EngineEvent::Served { model: Some(model), effort: None }
+                        if model == "served/model"
+                )),
+                "message.{field} must key the sidecar lookup: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_end_adopts_a_lone_sidecar_row_without_a_response_id() {
+        // A single-request turn may never name its response id; one observed
+        // row can only belong to that turn. Two or more rows stay ambiguous.
+        let run_id = format!("test-sidecar-lone-{}", std::process::id());
+        let path = served_models_path(&run_id);
+        std::fs::write(&path, "gen-x\tserved/model\n").unwrap();
+        let mut out = Vec::new();
+        parse_pi_family_line_with_run(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "model": "requested-model" }
+            })
+            .to_string(),
+            &mut out,
+            Some(run_id.as_str()),
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                EngineEvent::Served { model: Some(model), effort: None }
+                    if model == "served/model"
+            )),
+            "a lone sidecar row must serve a single-request turn: {out:?}"
+        );
+
+        std::fs::write(&path, "gen-x\tserved/model\ngen-y\tother/model\n").unwrap();
+        let mut out = Vec::new();
+        parse_pi_family_line_with_run(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "model": "requested-model" }
+            })
+            .to_string(),
+            &mut out,
+            Some(run_id.as_str()),
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, EngineEvent::Served { model: Some(_), .. })),
+            "multiple rows without a response id stay ambiguous: {out:?}"
         );
     }
 
