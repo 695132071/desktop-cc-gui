@@ -2,8 +2,29 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 
-/// Folded into the scanner's stat signature so a schema/derivation change
+static WRITE_STAMP: AtomicI64 = AtomicI64::new(0);
+
+/// Monotonic write stamp sampled synchronously at the command entry point
+/// before `spawn_blocking`. Even when two calls land in the same millisecond
+/// or their blocking tasks acquire the writer mutex out of call order,
+/// `next_write_stamp()` strictly increases with call order.
+pub fn next_write_stamp() -> i64 {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+        .saturating_mul(1_000);
+    let mut prev = WRITE_STAMP.load(Ordering::Relaxed);
+    loop {
+        let next = wall.max(prev + 1);
+        match WRITE_STAMP.compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
 /// still invalidates cached parse results.
 pub const CACHE_VERSION: &str = "2";
 
@@ -21,9 +42,29 @@ pub struct WorkspaceMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
 }
-pub struct Db(pub Mutex<Connection>);
+/// Writer plus a dedicated read-only connection. WAL lets the reader run on
+/// its own snapshot while the writer holds an index transaction; sharing one
+/// connection made every `list_sessions`/`search` wait for a full FTS rebuild.
+pub struct Db(pub Mutex<Connection>, Mutex<Connection>);
 
 impl Db {
+    /// Reader for hot query paths. Never use it for INSERT/UPDATE/DELETE:
+    /// the connection runs with `query_only`, which rejects writes.
+    pub fn read(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        self.1.lock()
+    }
+
+    /// Non-blocking passive WAL checkpoint so long-lived reader/writer
+    /// connections do not let `app.db-wal` grow without bound after background
+    /// index passes settle.
+    pub fn wal_checkpoint_passive(&self) -> Result<(i64, i64), String> {
+        let conn = self.0.lock();
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| {
+            Ok((r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| e.to_string())
+    }
+
     pub fn open() -> rusqlite::Result<Self> {
         Self::open_at(&crate::paths::db_path())
     }
@@ -56,12 +97,18 @@ impl Db {
         // FK, so enabling enforcement changes nothing else.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
-        Ok(Self(Mutex::new(conn)))
+        // A separate connection takes its own WAL snapshot. `query_only`
+        // turns an accidental write here into an immediate SQLITE_READONLY
+        // instead of a second writer racing the indexer.
+        let reader = Connection::open(path)?;
+        reader.busy_timeout(std::time::Duration::from_secs(5))?;
+        reader.pragma_update(None, "query_only", true)?;
+        Ok(Self(Mutex::new(conn), Mutex::new(reader)))
     }
 
     /// All registered workspace roots (session attribution + path confinement).
     pub fn workspace_paths(&self) -> Result<Vec<String>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT path FROM workspaces")
             .map_err(|e| e.to_string())?;
@@ -80,7 +127,7 @@ impl Db {
 
     /// Return the persistent registration identity for an exact workspace path.
     pub fn workspace_metadata(&self, path: &str) -> Result<Option<WorkspaceMetadata>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let mut metadata = conn
             .query_row(
                 "SELECT id, path, name FROM workspaces WHERE path=?1",
@@ -112,7 +159,7 @@ impl Db {
     /// Directories the user explicitly granted file access to on top of the
     /// registered workspaces (the on-demand grant flow, files::grant_root).
     pub fn granted_roots(&self) -> Result<Vec<String>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let mut stmt = conn
             .prepare("SELECT path FROM granted_roots ORDER BY granted_at")
             .map_err(|e| e.to_string())?;
@@ -156,7 +203,7 @@ impl Db {
     /// being set is what lets a device through: the user approves each new
     /// device in the app before it can see or drive anything.
     pub fn web_devices(&self) -> Result<Vec<crate::web::WebDevice>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let mut stmt = conn
             .prepare(
                 "SELECT id, user_agent, created_at, last_seen_at, approved_at, name
@@ -181,7 +228,7 @@ impl Db {
     }
 
     pub fn web_device_get(&self, id: &str) -> Result<Option<crate::web::WebDevice>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         conn.query_row(
             "SELECT id, user_agent, created_at, last_seen_at, approved_at, name
              FROM web_devices WHERE id=?1",
@@ -231,7 +278,9 @@ impl Db {
         conn.execute(
             "INSERT INTO session_models(engine, session_id, model, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET model=excluded.model, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE
+                SET model=excluded.model, updated_at=excluded.updated_at
+              WHERE excluded.updated_at >= session_models.updated_at",
             rusqlite::params![engine, session_id, model, now],
         )
         .map_err(|e| e.to_string())?;
@@ -253,7 +302,9 @@ impl Db {
         conn.execute(
             "INSERT INTO session_efforts(engine, session_id, effort, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET effort=excluded.effort, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE
+                SET effort=excluded.effort, updated_at=excluded.updated_at
+              WHERE excluded.updated_at >= session_efforts.updated_at",
             rusqlite::params![engine, session_id, effort, now],
         )
         .map_err(|e| e.to_string())?;
@@ -275,7 +326,9 @@ impl Db {
         conn.execute(
             "INSERT INTO session_providers(engine, session_id, provider_id, updated_at)
              VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(engine, session_id) DO UPDATE SET provider_id=excluded.provider_id, updated_at=excluded.updated_at",
+             ON CONFLICT(engine, session_id) DO UPDATE
+                SET provider_id=excluded.provider_id, updated_at=excluded.updated_at
+              WHERE excluded.updated_at >= session_providers.updated_at",
             rusqlite::params![engine, session_id, provider_id, now],
         )
         .map_err(|e| e.to_string())?;
@@ -323,7 +376,7 @@ impl Db {
         plugin_id: &str,
         key: &str,
     ) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let raw: Option<String> = conn
             .query_row(
                 "SELECT value FROM plugin_kv WHERE plugin_id=?1 AND key=?2",
@@ -416,7 +469,7 @@ impl Db {
         engine: &str,
         session_id: &str,
     ) -> Result<(HashSet<String>, String), String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         accepted_internal_frames_from(&conn, engine, session_id)
     }
 
@@ -426,7 +479,7 @@ impl Db {
     /// scan that no file change would otherwise justify, and compares each
     /// row's stored per-session signature to decide which files to re-derive.
     pub fn accepted_internal_frame_index(&self) -> Result<(AcceptedFrameIndex, String), String> {
-        let conn = self.0.lock();
+        let conn = self.read();
         let mut stmt = conn
             .prepare(
                 "SELECT engine, session_id, frame_hash FROM accepted_internal_frames
@@ -1137,6 +1190,11 @@ mod tests {
 
         db.remember_session_effort("omp", "s1", "low", 20).unwrap();
         assert_eq!(read().as_deref(), Some("low"), "newest wins");
+
+        // Out-of-order older write (e.g. a slower blocking task from an earlier
+        // plugin/IPC call) must not clobber the newer choice.
+        db.remember_session_effort("omp", "s1", "high", 15).unwrap();
+        assert_eq!(read().as_deref(), Some("low"), "stale stamp is ignored");
     }
 
     #[test]
@@ -1173,6 +1231,14 @@ mod tests {
             read().as_deref(),
             Some("__local_settings_json__"),
             "newest wins"
+        );
+
+        db.remember_session_provider("claude", "s1", "stale-chan", 12)
+            .unwrap();
+        assert_eq!(
+            read().as_deref(),
+            Some("__local_settings_json__"),
+            "stale stamp is ignored"
         );
     }
 
@@ -1212,6 +1278,14 @@ mod tests {
         db.remember_session_model("omp", "s1", "薄荷/claude-opus-5", 20)
             .unwrap();
         assert_eq!(read().as_deref(), Some("薄荷/claude-opus-5"), "newest wins");
+
+        db.remember_session_model("omp", "s1", "stale/model", 15)
+            .unwrap();
+        assert_eq!(
+            read().as_deref(),
+            Some("薄荷/claude-opus-5"),
+            "stale stamp is ignored"
+        );
     }
 
     #[test]
@@ -1604,5 +1678,18 @@ mod tests {
         assert!(plain.get("gitBranch").is_none());
         assert!(plain.get("gitHead").is_none());
         assert!(plain.get("dirty").is_none());
+    }
+
+    #[test]
+    fn next_write_stamp_is_strictly_monotonic_and_wal_checkpoint_succeeds() {
+        let s1 = next_write_stamp();
+        let s2 = next_write_stamp();
+        let s3 = next_write_stamp();
+        assert!(s1 < s2 && s2 < s3, "stamps must strictly increase: {s1}, {s2}, {s3}");
+
+        let scratch = Scratch::new();
+        let db = Db::open_at(&scratch.path("app.db")).unwrap();
+        db.plugin_kv_set("p1", "k", &serde_json::json!(1)).unwrap();
+        let (_log, _checkpointed) = db.wal_checkpoint_passive().unwrap();
     }
 }

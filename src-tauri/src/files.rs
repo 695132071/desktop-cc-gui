@@ -162,8 +162,14 @@ pub fn grant_scope(path: String) -> Result<String, String> {
 /// the filesystem boundary from a remote client, so web.rs has no route
 /// for this command.
 #[tauri::command]
-pub fn grant_root(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    grant_root_in(&db, &path)
+pub async fn grant_root(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || grant_root_in(&db, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn grant_root_in(db: &crate::db::Db, path: &str) -> Result<(), String> {
@@ -182,19 +188,29 @@ pub fn list_granted_roots(db: tauri::State<'_, Arc<crate::db::Db>>) -> Result<Ve
 }
 
 #[tauri::command]
-pub fn revoke_granted_root(
+pub async fn revoke_granted_root(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<(), String> {
-    db.remove_granted_root(path.trim())
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || db.remove_granted_root(path.trim()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn list_dir(
+pub async fn list_dir(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<Vec<DirEntry>, String> {
-    let dir = ensure_allowed(&path, &db)?;
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || list_dir_blocking(&db, &path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn list_dir_blocking(db: &crate::db::Db, path: &str) -> Result<Vec<DirEntry>, String> {
+    let dir = ensure_allowed(path, db)?;
     let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
     let mut out: Vec<DirEntry> = entries
         .flatten()
@@ -305,49 +321,83 @@ pub async fn read_file(
 }
 
 #[tauri::command]
-pub fn write_file(
+pub async fn write_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
     content: String,
 ) -> Result<(), String> {
-    let file = ensure_allowed(&path, &db)?;
-    std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = ensure_allowed(&path, &db)?;
+        std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn create_dir(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let dir = ensure_allowed(&path, &db)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))
+pub async fn create_dir(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ensure_allowed(&path, &db)?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 /// "New file" from the tree context menu: `create_new` fails instead of
 /// clobbering when the name is taken (write_file overwrites by design).
 #[tauri::command]
-pub fn create_file(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let file = ensure_allowed(&path, &db)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file)
-        .map(|_| ())
-        .map_err(|e| format!("create {}: {e}", file.display()))
+pub async fn create_file(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = ensure_allowed(&path, &db)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .map(|_| ())
+            .map_err(|e| format!("create {}: {e}", file.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn rename_item(
+pub async fn rename_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     from: String,
     to: String,
 ) -> Result<(), String> {
-    let src = ensure_allowed(&from, &db)?;
-    let dst = ensure_allowed(&to, &db)?;
-    std::fs::rename(&src, &dst)
-        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dst.display()))
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = ensure_allowed(&from, &db)?;
+        let dst = ensure_allowed(&to, &db)?;
+        std::fs::rename(&src, &dst)
+            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dst.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn trash_item(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let target = ensure_allowed(&path, &db)?;
-    trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
+pub async fn trash_item(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = ensure_allowed(&path, &db)?;
+        trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -435,47 +485,57 @@ fn copy_item_into_dir(
 }
 
 #[tauri::command]
-pub fn duplicate_item(
+pub async fn duplicate_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<FileOpResult, String> {
-    let source = ensure_allowed(&path, &db)?;
-    let meta = std::fs::symlink_metadata(&source)
-        .map_err(|e| format!("stat {}: {e}", source.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("cannot copy symlink {}", source.display()));
-    }
-    let parent = source
-        .parent()
-        .ok_or_else(|| format!("invalid path {}", source.display()))?;
-    let destination = copy_item_into_dir(&source, meta.is_dir(), parent, false)?;
-    Ok(FileOpResult {
-        path: destination.to_string_lossy().into_owned(),
-        is_dir: meta.is_dir(),
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = ensure_allowed(&path, &db)?;
+        let meta = std::fs::symlink_metadata(&source)
+            .map_err(|e| format!("stat {}: {e}", source.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("cannot copy symlink {}", source.display()));
+        }
+        let parent = source
+            .parent()
+            .ok_or_else(|| format!("invalid path {}", source.display()))?;
+        let destination = copy_item_into_dir(&source, meta.is_dir(), parent, false)?;
+        Ok(FileOpResult {
+            path: destination.to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn paste_item(
+pub async fn paste_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     source: String,
     target_dir: String,
 ) -> Result<FileOpResult, String> {
-    let source = ensure_allowed(&source, &db)?;
-    let dir = ensure_allowed(&target_dir, &db)?;
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
-    }
-    let meta = std::fs::symlink_metadata(&source)
-        .map_err(|e| format!("stat {}: {e}", source.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("cannot copy symlink {}", source.display()));
-    }
-    let destination = copy_item_into_dir(&source, meta.is_dir(), &dir, true)?;
-    Ok(FileOpResult {
-        path: destination.to_string_lossy().into_owned(),
-        is_dir: meta.is_dir(),
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = ensure_allowed(&source, &db)?;
+        let dir = ensure_allowed(&target_dir, &db)?;
+        if !dir.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        let meta = std::fs::symlink_metadata(&source)
+            .map_err(|e| format!("stat {}: {e}", source.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("cannot copy symlink {}", source.display()));
+        }
+        let destination = copy_item_into_dir(&source, meta.is_dir(), &dir, true)?;
+        Ok(FileOpResult {
+            path: destination.to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an

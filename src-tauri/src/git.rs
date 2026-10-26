@@ -729,11 +729,10 @@ pub async fn git_diff(path: String, file: String, staged: bool) -> Result<String
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
-    let repo = open_repo(&path)?;
+fn git_stage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    for file in &files {
+    for file in files {
         let file_path = std::path::Path::new(file);
         if repo
             .workdir()
@@ -750,14 +749,20 @@ pub fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
-    let repo = open_repo(&path)?;
+pub async fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_stage_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn git_unstage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let repo = open_repo(path)?;
     let head = repo.head().and_then(|h| h.peel_to_commit());
     let mut index = repo.index().map_err(|e| e.to_string())?;
     match head {
         Ok(commit) => {
             let tree = commit.tree().map_err(|e| e.to_string())?;
-            for file in &files {
+            for file in files {
                 let file_path = std::path::Path::new(file);
                 match tree.get_path(file_path) {
                     Ok(entry) => {
@@ -787,7 +792,7 @@ pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
         }
         Err(_) => {
             // No HEAD yet: clearing the index for these files un-stages them.
-            for file in &files {
+            for file in files {
                 let _ = index.remove_path(std::path::Path::new(file));
             }
         }
@@ -795,19 +800,25 @@ pub fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
     index.write().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn git_unstage(path: String, files: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_unstage_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Discard worktree changes (the panel's 撤销更改), matching
 /// `git restore --worktree` + `git clean -f`: a path present in the index
 /// restores from the index — so hunks already staged survive — while an
 /// untracked path is deleted from disk. Staged deletions (in HEAD, removed
 /// from the index) are not offered discard in the UI; here they are a no-op.
-#[tauri::command]
-pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
-    let repo = open_repo(&path)?;
+pub(crate) fn git_discard_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let repo = open_repo(path)?;
     let workdir = repo
         .workdir()
         .ok_or_else(|| "bare repository".to_string())?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    for file in &files {
+    for file in files {
         let file_path = Path::new(file);
         if index.get_path(file_path, 0).is_some() {
             let mut checkout = git2::build::CheckoutBuilder::new();
@@ -827,12 +838,18 @@ pub fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_commit(path: String, message: String) -> Result<String, String> {
+pub async fn git_discard(path: String, files: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_discard_blocking(&path, &files))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn git_commit_blocking(path: &str, message: &str) -> Result<String, String> {
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("empty commit message".to_string());
     }
-    let repo = open_repo(&path)?;
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     let tree_id = index.write_tree().map_err(|e| e.to_string())?;
     let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
@@ -847,6 +864,12 @@ pub fn git_commit(path: String, message: String) -> Result<String, String> {
     Ok(oid.to_string())
 }
 
+#[tauri::command]
+pub async fn git_commit(path: String, message: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || git_commit_blocking(&path, &message))
+        .await
+        .map_err(|e| e.to_string())?
+}
 /// Push/pull run over the network; credential failures should read as
 /// actionable guidance, not a libgit2 error dump.
 fn map_remote_error(e: git2::Error) -> String {
@@ -1156,9 +1179,8 @@ pub struct BranchInfo {
     pub is_remote: bool,
 }
 
-#[tauri::command]
-pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
-    let repo = open_repo(&path)?;
+pub(crate) fn git_branches_blocking(path: &str) -> Result<Vec<BranchInfo>, String> {
+    let repo = open_repo(path)?;
     // No is_current flag: consumers compare against the live status branch —
     // a cached flag here goes stale on external (CLI) checkouts.
     let mut out = Vec::new();
@@ -1188,6 +1210,12 @@ pub fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
     Ok(out)
 }
 
+#[tauri::command]
+pub async fn git_branches(path: String) -> Result<Vec<BranchInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || git_branches_blocking(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
 /// Local branch name git creates for `origin/release/1.0`: the remote name
 /// (the longest configured one that prefix-matches — remote names may contain
 /// slashes) is stripped, the rest is the local name.
@@ -1256,19 +1284,18 @@ fn checkout_remote_branch(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
-    let repo = open_repo(&path)?;
+pub(crate) fn git_checkout_blocking(path: &str, branch: &str) -> Result<(), String> {
+    let repo = open_repo(path)?;
     // A remote-tracking branch never receives HEAD directly (that would
     // detach it): it is materialized as a local tracking branch instead.
     // A same-named local branch wins, matching `git checkout` resolution.
-    if repo.find_branch(&branch, git2::BranchType::Local).is_err() {
-        if let Ok(remote) = repo.find_branch(&branch, git2::BranchType::Remote) {
-            return checkout_remote_branch(&repo, &branch, &remote);
+    if repo.find_branch(branch, git2::BranchType::Local).is_err() {
+        if let Ok(remote) = repo.find_branch(branch, git2::BranchType::Remote) {
+            return checkout_remote_branch(&repo, branch, &remote);
         }
     }
     let (object, reference) = repo
-        .revparse_ext(&branch)
+        .revparse_ext(branch)
         .map_err(|e| format!("unknown branch {branch}: {e}"))?;
     repo.checkout_tree(&object, None)
         .map_err(|e| e.to_string())?;
@@ -1283,12 +1310,18 @@ pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_create_branch(path: String, name: String) -> Result<(), String> {
+pub async fn git_checkout(path: String, branch: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_checkout_blocking(&path, &branch))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn git_create_branch_blocking(path: &str, name: &str) -> Result<(), String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("empty branch name".to_string());
     }
-    let repo = open_repo(&path)?;
+    let repo = open_repo(path)?;
     let head = repo
         .head()
         .and_then(|h| h.peel_to_commit())
@@ -1304,6 +1337,13 @@ pub fn git_create_branch(path: String, name: String) -> Result<(), String> {
     repo.checkout_tree(&object, None)
         .map_err(|e| e.to_string())?;
     repo.set_head(&refname).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn git_create_branch(path: String, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || git_create_branch_blocking(&path, &name))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -2162,7 +2202,7 @@ mod tests {
             .reference_symbolic("refs/remotes/origin/HEAD", &remote_head, true, "test")
             .unwrap();
 
-        let branches = git_branches(local_path.to_string_lossy().into_owned()).unwrap();
+        let branches = git_branches_blocking(local_path.to_str().unwrap()).unwrap();
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"origin/v1.0.9"), "names={names:?}");
         assert!(!names.contains(&"origin/HEAD"), "names={names:?}");
@@ -2190,11 +2230,7 @@ mod tests {
         let local_path = scratch.0.join("local");
         let local = Repository::clone(origin_path.to_str().unwrap(), &local_path).unwrap();
 
-        git_checkout(
-            local_path.to_string_lossy().into_owned(),
-            "origin/v1.0.9".to_string(),
-        )
-        .unwrap();
+        git_checkout_blocking(local_path.to_str().unwrap(), "origin/v1.0.9").unwrap();
 
         let head_ref = local.head().unwrap();
         assert_eq!(head_ref.shorthand(), Some("v1.0.9"));
@@ -2234,11 +2270,7 @@ mod tests {
         let local_tip = local.head().unwrap().target().unwrap();
         assert_ne!(local_tip, base.id());
 
-        git_checkout(
-            local_path.to_string_lossy().into_owned(),
-            "origin/feature".to_string(),
-        )
-        .unwrap();
+        git_checkout_blocking(local_path.to_str().unwrap(), "origin/feature").unwrap();
 
         assert_eq!(local.head().unwrap().target(), Some(local_tip));
         assert!(local_path.join("local.txt").exists());
@@ -2272,11 +2304,7 @@ mod tests {
                 .id;
             std::fs::write(scratch.0.join("a.txt"), "unstaged\n").unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["a.txt".to_string()],
-            )
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["a.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
@@ -2308,11 +2336,7 @@ mod tests {
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
             std::fs::remove_file(scratch.0.join("a.txt")).unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["a.txt".to_string()],
-            )
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["a.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
@@ -2341,11 +2365,7 @@ mod tests {
             }
             let staged_tree = repo.index().unwrap().write_tree().unwrap();
 
-            git_discard(
-                scratch.0.to_string_lossy().into_owned(),
-                vec!["new.txt".to_string()],
-            )
-            .unwrap();
+            git_discard_blocking(scratch.0.to_str().unwrap(), &["new.txt".to_string()]).unwrap();
 
             assert_eq!(
                 std::fs::read_to_string(scratch.0.join("new.txt")).unwrap(),
@@ -2363,11 +2383,7 @@ mod tests {
         std::fs::create_dir_all(scratch.0.join("sub")).unwrap();
         std::fs::write(scratch.0.join("sub/new.txt"), "x\n").unwrap();
 
-        git_discard(
-            scratch.0.to_string_lossy().into_owned(),
-            vec!["sub/new.txt".to_string()],
-        )
-        .unwrap();
+        git_discard_blocking(scratch.0.to_str().unwrap(), &["sub/new.txt".to_string()]).unwrap();
 
         assert!(!scratch.0.join("sub/new.txt").exists());
         assert_eq!(
