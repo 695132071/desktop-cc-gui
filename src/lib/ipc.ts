@@ -72,6 +72,11 @@ export interface Message {
   args?: unknown;
   /** Tool execution result/output; shown in the tool panel. */
   result?: unknown;
+  /** The engine's id for this tool call, when it reported one. Runtime-only:
+   *  a live result patch pairs to its call on this, so parallel calls of one
+   *  tool (four `TaskCreate` in a batch) each settle their own row. History
+   *  rows do not carry it — the backend pairs results by id while folding. */
+  toolCallId?: string;
   todos?: TodosPayload;
   ts: string | null;
   usage?: unknown;
