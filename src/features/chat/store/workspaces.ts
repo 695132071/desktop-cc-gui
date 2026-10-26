@@ -25,7 +25,7 @@ export function createWorkspaceActions(
 ): Pick<
   ChatStore,
   | "refreshWorkspaces"
-  | "addWorkspace"
+  | "addWorkspaces"
   | "reorderWorkspaces"
   | "removeWorkspace"
   | "createWorkspaceGroup"
@@ -44,19 +44,30 @@ export function createWorkspaceActions(
       if (workspaces) set({ workspaces });
     },
 
-    addWorkspace: async (path, meta) => {
-      try {
-        await ipc.addWorkspace(path, meta);
-        await get().refreshWorkspaces();
-        set({ actionError: null });
-        // 登记失败只 set actionError 会让调用方以为成功：「新建会话」据此接着
-        // 开出的待发会话会指向一个并未登记的目录，恰好复现输入框不可用的形态。
-        // 返回成功与否，让调用方决定要不要往下走（错误条仍由这里负责）。
-        return true;
-      } catch (error) {
-        set({ actionError: errorText(error) });
-        return false;
+    addWorkspaces: async (paths) => {
+      // 「添加工作区」支持一次多选多个目录：逐个 upsert，成功后只重读一次列表
+      // （N 次 refreshWorkspaces 会让侧栏逐条闪出来）。单个目录失败不阻断其余
+      // 目录——用户选的是 N 个，成功 N-1 个仍是进步；失败原因汇总进 actionError
+      // （ErrorBanner 是 whitespace-pre-wrap，多条按行显示）。返回真正登记成功的
+      // 路径，调用方据此决定要不要接着开会话——失败只留 actionError、路径列表为
+      // 空，零工作区的「新建会话」就不会开出一个指向未登记目录的待发会话。
+      const unique = [
+        ...new Set(paths.map((path) => path.trim()).filter(Boolean)),
+      ];
+      if (unique.length === 0) return [];
+      const added: string[] = [];
+      const failures: string[] = [];
+      for (const path of unique) {
+        try {
+          await ipc.addWorkspace(path);
+          added.push(path);
+        } catch (error) {
+          failures.push(errorText(error));
+        }
       }
+      if (added.length > 0) await get().refreshWorkspaces();
+      set({ actionError: failures.length > 0 ? failures.join("\n") : null });
+      return added;
     },
 
     reorderWorkspaces: async (ids) => {

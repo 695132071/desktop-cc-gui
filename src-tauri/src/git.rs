@@ -133,6 +133,40 @@ pub async fn git_repository_summaries(paths: Vec<String>) -> Vec<RepositorySumma
         .await
         .unwrap_or_default()
 }
+
+/// Sidebar row icon source: the GitHub account behind a workspace's `origin`
+/// remote. Only github.com remotes resolve — a local-only repo, a GitLab /
+/// Gitee remote, or a missing origin is omitted so the row keeps its folder
+/// icon instead of showing a guessed avatar.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceOwner {
+    pub path: String,
+    pub login: String,
+}
+
+/// Sync body of `git_workspace_owners`. `Repository::discover` matches
+/// `git_status`: a workspace opened on a repo subdirectory still counts.
+fn workspace_owners_blocking(paths: Vec<String>) -> Vec<WorkspaceOwner> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let repo = Repository::discover(&path).ok()?;
+            let url = repo.find_remote("origin").ok()?.url()?.to_string();
+            let slug = crate::git_worktree::github_owner_repo(&url)?;
+            let login = slug.split('/').next()?.to_string();
+            Some(WorkspaceOwner { path, login })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub async fn git_workspace_owners(paths: Vec<String>) -> Vec<WorkspaceOwner> {
+    tauri::async_runtime::spawn_blocking(move || workspace_owners_blocking(paths))
+        .await
+        .unwrap_or_default()
+}
+
 /// Bulk colors for one loaded tree level. Two sources, merged:
 /// 1. The repo *containing* the listed directory (any depth — the workspace
 ///    root itself, an ancestor, or none). Status paths are repo-relative, so
@@ -1337,6 +1371,43 @@ mod tests {
         // Drop restores the user's configured URL verbatim.
         let remote = repo.find_remote("origin").unwrap();
         assert_eq!(remote.url(), Some("http://host:8000/owner/repo"));
+    }
+
+    #[test]
+    fn workspace_owners_resolve_github_origin_from_repo_subdirs() {
+        let scratch = Scratch::new();
+        let repo = Repository::init(&scratch.0).unwrap();
+        repo.remote("origin", "git@github.com:owner/repo.git").unwrap();
+        let subdir = scratch.0.join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let path = subdir.to_string_lossy().into_owned();
+
+        let owners = workspace_owners_blocking(vec![path.clone()]);
+
+        assert_eq!(owners, vec![WorkspaceOwner { path, login: "owner".to_string() }]);
+    }
+
+    #[test]
+    fn workspace_owners_skip_non_github_and_non_repo_paths() {
+        let scratch = Scratch::new();
+        let gitlab = scratch.0.join("gitlab");
+        let plain = scratch.0.join("plain");
+        std::fs::create_dir_all(&gitlab).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        let repo = Repository::init(&gitlab).unwrap();
+        repo.remote("origin", "https://gitlab.com/owner/repo.git").unwrap();
+        let no_origin = scratch.0.join("no-origin");
+        Repository::init(&no_origin).unwrap();
+
+        // No origin, non-GitHub origin, and a plain directory all stay
+        // unlabeled — the sidebar keeps its folder icon for each.
+        let owners = workspace_owners_blocking(vec![
+            no_origin.to_string_lossy().into_owned(),
+            gitlab.to_string_lossy().into_owned(),
+            plain.to_string_lossy().into_owned(),
+        ]);
+
+        assert!(owners.is_empty());
     }
 
     #[test]
