@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
@@ -69,6 +69,14 @@ pub(crate) fn canonicalize_lenient(path: &Path) -> Result<PathBuf, String> {
         Err(_) => {}
     }
     let unresolved = || format!("cannot resolve {}", path.display());
+    // `..` outside the verified prefix is not something we may reproduce
+    // lexically: whether a hop over a missing directory still resolves
+    // depends on the platform's path parser (Unix fails component-wise,
+    // Windows' Win32 layer collapses `..` before touching the filesystem),
+    // so the result would diverge per OS. Refuse instead of guessing.
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(unresolved());
+    }
     // `file_name` is None for a trailing `..`, which cannot be resolved
     // lexically once the directory before it is missing.
     let name = path.file_name().ok_or_else(unresolved)?;
@@ -708,6 +716,12 @@ mod tests {
     fn lenient_canonicalize_rejects_parent_hop_past_missing_dir() {
         let outside = Scratch::new();
         let hop = outside.0.join("missing").join("..").join("x.txt");
+        assert!(canonicalize_lenient(&hop).is_err());
+        // Same rule when the hop pops a directory that does exist: only the
+        // platform's path parser decides what `..` leaves behind, so the
+        // tail after it may name a directory nobody created.
+        std::fs::create_dir(outside.0.join("sub")).unwrap();
+        let hop = outside.0.join("sub").join("..").join("missing").join("x.txt");
         assert!(canonicalize_lenient(&hop).is_err());
     }
 

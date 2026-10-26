@@ -1398,7 +1398,7 @@ mod tests {
     fn codebuddy_native_settings_are_editable_at_the_configured_home() {
         use tauri::Manager;
         let home = ScratchHome::new();
-        let path = home.dir.join("codebuddy-home/settings.json");
+        let path = home.dir.join("codebuddy-home").join("settings.json");
         assert_eq!(
             provider_file_paths("codebuddy".into()),
             vec![path.to_string_lossy().into_owned()]
