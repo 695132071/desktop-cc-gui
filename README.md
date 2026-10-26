@@ -116,7 +116,7 @@ MiniMax Code (command `mcode`) runs through its native ACP transport (`mcode acp
 - **LAN web access**: serve the UI to other devices on your network over a token-authenticated WebSocket bridge, with a QR-code entry in Settings.
 - **Workspace management**: group projects and switch between them.
 - In-app **auto-update** (Tauri updater against GitHub Releases), a changelog dialog, and signed macOS builds.
-- Bilingual UI: **Chinese and English**.
+- Multilingual UI: **Chinese, English and Korean**.
 
 ---
 

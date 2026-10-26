@@ -114,7 +114,7 @@ MiniMax Code（命令 `mcode`）走它的原生 ACP 传输（`mcode acp`）：�
 - **局域网网页访问**：通过 token 鉴权的 WebSocket 桥接，把界面共享给局域网内其他设备，设置页提供二维码入口。
 - **工作区管理**：给项目分组，快速切换。
 - 应用内**自动更新**（Tauri updater，对接 GitHub Releases）、版本记录对话框、macOS 签名构建。
-- 中英双语界面。
+- 中文、英文、韩语三语界面。
 
 ---
 
