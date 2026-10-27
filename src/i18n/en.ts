@@ -819,6 +819,9 @@ export const en: Messages = {
     thinkingAutoCollapse: "Fold thinking when it finishes",
     thinkingAutoCollapseDesc:
       "Turn off to keep the thinking process expanded during the turn; click the header to fold it manually",
+    fileTreeHideIgnored: "Hide Git-ignored files in the file tree",
+    fileTreeHideIgnoredDesc:
+      "Hide files and folders ignored by .gitignore (including .git); when off they are shown faded",
     promptHistory: "History completion",
     promptHistoryDesc:
       "Tab accepts a history suggestion while typing; ↑↓ recall history when the input is empty",

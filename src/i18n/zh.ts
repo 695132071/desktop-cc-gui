@@ -786,6 +786,9 @@ export const zh = {
     thinkingAutoCollapse: "思考结束后自动收起",
     thinkingAutoCollapseDesc:
       "关闭后，思考过程在本轮回复中保持展开，可点击标题手动收起",
+    fileTreeHideIgnored: "文件树隐藏 Git 忽略的文件",
+    fileTreeHideIgnoredDesc:
+      "隐藏被 .gitignore 忽略的文件和文件夹（含 .git）；关闭时以浅色显示",
     promptHistory: "历史输入补全",
     promptHistoryDesc:
       "输入时按 Tab 接受历史补全建议；输入框为空时按 ↑↓ 翻阅历史",

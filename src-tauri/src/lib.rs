@@ -19,6 +19,7 @@ pub mod event_sink;
 pub mod files;
 pub mod fonts;
 pub mod git;
+pub mod git_ignore;
 pub mod git_worktree;
 pub mod history;
 pub mod mcp;

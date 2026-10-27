@@ -773,6 +773,8 @@ export const ko: Messages = {
     "sendShortcutCmdEnterCtrl": "Ctrl+Enter",
     "thinkingAutoCollapse": "생각이 끝나면 접기",
     "thinkingAutoCollapseDesc": "끄면 생각이 끝난 뒤에도 사고 과정을 펼쳐 둡니다(레이아웃 변동 없음). 제목을 눌러 직접 접을 수 있습니다",
+    "fileTreeHideIgnored": "파일 트리에서 Git 무시 파일 숨기기",
+    "fileTreeHideIgnoredDesc": ".gitignore로 무시된 파일과 폴더(.git 포함)를 숨깁니다. 끄면 흐리게 표시합니다",
     "promptHistory": "기록 자동 완성",
     "promptHistoryDesc": "입력 중 Tab으로 기록 제안을 적용하고, 입력란이 비어 있을 때 ↑↓로 기록을 불러옵니다",
     "promptHistoryManage": "입력 기록",
