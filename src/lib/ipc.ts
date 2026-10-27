@@ -198,6 +198,7 @@ export type WorktreeCreateStage =
 
 export type WorktreeErrorKind =
   | "not_a_repo"
+  | "repo_open_failed"
   | "invalid_branch"
   | "branch_not_found"
   | "branch_exists"

@@ -24,6 +24,7 @@ import {
 } from "./ChangesFileContextMenu";
 import { DirectoryRow, FileRow } from "./GitTreeRow";
 import { NotRepoState } from "./NotRepoState";
+import { StatusErrorState } from "./StatusErrorState";
 
 function useVisibleGitValue<Value>(
   visible: boolean,
@@ -176,12 +177,14 @@ function useChangesActions(
       });
   }, []);
 
-  /** Dismiss the header error: the failed action's error, else the store's
-   *  last refresh failure. */
+  /** Dismiss the header error. A failed refresh clears the status, so its
+   *  reason lives in the body (StatusErrorState) until a re-read succeeds;
+   *  the store error is cleared here only when the header shows it, i.e.
+   *  next to a status. */
   const dismissError = useCallback(() => {
     setActionError(null);
-    useGitStore.getState().clearError(gitWorkspacePath);
-  }, [gitWorkspacePath]);
+    if (status) useGitStore.getState().clearError(gitWorkspacePath);
+  }, [gitWorkspacePath, status]);
 
   const stage = useCallback(
     (files: string[]) => {
@@ -336,6 +339,9 @@ export function ChangesPanel({
   const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
   const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
   const refreshError = useVisibleGitValue(visible, (s) => s.errorByWorkspace[gitWorkspacePath]);
+  // A failed refresh clears the status, so its reason is the whole body
+  // rather than a header line over an endless "loading".
+  const statusError = status ? null : (refreshError ?? null);
   const branches = useVisibleGitValue(visible, (s) => s.branchesByWorkspace[gitWorkspacePath]);
   const [scrollElement, setScrollElement] = useState<HTMLDivElement | null>(null);
   const scrollOffset = useRef(0);
@@ -399,7 +405,7 @@ export function ChangesPanel({
       behind={status?.behind}
       branches={branches}
       pending={pending}
-      error={actionError ?? refreshError ?? null}
+      error={actionError ?? (statusError ? null : refreshError) ?? null}
       run={run}
       onDismissError={dismissError}
       viewMode={viewMode}
@@ -428,46 +434,61 @@ export function ChangesPanel({
       className={cx("flex h-full min-h-0 flex-col bg-background-primary-default", className)}
     >
       {header}
-      <div
-        ref={setScrollElement}
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
-        onScroll={(event) => {
-          if (visible) scrollOffset.current = event.currentTarget.scrollTop;
-        }}
-      >
-        <ChangesBody
-          status={status}
-          visible={visible}
-          scrollElement={scrollElement}
-          scrollOffset={scrollOffset}
-          pending={pending}
-          viewMode={viewMode}
-          selectedFiles={selectedFiles}
-          onToggleSelectFile={toggleSelectFile}
-          onToggleSelectDir={toggleSelectDir}
-          onToggleSelectGroup={toggleSelectGroup}
-          stage={stage}
-          unstage={unstage}
-          stageOne={stageOne}
-          unstageOne={unstageOne}
-          discardRow={discardRow}
-          setDiscardTarget={setDiscardTarget}
-          openStagedDiff={openStagedDiff}
-          openUnstagedDiff={openUnstagedDiff}
-          onRowContextMenu={fileMenu.openMenu}
+      {/* Only the list and the commit box give way to a status-read failure;
+          open confirmations and the row menu stay put instead of vanishing
+          and resurfacing with stale paths once the status is back. */}
+      {statusError ? (
+        <StatusErrorState
+          message={statusError}
+          busy={pending.retryStatus === true}
+          onRetry={() =>
+            run("retryStatus", () => useGitStore.getState().refresh(gitWorkspacePath, true))
+          }
         />
-      </div>
-      {visible && (
-        <CommitFooter
-          workspacePath={gitWorkspacePath}
-          stagedCount={status?.staged.length ?? 0}
-          selectedCount={selectedFiles.size}
-          onCommitSelected={handleCommitSelected}
-          busy={pending.commit === true}
-          commitMsg={commitMsg}
-          onCommitMsgChange={setCommitMsg}
-          run={run}
-        />
+      ) : (
+        <>
+          <div
+            ref={setScrollElement}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain"
+            onScroll={(event) => {
+              if (visible) scrollOffset.current = event.currentTarget.scrollTop;
+            }}
+          >
+            <ChangesBody
+              status={status}
+              visible={visible}
+              scrollElement={scrollElement}
+              scrollOffset={scrollOffset}
+              pending={pending}
+              viewMode={viewMode}
+              selectedFiles={selectedFiles}
+              onToggleSelectFile={toggleSelectFile}
+              onToggleSelectDir={toggleSelectDir}
+              onToggleSelectGroup={toggleSelectGroup}
+              stage={stage}
+              unstage={unstage}
+              stageOne={stageOne}
+              unstageOne={unstageOne}
+              discardRow={discardRow}
+              setDiscardTarget={setDiscardTarget}
+              openStagedDiff={openStagedDiff}
+              openUnstagedDiff={openUnstagedDiff}
+              onRowContextMenu={fileMenu.openMenu}
+            />
+          </div>
+          {visible && (
+            <CommitFooter
+              workspacePath={gitWorkspacePath}
+              stagedCount={status?.staged.length ?? 0}
+              selectedCount={selectedFiles.size}
+              onCommitSelected={handleCommitSelected}
+              busy={pending.commit === true}
+              commitMsg={commitMsg}
+              onCommitMsgChange={setCommitMsg}
+              run={run}
+            />
+          )}
+        </>
       )}
       <ChangesConfirmDialogs
         visible={visible}
