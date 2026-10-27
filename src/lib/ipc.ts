@@ -1804,6 +1804,7 @@ export const ipc = {
     invoke<void>("git_checkout", { path, branch }),
   gitCreateBranch: (path: string, name: string) =>
     invoke<void>("git_create_branch", { path, name }),
+  gitInit: (path: string) => invoke<void>("git_init", { path }),
   // git worktree (子工作区)
   gitWorktreeList: (repoPath: string) =>
     invoke<WorktreeInfo[]>("git_worktree_list", { repoPath }),
@@ -1852,6 +1853,9 @@ export const ipc = {
     invoke<string | null>("get_program_icon", { executablePath }),
   revealInFileManager: (path: string) =>
     invoke<void>("reveal_in_file_manager", { path }),
+  /** Local .html/.htm/.xhtml in the default web browser (desktop only: the
+   *  remote web bridge would open it on the host, not for the remote user). */
+  openInBrowser: (path: string) => invoke<void>("open_in_browser", { path }),
   // metrics
   appMetrics: () => invoke<AppMetrics>("app_metrics"),
   performanceDiagnostics: () => invoke<NativePerformanceDiagnostics>("performance_diagnostics"),

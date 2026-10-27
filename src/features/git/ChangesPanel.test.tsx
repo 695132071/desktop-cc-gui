@@ -295,3 +295,57 @@ describe("ChangesPanel virtual rows", () => {
     expect(container.querySelectorAll("section")[1].textContent).toContain("file-0.ts");
   });
 });
+
+describe("ChangesPanel outside a Git repository", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    useGitStore.setState({
+      statusByWorkspace: { "/plain": undefined },
+      notRepoByWorkspace: { "/plain": true },
+      refresh: vi.fn().mockResolvedValue(undefined),
+      loadBranches: vi.fn().mockResolvedValue(undefined),
+    });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root.render(<ChangesPanel workspacePath="/plain" repoPath="/plain" />));
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+    useGitStore.setState({ notRepoByWorkspace: {} });
+    vi.restoreAllMocks();
+  });
+
+  const initButton = () =>
+    [...container.querySelectorAll("button")].find((b) => b.textContent === "git.initRepo")!;
+
+  it("initializes the shown workspace and stays busy until init settles", async () => {
+    let resolve!: () => void;
+    const init = vi.fn(() => new Promise<void>((done) => { resolve = done; }));
+    useGitStore.setState({ init });
+
+    expect(container.textContent).toContain("git.notARepo");
+    act(() => initButton().click());
+    expect(init).toHaveBeenCalledWith("/plain");
+    expect(initButton().disabled).toBe(true);
+    // A second click while busy must not start another init.
+    act(() => initButton().click());
+    expect(init).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolve());
+    expect(initButton().disabled).toBe(false);
+  });
+
+  it("surfaces an init failure in the header and lets the user retry", async () => {
+    useGitStore.setState({ init: vi.fn().mockRejectedValue(new Error("permission denied")) });
+
+    await act(async () => initButton().click());
+
+    expect(container.querySelector("header")!.textContent).toContain("permission denied");
+    expect(initButton().disabled).toBe(false);
+  });
+});
