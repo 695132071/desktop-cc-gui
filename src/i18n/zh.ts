@@ -1623,6 +1623,7 @@ export const zh = {
         uiSidebarEntry: "侧栏入口",
         uiCenterTab: "中央页签",
         uiConversationMode: "当前聊天内的会话模式",
+        uiWorktreeBadge: "侧栏 worktree 状态徽标",
         ui: "扩展界面",
         exec: "运行 {{name}} 命令",
         network: "访问 {{host}}",

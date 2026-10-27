@@ -1572,6 +1572,7 @@ export const ko: Messages = {
         "uiSidebarEntry": "사이드바 항목",
         "uiCenterTab": "중앙 탭",
         "uiConversationMode": "채팅별 대화 모드",
+        "uiWorktreeBadge": "워크트리 상태 배지",
         "ui": "UI 확장",
         "exec": "{{name}} 명령 실행",
         "network": "{{host}} 접근",

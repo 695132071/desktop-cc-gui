@@ -1683,6 +1683,7 @@ export const en: Messages = {
         uiSidebarEntry: "Sidebar entry",
         uiCenterTab: "Center tab",
         uiConversationMode: "Chat-local conversation mode",
+        uiWorktreeBadge: "Worktree status badges",
         ui: "Extend the UI",
         exec: "Run the {{name}} command",
         network: "Access {{host}}",
