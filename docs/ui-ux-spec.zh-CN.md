@@ -49,6 +49,7 @@
 - 交互控件优先复用 `src/components/base/*`（`Button`、`IconButton`、`Dropdown`、`Select`、`Input`、`Switch`、`Tooltip`…）。页面内自造按钮要么说明 base 组件为什么不适用，要么把它沉淀成 base 组件。
 - 尺寸以组件自身定义为准，不在调用点临时改高度：`Button` medium 36 / small 32 / xs 24，`IconButton` medium 36 / small 32。
 - `Button` / `IconButton` 需要承载动态图标时用 `children` 覆盖默认图标（两者同一契约），不要用 `[&_svg]:animate-spin` 这类穿透选择器改图标行为。
+- **勾选项的说明文字也是点击区域**：`Checkbox` 下方需要补一行说明时用它的 `hint` 属性，不要在 `<Checkbox>` 外面另放一个 `<span>`——外置的说明不在 `<label>` 里，点上去没反应。`hint` 模式下整行（`w-full`）都是热区，方框与标题行垂直居中，说明对齐标题列；说明挂到 input 的 `aria-describedby`，可访问名只取标题。实现：`src/components/base/checkbox/checkbox.tsx`。
 - 图标一律取 `lucide-react/dist/esm/icons/*`（按需具名导入）；不新引图标库，也不自绘 SVG。同一入口出现在多个位置时三处共用同一个图标：插件/插件市场 = `layout-grid`（侧边栏 `sidebar-chrome.tsx`、插件中心页签 `use-chat-tabs.ts`、设置页插件条目无品牌素材时的兜底 `PluginSettingsNavIcon.tsx`）。
 
 ### 2.3 文案与无障碍
@@ -258,7 +259,7 @@ const feedback = useRunningFeedback(store.loading);
 - 由指针发起的行内破坏性操作可以用 `ConfirmPopover`，让确认贴近光标。
 - 文案写清**后果对象**（删的是哪个文件/会话/插件），不写"确定吗？"。
 - **退出应用**：窗口关闭按钮一律先确认（`src/lib/close-confirm.ts` 拦截 `CloseRequested`）；macOS 的 ⌘Q / 系统退出请求在存在进行中的会话时会被 `src-tauri/src/quit_guard.rs` 取消并复用同一弹窗，只有显式确认才销毁窗口退出，空闲时正常退出、不拦截。
-- **删除 Worktree 分级确认**：`DeleteWorktreeDialog` 打开时预检 `git status`（未提交文件数 + 前两个文件名、未推送提交数）与 `git_branch_merged`（分支是否合入 base；同 tip 算已合入，squash 合入可能误报为未合入，文案如实说明），三项全干净只显示「没有未提交或未推送的改动」；有流式会话或活着的终端页签时额外提示。「同时删除本地分支」默认不勾（保留在仓库里），勾选后危险按钮文案升级为「删除 Worktree 和分支」；确认即关对话框，`git worktree remove --force` 后台执行（孤儿目录回落 `prune` + 提示手动清理，分支 `branch -d` 失败再 `-D` 仅显式勾选时），非致命尾巴（目录没删掉 / 分支被占用保留）走 `actionError` 横幅告知。会话历史保存在引擎侧，重新注册该目录会重新出现；侧栏登记在删除成功后移除。回归：`DeleteWorktreeDialog.test.tsx`。
+- **删除 Worktree 分级确认**：`DeleteWorktreeDialog` 打开时预检 `git status`（未提交文件数 + 前两个文件名、未推送提交数）与 `git_branch_merged`（分支是否合入 base；同 tip 算已合入，squash 合入可能误报为未合入，文案如实说明），三项全干净只显示「没有未提交或未推送的改动」；有流式会话或活着的终端页签时额外提示。「同时删除本地分支」默认不勾（保留在仓库里），连同下方「不可恢复」说明整块可点（`Checkbox` 的 `hint`），勾选后危险按钮文案升级为「删除 Worktree 和分支」；确认即关对话框，`git worktree remove --force` 后台执行（孤儿目录回落 `prune` + 提示手动清理，分支 `branch -d` 失败再 `-D` 仅显式勾选时），非致命尾巴（目录没删掉 / 分支被占用保留）走 `actionError` 横幅告知。会话历史保存在引擎侧，重新注册该目录会重新出现；侧栏登记在删除成功后移除。回归：`DeleteWorktreeDialog.test.tsx`。
 - **父工作区移除/归档带级联提示**：移除或归档含 worktree 子项的父工作区时，`ConfirmDialog` 列出受影响分支再确认（移除：先移除子项登记再移除父行，磁盘目录不动；归档：一并归档）。要连目录删必须逐个走「删除 Worktree…」流程，父行移除不做目录级联。
 
 ## 7. 刷新入口清单
@@ -306,6 +307,7 @@ const feedback = useRunningFeedback(store.loading);
 
 | 版本 | 时间 | 内容 |
 |---|---|---|
+| v0.92 | 2026-10-26 | `Checkbox` 新增 `hint` 属性：说明文字放进同一个 `<label>`，整行都是点击区域，说明作为 `aria-describedby`。删除 Worktree 对话框的「同时删除本地分支」改用它，点说明文字也能勾选。§2.2、§6 补规则 |
 | v0.91 | 2026-10-25 | 收紧 CodeBuddy 登录反馈：无活动会话时不再回退首个工作区，空终端坞只创建一个登录 shell；两次终端写入与 CLI ready 等待均有明确成败，失败不假报成功，账号状态 IPC 失败与检测中分态，跨导航保留一次强制状态探测。宿主 shell 信息经 IPC 提供，远程 Web 与 Windows Git Bash 使用正确的命令转义；§2 补规则 |
 | v0.90 | 2026-10-25 | 新增 CodeBuddy CLI（命令 `codebuddy`）引擎：聊天引擎下拉与设置 CLI 管理按既有数据驱动形态自动出现；支持账号登录（终端唤起 `/login` 扫码/SSO 认证，登录状态经系统凭据存储做只读存在性检查，探测带 1.5s 超时、显式「刷新状态」绕过 30s 缓存）与 API Key 渠道登录；历史会话索引 `~/.codebuddy/projects`（按转录内的 cwd/sessionId 归属，目录名是 CLI 私有编码；一次扫描建索引、同 id 取最新副本、删除时清掉全部副本）；MCP 页接入原生 JSON 来源（`~/.codebuddy/mcp.json`、项目 `.codebuddy/mcp.json` / `.mcp.json`，写语义未对拍故只读） |
 | v0.89 | 2026-10-25 | 过程组在思考 settle / 工具调用边界保持展开，只在回答文字出现在其后或本轮结束时自动收起（设置项关闭则保持展开），修复流式对话中过程提前消失、再展开的跳动；用户手动的展开 / 收起仍优先。§4 补规则 |
