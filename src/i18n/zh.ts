@@ -1330,6 +1330,7 @@ export const zh = {
     unsafeRepo:
       "Git 仓库所有权不受信任：{{message}}。请将该目录加入 safe.directory（git config --global --add safe.directory <路径>），或以当前用户身份重新打开/克隆。",
     openFailed: "无法打开 Git 仓库：{{message}}",
+    retryStatus: "重试",
     diffTooLarge: "Diff 过大，已截断",
     noChanges: "没有变更",
     uncommittedChanges: "个未提交变更",

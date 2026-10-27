@@ -1284,6 +1284,7 @@ export const ko: Messages = {
     "initRepo": "Git 저장소 초기화",
     "unsafeRepo": "Git 저장소 소유권이 신뢰되지 않습니다: {{message}}. 해당 디렉터리를 safe.directory에 추가하거나(git config --global --add safe.directory <경로>), 현재 사용자로 다시 열거나 클론하세요.",
     "openFailed": "Git 저장소를 열 수 없습니다: {{message}}",
+    "retryStatus": "다시 시도",
     "diffTooLarge": "차이가 너무 커서 일부만 표시합니다",
     "noChanges": "변경 사항 없음",
     "uncommittedChanges": "커밋하지 않은 변경 사항",

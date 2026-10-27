@@ -339,7 +339,7 @@ workspaces: {
 
 ### ctx.worktrees
 
-Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Worktree」 管线（validate → fetch → add → register）创建，宿主侧栏出现同一份进度 行与取消/重试语义；成功后 worktree 以 `kind="worktree"` 登记进侧栏 （父行是 `parentWorkspaceId` 对应的工作区），resolve 已注册的路径。 `prNumber` 存在时 fetch `pull/<n>/head` 再检出；`existingBranch` 表示 `branch` 是已存在的本地分支（检出而非新建）。路径缺省 = 宿主默认布局 `<仓库同级>/<仓库名>-worktrees/<branch>`。 失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"` （kind 与宿主错误分类一致：not_a_repo / invalid_branch / branch_not_found / branch_exists / branch_checked_out / dir_exists / pr_not_found / fetch_failed / register_failed / sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+Worktree 创建（权限 `host:worktree`，0.3.17 起）：经宿主「新建 Worktree」 管线（validate → fetch → add → register）创建，宿主侧栏出现同一份进度 行与取消/重试语义；成功后 worktree 以 `kind="worktree"` 登记进侧栏 （父行是 `parentWorkspaceId` 对应的工作区），resolve 已注册的路径。 `prNumber` 存在时 fetch `pull/<n>/head` 再检出；`existingBranch` 表示 `branch` 是已存在的本地分支（检出而非新建）。路径缺省 = 宿主默认布局 `<仓库同级>/<仓库名>-worktrees/<branch>`。 失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"` （kind 与宿主错误分类一致：not_a_repo / repo_open_failed / invalid_branch / branch_not_found / branch_exists / branch_checked_out / dir_exists / pr_not_found / fetch_failed / register_failed / sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。 `repo_open_failed` = 仓库存在但打不开（如属主校验拒绝），detail 以 `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。
 
 ```ts
 worktrees: {

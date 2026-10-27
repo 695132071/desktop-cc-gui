@@ -708,10 +708,12 @@ export interface PluginContext {
    *  `<仓库同级>/<仓库名>-worktrees/<branch>`。
    *
    *  失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"`
-   *  （kind 与宿主错误分类一致：not_a_repo / invalid_branch /
-   *  branch_not_found / branch_exists / branch_checked_out / dir_exists /
-   *  pr_not_found / fetch_failed / register_failed / sparse_checkout_empty /
-   *  canceled / unknown），插件据此给用户可读文案。 */
+   *  （kind 与宿主错误分类一致：not_a_repo / repo_open_failed /
+   *  invalid_branch / branch_not_found / branch_exists / branch_checked_out /
+   *  dir_exists / pr_not_found / fetch_failed / register_failed /
+   *  sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+   *  `repo_open_failed` = 仓库存在但打不开（如属主校验拒绝），detail 以
+   *  `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。 */
   worktrees: {
     create(def: {
       /** 本地仓库路径（父工作区目录，必须是 git 仓库）。 */

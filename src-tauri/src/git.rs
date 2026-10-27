@@ -402,8 +402,11 @@ fn map_open_repo_error(error: git2::Error) -> String {
         return "NOT_A_REPO".to_string();
     }
     let message = error.message().trim().to_string();
-    let lower = message.to_lowercase();
-    if lower.contains("not owned by current user") || lower.contains("dubious ownership") {
+    // libgit2 的属主校验以 GIT_EOWNER 失败（git2 的 `ErrorCode::Owner`）；
+    // 提示语只作兜底，措辞变了也不会退回成通用失败。
+    if error.code() == git2::ErrorCode::Owner
+        || message.to_lowercase().contains("not owned by current user")
+    {
         return format!("GIT_UNSAFE_REPO:{message}");
     }
     format!("GIT_OPEN_FAILED:{message}")
@@ -2509,6 +2512,17 @@ mod tests {
             )),
             "NOT_A_REPO"
         );
+        // libgit2 的属主校验失败：GIT_EOWNER + GIT_ERROR_CONFIG（repository.c
+        // validate_ownership）。按错误码判定，不依赖提示语措辞。
+        assert_eq!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::Owner,
+                git2::ErrorClass::Config,
+                "repository path 'C:/x' is owned by someone else"
+            )),
+            "GIT_UNSAFE_REPO:repository path 'C:/x' is owned by someone else"
+        );
+        // 错误码丢失时（例如经过别的包装）仍按 libgit2 的提示语兜底。
         assert!(
             map_open_repo_error(git2::Error::new(
                 git2::ErrorCode::GenericError,

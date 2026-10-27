@@ -9,6 +9,7 @@
   - 卸载（或 `handle.dispose()`）清掉该插件的徽标与订阅；宿主快照不可变，插件改返回值动不到宿主。
 - `ctx.ui.registerSidebarNav(def)` 新增可选 `badge?: () => string | number | null`：内建侧栏导航项的尾部计数 pill，每次渲染求值，抛错按「无徽标」处理；同一 `key` 重新注册即刷新（Registry upsert）。
 - `contract-check.ts` 补齐 `WorktreeBadge` / `WorktreeBadgeHandle` / `WorktreeBadgeTarget` / `WorktreeBadgeTone` 的双向断言，以及 `registerWorktreeBadges` 参数元组与 `registerSidebarNav.badge` 的漂移守卫。
+- `ctx.worktrees.create` 的失败分类新增 `repo_open_failed`：仓库存在但打不开（如 libgit2 属主校验拒绝）不再报成 `not_a_repo`，detail 以 `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。按 `not_a_repo` 判断「不是仓库」的插件无需改动，这类失败此前被误归到该类。
 
 ## 0.3.21 — 2026-10-22
 
