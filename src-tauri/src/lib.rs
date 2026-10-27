@@ -645,6 +645,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // macOS 空闲时的 ⌘Q / 程序坞退出不经过窗口的 CloseRequested /
+                // Destroyed（见 quit_guard.rs），只走到这里：兜底落盘最后一次窗口
+                // 变化。其余平台窗口关闭时已 flush，这里重复写同一份快照，无害。
+                window_state::flush();
                 if let Some(metrics) = app.try_state::<metrics::MetricsState>() {
                     metrics.stop();
                 }
