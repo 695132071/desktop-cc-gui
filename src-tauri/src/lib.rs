@@ -562,6 +562,7 @@ pub fn run() {
             git::git_branches,
             git::git_checkout,
             git::git_create_branch,
+            git::git_init,
             git_worktree::git_worktree_list,
             git_worktree::git_worktree_create,
             git_worktree::git_worktree_create_cancel,
@@ -573,6 +574,7 @@ pub fn run() {
             open_app::open_custom_program,
             open_app::get_program_icon,
             open_app::reveal_in_file_manager,
+            open_app::browser::open_in_browser,
             // terminal
             terminal::terminal_host_info,
             terminal::terminal_open,

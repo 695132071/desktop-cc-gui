@@ -1205,6 +1205,10 @@ pub(super) async fn dispatch(
             let a: GitCreateBranchArgs = parse_args(&raw)?;
             ser(crate::git::git_create_branch(a.path, a.name))
         }
+        "git_init" => {
+            let a: PathArgs = parse_args(&raw)?;
+            ser(crate::git::git_init(app.state(), a.path))
+        }
         // open-app
         "open_workspace_in" => {
             let a: OpenWorkspaceArgs = parse_args(&raw)?;

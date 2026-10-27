@@ -629,15 +629,28 @@ fn ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     repo.graph_ahead_behind(local_oid, upstream_oid).ok()
 }
 
+/// Branch label for the status header. An unborn HEAD (fresh `git init`, no
+/// commit yet) fails `repo.head()` but still points at its branch
+/// symbolically — show that name rather than a bare "HEAD".
+fn head_branch_label(repo: &Repository) -> String {
+    if let Some(name) = repo.head().ok().and_then(|h| h.shorthand().map(str::to_string)) {
+        return name;
+    }
+    repo.find_reference("HEAD")
+        .ok()
+        .and_then(|head| {
+            head.symbolic_target()
+                .and_then(|target| target.strip_prefix("refs/heads/"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
 /// Sync body of `git_status` — libgit2 walks can touch thousands of files,
 /// far too heavy for the IPC main thread.
 fn git_status_blocking(path: &str) -> Result<GitStatus, String> {
     let repo = open_repo(path)?;
-    let branch = repo
-        .head()
-        .ok()
-        .and_then(|h| h.shorthand().map(str::to_string))
-        .unwrap_or_else(|| "HEAD".to_string());
+    let branch = head_branch_label(&repo);
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let index = repo.index().map_err(|e| e.to_string())?;
@@ -1280,6 +1293,41 @@ pub fn git_checkout(path: String, branch: String) -> Result<(), String> {
             .set_head_detached(object.id())
             .map_err(|e| e.to_string()),
     }
+}
+
+/// `git init` for a workspace the changes panel reported as NOT_A_REPO. The
+/// initial branch follows the user's `init.defaultBranch`, like the CLI.
+/// Unlike the other git commands this creates a repository where none
+/// exists, so it keeps to the registered workspaces like the file tree's
+/// create commands — the remote bridge routes here too.
+#[tauri::command]
+pub fn git_init(
+    db: tauri::State<'_, std::sync::Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    crate::files::ensure_allowed(&path, &db)?;
+    init_repository(&path)
+}
+
+fn init_repository(path: &str) -> Result<(), String> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    match Repository::discover(dir) {
+        // The panel's NOT_A_REPO can be stale (`git init` ran in a terminal
+        // meanwhile); a nested repository would hide the outer one's changes.
+        Ok(_) => return Ok(()),
+        // Anything but "none found" — e.g. libgit2's ownership check on a
+        // repository cloned by another account — may hide one above us.
+        Err(e) if e.code() != git2::ErrorCode::NotFound => return Err(e.message().to_string()),
+        Err(_) => {}
+    }
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.mkdir(false).mkpath(false).no_reinit(true);
+    Repository::init_opts(dir, &opts)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2139,6 +2187,63 @@ mod tests {
         let status = git_status_blocking(repo_path.to_str().unwrap()).unwrap();
         assert_eq!(status.ahead, None, "status={status:?}");
         assert_eq!(status.behind, None, "status={status:?}");
+    }
+
+    #[test]
+    fn init_turns_a_plain_directory_into_a_repository() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("a.txt"), "a\n").unwrap();
+        let path = scratch.0.to_string_lossy().into_owned();
+        assert_eq!(git_status_blocking(&path).unwrap_err(), "NOT_A_REPO");
+
+        init_repository(&path).unwrap();
+
+        let status = git_status_blocking(&path).unwrap();
+        let untracked: Vec<_> = status.untracked.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(untracked, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn status_names_the_unborn_branch_of_a_fresh_repository() {
+        let scratch = Scratch::new();
+        let repo = Repository::init(&scratch.0).unwrap();
+        // Whatever init.defaultBranch the machine has, the label must be
+        // that branch rather than the bare "HEAD" an unborn head reads as.
+        let expected = repo
+            .find_reference("HEAD")
+            .unwrap()
+            .symbolic_target()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .unwrap()
+            .to_string();
+
+        let status = git_status_blocking(scratch.0.to_str().unwrap()).unwrap();
+
+        assert_eq!(status.branch, expected);
+        assert_ne!(status.branch, "HEAD");
+    }
+
+    #[test]
+    fn init_inside_an_existing_repository_leaves_it_alone() {
+        let scratch = Scratch::new();
+        Repository::init(&scratch.0).unwrap();
+        let nested = scratch.0.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        init_repository(nested.to_str().unwrap()).unwrap();
+
+        // A stale NOT_A_REPO must not nest a second repository that would
+        // hide the outer one's changes under `sub/`.
+        assert!(!nested.join(".git").exists());
+    }
+
+    #[test]
+    fn init_never_creates_a_missing_directory() {
+        let scratch = Scratch::new();
+        let missing = scratch.0.join("gone");
+
+        assert!(init_repository(missing.to_str().unwrap()).is_err());
+        assert!(!missing.exists());
     }
 
     #[test]
