@@ -1224,6 +1224,8 @@ export const ko: Messages = {
     "fileNotFound": "파일을 찾을 수 없거나 이동되었습니다",
     "unsavedChanges": "저장되지 않음",
     "emptyTree": "빈 폴더",
+    "expandLoadedFolders": "불러온 폴더 모두 펼치기",
+    "collapseAllFolders": "모든 폴더 접기",
     "addToChat": "채팅에 추가",
     "newFile": "새 파일",
     "newFolder": "새 폴더",

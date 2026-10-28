@@ -13,11 +13,34 @@ import {
   type RepositorySummary,
 } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
-import { writeStored } from "@/lib/storage";
+import { readStoredJson, writeStored } from "@/lib/storage";
 import { installFilesBridge, readRemoteAware } from "./remote-files";
+import { useFileTreePreferencesStore } from "./tree-preferences";
 
 export const FILES_ROOT_KEY = "ccgui-next.filesRoot";
+export const fileTreeWorkspaceKey = (root: string) =>
+  `ccgui-next.fileTreeWorkspace:${encodeURIComponent(root)}`;
 let treeGeneration = 0;
+
+function reachableExpanded(root: string, expanded: Record<string, true>): Record<string, true> {
+  const reachable: Record<string, true> = {};
+  if (!root || !expanded[root]) return reachable;
+  reachable[root] = true;
+  for (const path of Object.keys(expanded).sort((a, b) => a.length - b.length)) {
+    if (path !== root && path.startsWith(`${root}/`) && reachable[parentPath(path)]) reachable[path] = true;
+  }
+  return reachable;
+}
+
+function readWorkspaceExpanded(root: string): Record<string, true> {
+  const saved = root ? readStoredJson(fileTreeWorkspaceKey(root), (value) => {
+    if (!value || typeof value !== "object" || !Array.isArray((value as { expanded?: unknown }).expanded)) return null;
+    const paths = (value as { expanded: unknown[] }).expanded;
+    if (!paths.every((path) => typeof path === "string")) return null;
+    return reachableExpanded(root, Object.fromEntries(paths.map((path) => [path, true])));
+  }) : null;
+  return saved ?? (root ? { [root]: true } : {});
+}
 
 /** Newest listing request per directory. list_dir runs off the main thread,
  *  so two listings of one directory (a refresh and a post-rename
@@ -105,9 +128,12 @@ interface FilesStore {
   setRoot: (path: string) => void;
   ensureDir: (path: string) => Promise<void>;
   toggleDir: (path: string) => Promise<void>;
+  toggleCompactDir: (paths: string[]) => Promise<void>;
+  expandLoadedDirs: () => void;
+  collapseAllDirs: () => void;
   /** Re-fetch a directory only if it has been loaded before. */
   invalidateDir: (path: string) => Promise<void>;
-  /** Re-fetch every loaded/expanded directory (titlebar refresh button). */
+  /** Re-fetch reachable expanded directories (titlebar refresh button). */
   refreshTree: () => Promise<void>;
   /** True while refreshTree is in flight. */
   refreshing: boolean;
@@ -159,7 +185,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   children: {},
   loadingDirs: {},
   dirErrors: {},
-  expanded: {},
+  expanded: readWorkspaceExpanded(localStorage.getItem(FILES_ROOT_KEY) ?? ""),
   repositories: {},
   fileColors: {},
   selectedPath: null,
@@ -190,7 +216,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       children: {},
       loadingDirs: {},
       dirErrors: {},
-      expanded: {},
+      expanded: readWorkspaceExpanded(root),
       repositories: {},
       fileColors: {},
       selectedPath: null,
@@ -267,13 +293,61 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   toggleDir: async (path) => {
     const s = get();
     if (s.expanded[path]) {
-      const expanded = { ...s.expanded };
-      delete expanded[path];
-      set({ expanded });
+      set({ expanded: Object.fromEntries(Object.entries(s.expanded).filter(([key]) => key !== path && !key.startsWith(`${path}/`))) });
       return;
     }
     set((s) => ({ expanded: { ...s.expanded, [path]: true } }));
     await get().ensureDir(path);
+  },
+
+  toggleCompactDir: async (paths) => {
+    if (paths.length === 0) return;
+    const generation = treeGeneration;
+    if (paths.every((path) => get().expanded[path])) {
+      const parent = paths[0];
+      set((s) => ({ expanded: Object.fromEntries(Object.entries(s.expanded).filter(([key]) => key !== parent && !key.startsWith(`${parent}/`))) }));
+      return;
+    }
+    let path = paths[paths.length - 1];
+    set((s) => ({ expanded: { ...s.expanded, ...Object.fromEntries(paths.map((part) => [part, true])) } }));
+    while (true) {
+      await get().ensureDir(path);
+      if (generation !== treeGeneration) return;
+      const state = get();
+      if (!state.expanded[path]) return;
+      if (state.dirErrors[path] || !state.children[path] || state.repositories[path]) break;
+      const visible = state.children[path].filter((entry) =>
+        !(useFileTreePreferencesStore.getState().hideIgnored && entry.ignored),
+      );
+      if (visible.length !== 1 || !visible[0].isDir) break;
+      const nextPath = joinPath(path, visible[0].name);
+      if (state.repositories[nextPath]) break;
+      path = nextPath;
+      set((s) => ({ expanded: { ...s.expanded, [path]: true } }));
+    }
+  },
+
+  expandLoadedDirs: () => {
+    const { root, children } = get();
+    if (!root) return;
+    const hideIgnored = useFileTreePreferencesStore.getState().hideIgnored;
+    const expanded = { [root]: true } as Record<string, true>;
+    const visit = (dir: string) => {
+      for (const entry of children[dir] ?? []) {
+        if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+        const path = joinPath(dir, entry.name);
+        if (!children[path]) continue;
+        expanded[path] = true;
+        visit(path);
+      }
+    };
+    visit(root);
+    set({ expanded });
+  },
+
+  collapseAllDirs: () => {
+    const root = get().root;
+    set({ expanded: root ? { [root]: true } : {} });
   },
 
   invalidateDir: async (path) => {
@@ -294,7 +368,20 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const generation = treeGeneration;
     set({ refreshing: true });
     try {
-      const dirs = new Set([s.root, ...Object.keys(s.children), ...Object.keys(s.expanded)]);
+      const dirs = new Set([s.root]);
+      const hideIgnored = useFileTreePreferencesStore.getState().hideIgnored;
+      const visit = (dir: string) => {
+        if (!s.expanded[dir]) return;
+        for (const entry of s.children[dir] ?? []) {
+          if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+          const path = joinPath(dir, entry.name);
+          if (s.expanded[path]) {
+            dirs.add(path);
+            if (s.children[path]) visit(path);
+          }
+        }
+      };
+      visit(s.root);
       const levels: Record<string, DirEntry[]> = {};
       await Promise.all(
         [...dirs].map(async (dir) => {
@@ -498,6 +585,13 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
 
   closeSearch: () => set({ searchRoot: null }),
 }));
+
+useFilesStore.subscribe((state, previous) => {
+  if (!state.root || state.expanded === previous.expanded) return;
+  writeStored(fileTreeWorkspaceKey(state.root), JSON.stringify({
+    expanded: Object.keys(reachableExpanded(state.root, state.expanded)),
+  }));
+});
 
 // WSL 插件(独立 bundle)经 window.__ccguiFiles 拿到中央编辑器的打开入口,
 // 并注册远程读取器 —— 见 remote-files.ts。

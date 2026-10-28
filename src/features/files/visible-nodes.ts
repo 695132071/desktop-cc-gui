@@ -8,6 +8,7 @@ export interface TreeSnapshot {
   children: Record<string, DirEntry[]>;
   expanded: Record<string, true>;
   loadingDirs: Record<string, true>;
+  dirErrors: Record<string, string>;
   repositories: Record<string, RepositorySummary>;
   fileColors: Record<string, Record<string, FileTreeColor>>;
   /** Drop entries Git ignores (and, with them, everything beneath). */
@@ -20,6 +21,7 @@ export function buildVisibleNodes({
   children,
   expanded,
   loadingDirs,
+  dirErrors,
   repositories,
   fileColors,
   hideIgnored,
@@ -48,12 +50,26 @@ export function buildVisibleNodes({
     if (!entries) return;
     for (const e of entries) {
       if (hideIgnored && e.ignored) continue;
-      const path = joinPath(dirPath, e.name);
+      let path = joinPath(dirPath, e.name);
+      let name = e.name;
+      const compactPaths = [path];
+      if (e.isDir) {
+        while (!repositories[path] && !loadingDirs[path] && !dirErrors[path]) {
+          const visible = children[path]?.filter((entry) => !hideIgnored || !entry.ignored);
+          if (visible?.length !== 1 || !visible[0].isDir) break;
+          name += `/${visible[0].name}`;
+          path = joinPath(path, visible[0].name);
+          compactPaths.push(path);
+        }
+      }
+      const isExpanded = compactPaths.every((part) => !!expanded[part]);
       out.push({
         ...e,
+        name,
         path,
+        compactPaths: compactPaths.length > 1 ? compactPaths : undefined,
         depth,
-        expanded: e.isDir && !!expanded[path],
+        expanded: e.isDir && isExpanded,
         loading: e.isDir && !!loadingDirs[path],
         repository: e.isDir ? repositories[path] : undefined,
         // Plain folders never carry color; files take their git state;
@@ -61,9 +77,9 @@ export function buildVisibleNodes({
         // backend. Blue stays exclusive to the workspace root row.
         color: fileColors[dirPath]?.[e.name],
       });
-      // Only already-expanded levels are walked — the tree never loads
-      // recursively; each expansion triggers exactly one listDir call.
-      if (e.isDir && expanded[path]) walk(path, depth + 1);
+      // Only already-expanded levels are walked. Listing requests belong to
+      // the click handler, which follows a single chain when needed.
+      if (e.isDir && isExpanded) walk(path, depth + 1);
     }
   };
   if (expanded[root]) walk(root, 1);

@@ -26,6 +26,7 @@ function snapshot(overrides: Partial<TreeSnapshot> = {}): TreeSnapshot {
     },
     expanded: { "/ws": true, "/ws/build": true },
     loadingDirs: {},
+    dirErrors: {},
     repositories: {},
     fileColors: { "/ws": { "README.md": "modified" } },
     hideIgnored: false,
@@ -72,5 +73,16 @@ describe("buildVisibleNodes", () => {
 
   it("renders nothing without a root", () => {
     expect(buildVisibleNodes(snapshot({ root: "" }))).toEqual([]);
+  });
+
+  it("合并已加载的单链目录，并按 Git 忽略开关判断唯一子目录", () => {
+    const children = {
+      "/ws": [entry("src", { isDir: true })],
+      "/ws/src": [entry("main", { isDir: true }), entry("cache", { ignored: true })],
+      "/ws/src/main": [entry("App.java")],
+    };
+    const hidden = buildVisibleNodes(snapshot({ children, hideIgnored: true }));
+    expect(hidden[1]).toMatchObject({ name: "src/main", path: "/ws/src/main", compactPaths: ["/ws/src", "/ws/src/main"] });
+    expect(buildVisibleNodes(snapshot({ children, hideIgnored: false }))[1].name).toBe("src");
   });
 });

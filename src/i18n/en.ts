@@ -1327,6 +1327,8 @@ export const en: Messages = {
     fileNotFound: "File not found or moved",
     unsavedChanges: "Unsaved",
     emptyTree: "Empty folder",
+    expandLoadedFolders: "Expand loaded folders",
+    collapseAllFolders: "Collapse all folders",
     addToChat: "Add to chat",
     newFile: "New File",
     newFolder: "New Folder",

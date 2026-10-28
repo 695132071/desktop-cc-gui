@@ -1269,6 +1269,8 @@ export const zh = {
     fileNotFound: "文件不存在或已被移动",
     unsavedChanges: "未保存",
     emptyTree: "目录为空",
+    expandLoadedFolders: "展开已加载的文件夹",
+    collapseAllFolders: "收起全部文件夹",
     addToChat: "添加到对话",
     newFile: "新建文件",
     newFolder: "新建文件夹",

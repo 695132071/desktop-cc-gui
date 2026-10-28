@@ -17,10 +17,92 @@ import { useGitStore } from "@/features/git/store";
 import { resetMissionStore, useMissionStore } from "@/features/mission/store";
 import { usePluginHubStore } from "@/features/plugins/hub/store";
 import { usePluginTabsStore } from "@/features/plugins/runtime/center-tabs";
-import { useFilesStore } from "./store";
+import { fileTreeWorkspaceKey, useFilesStore } from "./store";
+import { useFileTreePreferencesStore } from "./tree-preferences";
 
 const entry = (name: string, isDir = false): DirEntry => ({ name, isDir, size: 0, mtimeMs: 0 });
 const emptyStatus = () => ({ repositories: [], fileColors: {} });
+
+describe("文件树单链展开与记忆", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mocks.gitTreeStatus.mockResolvedValue(emptyStatus());
+    useFileTreePreferencesStore.setState({ hideIgnored: false });
+    useFilesStore.setState({ root: "/chain", children: { "/chain": [entry("src", true)] }, expanded: { "/chain": true }, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {} });
+    localStorage.removeItem(fileTreeWorkspaceKey("/chain"));
+  });
+
+  it("一次点击沿唯一子目录读到含文件的链尾", async () => {
+    mocks.listDir.mockImplementation(async (path: string) => ({
+      "/chain/src": [entry("main", true)],
+      "/chain/src/main": [entry("java", true)],
+      "/chain/src/main/java": [entry("App.java")],
+    })[path] ?? []);
+    await useFilesStore.getState().toggleCompactDir(["/chain/src"]);
+    expect(mocks.listDir.mock.calls.map(([path]) => path)).toEqual([
+      "/chain/src", "/chain/src/main", "/chain/src/main/java",
+    ]);
+    expect(useFilesStore.getState().expanded).toMatchObject({
+      "/chain/src": true, "/chain/src/main": true, "/chain/src/main/java": true,
+    });
+    expect(useFilesStore.getState().children["/chain/src/main/java"]).toEqual([entry("App.java")]);
+  });
+
+  it("读取途中收起目录后不继续展开晚到的子目录", async () => {
+    let finish!: (entries: DirEntry[]) => void;
+    mocks.listDir.mockReturnValue(new Promise<DirEntry[]>((resolve) => { finish = resolve; }));
+    const click = useFilesStore.getState().toggleCompactDir(["/chain/src"]);
+    await useFilesStore.getState().toggleDir("/chain/src");
+    finish([entry("main", true)]);
+    await click;
+    expect(useFilesStore.getState().expanded["/chain/src/main"]).toBeUndefined();
+    expect(mocks.listDir).toHaveBeenCalledTimes(1);
+  });
+
+  it("隐藏 Git 忽略项时不沿其展开，也不批量展开", async () => {
+    useFileTreePreferencesStore.setState({ hideIgnored: true });
+    useFilesStore.setState({ children: {
+      "/chain": [entry("src", true), { ...entry("cache", true), ignored: true }],
+      "/chain/src": [{ ...entry("ignored", true), ignored: true }, entry("Main.java")],
+      "/chain/cache": [],
+    } });
+    await useFilesStore.getState().toggleCompactDir(["/chain/src"]);
+    expect(useFilesStore.getState().expanded["/chain/src/ignored"]).toBeUndefined();
+    useFilesStore.getState().expandLoadedDirs();
+    expect(useFilesStore.getState().expanded["/chain/cache"]).toBeUndefined();
+    expect(mocks.listDir).not.toHaveBeenCalled();
+  });
+
+  it("收起父目录清理后代展开路径，持久化只保留可达路径", async () => {
+    useFilesStore.setState({ expanded: { "/chain": true, "/chain/src": true, "/chain/src/main": true } });
+    await useFilesStore.getState().toggleDir("/chain/src");
+    expect(useFilesStore.getState().expanded).toEqual({ "/chain": true });
+    expect(JSON.parse(localStorage.getItem(fileTreeWorkspaceKey("/chain"))!)).toEqual({ expanded: ["/chain"] });
+  });
+
+  it("切换工作区后分别恢复展开路径，持久化内容不含过滤配置", () => {
+    mocks.listDir.mockResolvedValue([]);
+    useFilesStore.setState({ expanded: { "/chain": true, "/chain/src": true } });
+    useFilesStore.getState().setRoot("/other");
+    expect(useFilesStore.getState().expanded).toEqual({ "/other": true });
+    useFilesStore.getState().setRoot("/chain");
+    expect(useFilesStore.getState().expanded).toEqual({ "/chain": true, "/chain/src": true });
+    expect(JSON.parse(localStorage.getItem(fileTreeWorkspaceKey("/chain"))!)).toEqual({
+      expanded: ["/chain", "/chain/src"],
+    });
+  });
+
+  it("刷新不重读当前被隐藏的 Git 忽略目录", async () => {
+    useFileTreePreferencesStore.setState({ hideIgnored: true });
+    useFilesStore.setState({
+      children: { "/chain": [{ ...entry("cache", true), ignored: true }], "/chain/cache": [] },
+      expanded: { "/chain": true, "/chain/cache": true },
+    });
+    mocks.listDir.mockResolvedValue([]);
+    await useFilesStore.getState().refreshTree();
+    expect(mocks.listDir.mock.calls.map(([path]) => path)).toEqual(["/chain"]);
+  });
+});
 
 describe("file tree Git refresh", () => {
   beforeEach(() => {
@@ -30,7 +112,7 @@ describe("file tree Git refresh", () => {
     mocks.gitTreeStatus.mockResolvedValue(emptyStatus());
     mocks.gitRepositorySummaries.mockResolvedValue([]);
     mocks.gitFileColors.mockResolvedValue({});
-    useFilesStore.setState({ root: "/repo", children: { "/repo": [], "/repo/sub": [] }, expanded: {}, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {}, refreshing: false });
+    useFilesStore.setState({ root: "/repo", children: { "/repo": [entry("sub", true)], "/repo/sub": [] }, expanded: { "/repo": true, "/repo/sub": true }, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {}, refreshing: false });
   });
 
   it("batches all loaded levels instead of requesting a scan per directory", async () => {
@@ -140,7 +222,7 @@ describe("file tree listings of one directory", () => {
   });
 
   it("a superseded first load still clears its loading flag", async () => {
-    useFilesStore.setState({ children: { "/repo": [entry("sub", true)] }, expanded: { "/repo/sub": true } });
+    useFilesStore.setState({ children: { "/repo": [entry("sub", true)] }, expanded: { "/repo": true, "/repo/sub": true } });
     const finishLoad = deferredListing();
     mocks.listDir.mockResolvedValue([entry("fresh.txt")]);
     const load = useFilesStore.getState().ensureDir("/repo/sub");
