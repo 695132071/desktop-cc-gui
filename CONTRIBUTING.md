@@ -83,14 +83,14 @@ Run what your change touches / 按改动范围选择：
 | --- | --- |
 | Frontend, TypeScript / 前端 | `pnpm build` (typecheck + build / 类型检查与构建), `pnpm test` |
 | Rust (`src-tauri`) | `cargo test --manifest-path src-tauri/Cargo.toml [filter]` |
-| Streaming, Markdown, render caches / 流式输出、Markdown、渲染缓存 | `node --experimental-strip-types --test tests/*.test.ts` |
+| Streaming, Markdown, render caches / 流式输出、Markdown、渲染缓存 | `pnpm test:node` (also run first by `pnpm test` / `pnpm test` 也会先跑它) |
 | Docs only / 只改文档 | Check the rendered result; no build needed / 检查渲染效果即可，不必构建 |
 
 - For behavior changes, also run the app with `pnpm dev` and try it. Green tests don't by themselves mean the problem is fixed.
-- `pnpm plugin-skill:docs` and the `node --test` suite need Node 22.6+ (`--experimental-strip-types`); the app itself builds on Node 20+.
+- `pnpm test` needs Node 22.13+: it runs the `node --test` suite first, which uses `--experimental-strip-types` and `module.stripTypeScriptTypes`. `pnpm plugin-skill:docs` needs Node 22.6+; the app itself builds on Node 20+.
 
 - 改了行为，还要用 `pnpm dev` 把应用跑起来实际试一遍。测试全绿不等于问题已经解决。
-- `pnpm plugin-skill:docs` 和 `node --test` 那组测试需要 Node 22.6 及以上（用到 `--experimental-strip-types`）；应用本身 Node 20+ 即可构建。
+- `pnpm test` 需要 Node 22.13 及以上：它会先跑 `node --test` 那组测试，用到 `--experimental-strip-types` 和 `module.stripTypeScriptTypes`。`pnpm plugin-skill:docs` 需要 Node 22.6 及以上；应用本身 Node 20+ 即可构建。
 
 ---
 

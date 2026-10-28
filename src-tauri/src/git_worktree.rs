@@ -660,7 +660,8 @@ async fn run_create(
         }
         let meta = serde_json::json!({ "worktree": serde_json::Value::Object(meta) });
         crate::history::reader::add_workspace_inner(
-            state,
+            &state.db,
+            &state.sink,
             &args.worktree_path,
             Some(meta),
             Some("worktree".to_string()),
