@@ -558,9 +558,10 @@ export interface PluginContext {
       keywords?: () => string[];
       run: () => void;
     }): Disposer;
-    /** Chat file-link actions before the external editor (0.3.22).
+    /** Chat file-link actions before the external editor (0.3.23).
      * Permission: ui:file-link-menu. run receives a non-null resolvedPath
-     * for the clicked link, never the currently active editor's file. */
+     * for the clicked link, never the currently active editor's file.
+     * label/visible run on every menu open and see the clicked path. */
     registerFileLinkMenuItem(def: {
       key?: string;
       label: (target: FileLinkMenuTarget) => string;

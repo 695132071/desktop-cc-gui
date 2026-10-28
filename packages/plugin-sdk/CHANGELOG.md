@@ -1,11 +1,12 @@
 # @ccgui/plugin-sdk changelog
 
-## 0.3.22 — proposed: file-link context menu
+## 0.3.23 — 2026-10-28
 
-- `ctx.ui.registerFileLinkMenuItem` (`ui:file-link-menu`) contributes actions after Open File and before the selected external editor. Entries are scoped, ordered and disposed on unload.
-- `FileLinkMenuTarget` contains the clicked link, its session workspace and a re-resolved absolute path at dispatch. Resolution does not guarantee the file still exists.
-- Throwing labels/visibility predicates, rejected actions and crashing icons are isolated. An entry unloaded or replaced during asynchronous path resolution is not dispatched.
-- 0.3.21 is already proposed separately in upstream PR #1421; 0.3.22 avoids reusing that contract version.
+- 新增权限 `ui:file-link-menu` 与 `ctx.ui.registerFileLinkMenuItem(def)`：在聊天文件链接右键菜单里追加插件动作，排在「打开文件」与「在浏览器中打开」（仅 HTML）之后、所选外部编辑器之前；插件项之间按 `order`、再按 scoped id 排序。返回 Disposer，卸载自动移除。同一插件注册多项时各给一个 `key`：省略 `key` 的注册共用 `plugin:<id>`，后注册的会覆盖前一项。
+- `FileLinkMenuTarget` 是冻结快照 `{ path, resolvedPath, workspacePath }`：`path` 是消息里的原始链接文本（可能带 `:12` 行号），`workspacePath` 是该消息所在会话的工作区。不可解析的链接（`~/`、`../`）插件项可见但禁用；点击后按「打开文件」同一链路重新解析，只在得到非 null 路径时调用 `run`。解析沿用候选路径回退，不保证文件存在。
+- 隔离：`label` / `visible` 抛错，`label` 返回非字符串或空白，`run` 同步抛错或 Promise 拒绝，都只影响该插件项；图标包在 PluginBoundary 内。路径解析期间插件被卸载或同 key 重新注册时，旧回调不再派发。
+- `label` / `visible` 在每次打开菜单时求值并收到链接路径与会话工作区路径，用户不点该项插件也能看到被右键的路径，权限说明已写明这一点。web 访问模式下插件项照常显示，动作在宿主机上执行；需要时在 `visible` 里用 `ctx.host.isWeb` 自行隐藏。
+- 依赖本接口的插件声明 `sdkVersion: ">=0.3.23"`。0.3.22 已由 1.1.8 发布（worktree 徽标），那一版宿主没有本接口；声明 `>=0.3.22` 会让握手放行，激活时再报错。
 
 ## 0.3.22 — 2026-10-26
 

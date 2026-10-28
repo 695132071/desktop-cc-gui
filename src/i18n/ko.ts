@@ -1577,6 +1577,7 @@ export const ko: Messages = {
         uiPage: "독립 페이지 열기",
         uiTimelineRow: "사용자 지정 메시지 행",
         uiSessionMenu: "세션 컨텍스트 메뉴",
+        uiFileLinkMenu: "파일 링크 컨텍스트 메뉴 작업 (우클릭한 파일 경로 읽기)",
         uiSidebarEntry: "사이드바 항목",
         uiCenterTab: "중앙 탭",
         uiConversationMode: "채팅별 대화 모드",

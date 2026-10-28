@@ -21,6 +21,11 @@ vi.mock("@/features/plugins/runtime/loader", () => ({
   reportPluginCrash: mocks.crash, notePluginRenderOk: vi.fn(),
 }));
 vi.mock("@/lib/i18n", () => ({ default: { t: (key: string) => key } }));
+// Desktop host: the HTML-only "Open in Browser" row is gated on !isWeb.
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/platform")>(),
+  isWeb: false,
+}));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({
   t: (key: string, options?: { app: string }) => key === "files.openInApp"
     ? `Open in ${options?.app}` : key,
@@ -62,9 +67,12 @@ describe("file-link menu plugin entries", () => {
     container.remove();
     vi.restoreAllMocks();
   });
-  async function render(resolvedPath: string | null = "C:/vault/Note & #1.md") {
+  async function render(
+    resolvedPath: string | null = "C:/vault/Note & #1.md",
+    linkPath = "Note & #1.md",
+  ) {
     await act(async () => root.render(<FileLinkContextMenu menu={{
-      x: 30, y: 30, path: "Note & #1.md", resolvedPath, workspacePath,
+      x: 30, y: 30, path: linkPath, resolvedPath, workspacePath,
     }} onClose={() => {}} />));
   }
   it("inserts ordered plugin rows between Open File and the selected editor", async () => {
@@ -73,6 +81,22 @@ describe("file-link menu plugin entries", () => {
     await render();
     expect(rows().map(button => button.textContent).slice(0, 4)).toEqual([
       "files.openFile", "First", "Second", "Open in VS Code",
+    ]);
+  });
+  it("places plugin rows after Open in Browser on HTML links", async () => {
+    register({ label: () => "Open in Obsidian" });
+    await render("C:/vault/page.html", "page.html:12");
+    expect(rows().map(button => button.textContent).slice(0, 4)).toEqual([
+      "files.openFile", "files.openInBrowser", "Open in Obsidian", "Open in VS Code",
+    ]);
+  });
+  it("drops blank labels instead of rendering an unnamed row", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    register({ id: "plugin:empty", label: () => "" });
+    register({ id: "plugin:spaces", label: () => "   " });
+    await render();
+    expect(rows().map(button => button.textContent).slice(0, 2)).toEqual([
+      "files.openFile", "Open in VS Code",
     ]);
   });
   it("passes the clicked link's actual resolved path and workspace to run", async () => {

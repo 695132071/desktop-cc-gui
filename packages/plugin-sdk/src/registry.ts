@@ -305,7 +305,7 @@ export const commandRegistry = new Registry<CommandDef>();
 /** Sidebar session context-menu item registry. */
 export const sessionMenuRegistry = new Registry<SessionMenuItemDef>();
 
-/** Chat file-link context-menu contributions (0.3.22). */
+/** Chat file-link context-menu contributions (0.3.23). */
 export const fileLinkMenuRegistry = new Registry<FileLinkMenuItemDef>();
 
 /** Markdown pipeline registry (plan §4.2 #5). */

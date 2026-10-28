@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.22
+ * @ccgui/plugin-sdk v0.3.23
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -586,7 +586,7 @@ export interface PluginContext {
       keywords?: () => string[];
       run: () => void;
     }): Disposer;
-    /** Chat file-link actions before the external editor (ui:file-link-menu, 0.3.22). */
+    /** Chat file-link actions before the external editor (ui:file-link-menu, 0.3.23). */
     registerFileLinkMenuItem(def: {
       key?: string;
       label: (target: FileLinkMenuTarget) => string;

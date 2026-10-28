@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.22）
+# CC GUI 插件 SDK 参考（SDK 0.3.23）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -72,7 +72,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerComposerStatusItem` | `ui:composer-status` | Composer status-row chip (permission `ui:composer-status`, 0.3.9): renders in the composer's status row (branch/context meter row), left group after the branch switcher. |
 | `ctx.ui.registerOverlay` | `ui:overlay` | Persistent viewport mount; requires ui:overlay. The plugin controls placement and opts interactive children into pointer-events: auto. |
 | `ctx.ui.registerCommand` | `ui:command` | Command palette entry (plan §4.2 #9). |
-| `ctx.ui.registerFileLinkMenuItem` | `ui:file-link-menu` | Chat file-link actions before the external editor (0.3.22). Permission: ui:file-link-menu. run receives a non-null resolvedPath for the clicked link, never the currently active editor's file. |
+| `ctx.ui.registerFileLinkMenuItem` | `ui:file-link-menu` | Chat file-link actions before the external editor (0.3.23). Permission: ui:file-link-menu. run receives a non-null resolvedPath for the clicked link, never the currently active editor's file. label/visible run on every menu open and see the clicked path. |
 | `ctx.ui.registerSessionMenuItem` | `ui:session-menu` | Sidebar session right-click menu row (permission `ui:session-menu`, 0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 |
 | `ctx.ui.openSettings` | `ui:settings-section` | 跳转到本插件的设置页（权限 `ui:settings-section`，0.3.6 起）。 `key` 对应 registerSettingsSection 的子 key，省略时打开主 section； 供状态栏 chip、面板按钮等做深链入口。 |
 | `ctx.ui.registerMarkdownRenderer` | `ui:markdown` | Markdown pipeline additions, merged over host defaults (plan §4.2 #5). |

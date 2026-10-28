@@ -41,6 +41,8 @@ export interface FileLinkMenuState {
  * - 打开文件 → center-area editor tab (same as left-click)
  * - 在浏览器中打开 → default web browser; HTML links on desktop only, the
  *   same gate the file tree and changes panel menus use
+ * - plugin rows (`ctx.ui.registerFileLinkMenuItem`, `ui:file-link-menu`),
+ *   sorted among themselves by order, then scoped id
  * - 在 <app> 中打开 → the header's selected "open with" target (VS Code,
  *   Cursor, IDEA); when that target is the file manager this entry *is* the
  *   reveal action, matching the reference app
@@ -108,7 +110,10 @@ export function FileLinkContextMenu({
     try {
       if (def.visible?.(pluginTarget) === false) continue;
       const label = def.label(pluginTarget);
-      if (typeof label !== "string") throw new TypeError("File-link menu label must be a string");
+      // A blank label would render an unnamed but clickable row.
+      if (typeof label !== "string" || label.trim() === "") {
+        throw new TypeError("File-link menu label must be a non-empty string");
+      }
       const Icon = def.icon ?? Puzzle;
       pluginEntries.push({
         id: def.id,
