@@ -32,6 +32,16 @@ pub fn clipboard_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
     os_file_snapshot()
 }
 
+/// The clipboard generation alone (macOS `changeCount`, Windows
+/// `GetClipboardSequenceNumber`). Neither call opens the clipboard, so this
+/// still answers while another program holds it open — exactly when the
+/// tree's Copy fails to write and must record whether anything changed.
+/// `None` where the platform keeps no generation.
+#[tauri::command]
+pub fn clipboard_change_count() -> Option<u64> {
+    platform::change_count()
+}
+
 /// Replace the general clipboard with a file list, so another app's paste
 /// inserts the actual items (Explorer / Finder semantics, not a path string).
 ///
@@ -85,12 +95,18 @@ mod platform {
 
     pub(super) fn file_snapshot() -> Result<super::ClipboardFileSnapshot, String> {
         let pasteboard = NSPasteboard::generalPasteboard();
-        let change_count = u64::try_from(pasteboard.changeCount())
-            .map_err(|error| format!("cannot read the clipboard generation: {error}"))?;
         Ok(super::ClipboardFileSnapshot {
             paths: read_file_urls(&pasteboard),
-            change_count: Some(change_count),
+            change_count: generation(&pasteboard),
         })
+    }
+
+    pub(super) fn change_count() -> Option<u64> {
+        generation(&NSPasteboard::generalPasteboard())
+    }
+
+    fn generation(pasteboard: &NSPasteboard) -> Option<u64> {
+        u64::try_from(pasteboard.changeCount()).ok()
     }
 
     pub(super) fn set_file_paths(paths: &[String]) -> Result<(), String> {
@@ -169,13 +185,20 @@ mod platform {
         unsafe {
             OpenClipboard(None).map_err(|e| format!("cannot open the clipboard: {e}"))?;
             let paths = read_hdrop();
-            let change_count = GetClipboardSequenceNumber();
+            let change_count = change_count();
             let _ = CloseClipboard();
             Ok(super::ClipboardFileSnapshot {
                 paths: paths?,
-                change_count: Some(u64::from(change_count)),
+                change_count,
             })
         }
+    }
+
+    pub(super) fn change_count() -> Option<u64> {
+        // SAFETY: a plain query that does not open the clipboard.
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        // Zero means this window station has no clipboard access.
+        (sequence != 0).then(|| u64::from(sequence))
     }
 
     pub(super) fn set_file_paths(paths: &[String]) -> Result<(), String> {
@@ -289,6 +312,10 @@ mod platform {
             paths: Vec::new(),
             change_count: None,
         })
+    }
+
+    pub(super) fn change_count() -> Option<u64> {
+        None
     }
 
     /// Writing a file list needs the same GTK/X11 selection stack the read

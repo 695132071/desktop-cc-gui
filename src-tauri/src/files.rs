@@ -404,11 +404,10 @@ fn copy_item_into_dir_with(
             .ok_or_else(|| "too many copies exist".to_string())?;
     }
     // A unique staged name isolates concurrent copies; only this operation's
-    // temporary item is ever cleaned up.
-    let temporary = target_dir.join(format!(
-        ".{source_name}.ccgui-copying-{}",
-        uuid::Uuid::new_v4()
-    ));
+    // temporary item is ever cleaned up. It does not embed the source name:
+    // a long name plus the suffix would exceed the 255-unit name limit and
+    // fail a copy whose real destination fits.
+    let temporary = target_dir.join(format!(".ccgui-copying-{}", uuid::Uuid::new_v4()));
     if is_dir {
         std::fs::create_dir(&temporary)
             .map_err(|error| format!("mkdir {}: {error}", temporary.display()))?;
@@ -430,9 +429,49 @@ fn copy_item_into_dir_with(
 
 /// Publish a complete staged item without replacing a destination that
 /// appeared while it was being copied. All staging paths are siblings of the
-/// destination, so the native rename stays on one filesystem.
-#[cfg(windows)]
+/// destination, so the rename stays on one filesystem.
 fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish_copy_with(from, to, rename_exclusive)
+}
+
+/// Some filesystems have no exclusive rename: exFAT on macOS answers
+/// `RENAME_EXCL` with ENOTSUP, and network or FUSE mounts on Linux may reject
+/// `RENAME_NOREPLACE` with EINVAL. Duplicate and paste must keep working
+/// there, so the fallback checks the destination and then renames; a
+/// destination created in that narrow window can still be replaced, which is
+/// the best such a filesystem offers.
+fn publish_copy_with(
+    from: &Path,
+    to: &Path,
+    exclusive: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match exclusive(from, to) {
+        Err(error) if exclusive_rename_unsupported(&error) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS].contains(&code)
+    })
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` works on every Windows
+/// filesystem, so there is nothing to fall back from.
+#[cfg(windows)]
+fn exclusive_rename_unsupported(_error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
 
@@ -451,7 +490,7 @@ fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -469,7 +508,7 @@ fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -524,25 +563,14 @@ fn copy_item_into_dir(
         is_dir,
         target_dir,
         prefer_original_name,
+        // std::fs::copy is what duplicate/paste used before staging: it keeps
+        // mode bits, and on macOS clones on APFS (instant, no extra space)
+        // keeping timestamps and extended attributes. The staged name is
+        // unique, so the only file it can overwrite is the AppleDouble
+        // `._name` sidecar macOS itself just wrote on a FAT / exFAT volume.
         &mut |source, destination| {
-            let permissions = std::fs::metadata(source)
-                .map_err(|e| format!("stat {}: {e}", source.display()))?
-                .permissions();
-            let mut reader = std::fs::File::open(source)
-                .map_err(|e| format!("open {}: {e}", source.display()))?;
-            let mut writer = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(destination)
-                .map_err(|e| format!("create {}: {e}", destination.display()))?;
-            let copied = std::io::copy(&mut reader, &mut writer)
-                .map_err(|e| format!("copy {}: {e}", source.display()))?;
-            drop(writer);
-            // io::copy moves bytes only; restore mode bits so executable
-            // scripts and read-only files survive duplicate/paste.
-            std::fs::set_permissions(destination, permissions)
-                .map_err(|e| format!("chmod {}: {e}", destination.display()))?;
-            Ok(copied)
+            std::fs::copy(source, destination)
+                .map_err(|e| format!("copy {}: {e}", source.display()))
         },
     )
 }
@@ -1083,6 +1111,83 @@ mod tests {
         assert_eq!(result.failed.len(), 2);
         assert!(result.failed.iter().all(|error| error.contains("symlink")));
         assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+    }
+
+    /// exFAT on macOS answers `RENAME_EXCL` with ENOTSUP: the copy must
+    /// still publish, and still refuse to replace an existing destination.
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_exclusive_rename_falls_back_without_replacing() {
+        let scratch = Scratch::new();
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        publish_copy_with(&staged, &destination, unsupported).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert!(!staged.exists());
+
+        std::fs::write(&staged, b"second").unwrap();
+        let error = publish_copy_with(&staged, &destination, unsupported).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_exclusive_rename_errors_do_not_fall_back() {
+        let scratch = Scratch::new();
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        let error = publish_copy_with(&staged, &destination, |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(!destination.exists());
+        assert!(staged.exists());
+    }
+
+    /// The staged name must not grow with the source name: a 213-character
+    /// name fits the 255 limit, its staged sibling must too.
+    #[test]
+    fn long_names_paste_and_duplicate() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let name = format!("{}.md", "a".repeat(210));
+        let file = source.0.join(&name);
+        std::fs::write(&file, b"hi").unwrap();
+
+        let pasted = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(pasted, destination.0.join(&name));
+        let duplicated = copy_item_into_dir(&file, false, &source.0, false).unwrap();
+        assert_eq!(std::fs::read(duplicated).unwrap(), b"hi");
+    }
+
+    /// Duplicate/paste keep the modification time like a file-manager copy
+    /// (APFS clone / copyfile on macOS, CopyFileEx on Windows).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn copy_keeps_the_source_modification_time() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("photo.txt");
+        std::fs::write(&file, b"data").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let copied = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(std::fs::metadata(copied).unwrap().modified().unwrap(), old);
     }
 
     #[test]

@@ -1514,6 +1514,10 @@ export const ipc = {
    *  no path to the webview). Rejects on a real read failure; the web bridge
    *  has no OS pasteboard and returns an empty snapshot with no generation. */
   clipboardFileSnapshot: () => invoke<ClipboardFileSnapshot>("clipboard_file_snapshot"),
+  /** The OS clipboard generation alone. Unlike a snapshot it never opens the
+   *  clipboard, so it answers while another program holds it; null where no
+   *  native generation exists (Linux, the web bridge). */
+  clipboardChangeCount: () => invoke<number | null>("clipboard_change_count"),
   /** Replace the OS clipboard with a file list, so Finder / Explorer paste
    *  the actual items. Rejects when the host cannot write; the in-app tree
    *  clipboard still carries the item (Linux has no native bridge). */

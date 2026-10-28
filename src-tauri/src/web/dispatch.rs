@@ -769,6 +769,8 @@ pub(super) async fn dispatch(
                 change_count: None,
             },
         )),
+        // No generation either: the tree then always pastes its own item.
+        "clipboard_change_count" => ser(Ok::<Option<u64>, String>(None)),
         // Same reason: nothing to write. The tab keeps the in-app tree
         // clipboard, so Copy/Paste inside the tree still works.
         "clipboard_set_file_paths" => ser(Ok::<(), String>(())),

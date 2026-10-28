@@ -4,16 +4,11 @@ import { copyText } from "@/lib/clipboard";
 import { ipc, type ClipboardFileSnapshot } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { joinPath, parentPath, useFilesStore, type TreeClipboard } from "./store";
+import { choosePasteSource } from "./paste-source";
 import type { FileTreeMenuState } from "./FileTreeContextMenu";
 import type { VisibleNode } from "./FileTreeRow";
 import { useChatStore } from "@/features/chat/store";
 
-interface PendingTreeCopy {
-  id: number;
-  /** Undefined means no unchanged clipboard generation was proven. */
-  beforeChangeCount?: number | null;
-  write: Promise<void>;
-}
 interface PromptState {
   kind: "newFile" | "newFolder" | "rename";
   /** Parent dir for newFile/newFolder; the item itself for rename. */
@@ -68,7 +63,7 @@ export function useFileTreeOperations(): FileTreeOperations {
   const selectPath = useFilesStore((s) => s.selectPath);
 
   const copyIdRef = useRef(0);
-  const pendingCopyRef = useRef<PendingTreeCopy | null>(null);
+  /** Tail of the serialized Copy writes; never rejects. */
   const clipboardWriteRef = useRef<Promise<void>>(Promise.resolve());
   const clipboardProbeRef = useRef(0);
   const mountedRef = useRef(true);
@@ -197,26 +192,27 @@ export function useFileTreeOperations(): FileTreeOperations {
   const handlePaste = useCallback(
     async (targetDir: string) => {
       try {
-        // Copy ids are captured around both waits and reads. A Copy that
-        // arrives while Paste is reading invalidates that source decision.
-        let pending = pendingCopyRef.current;
-        if (pending) await pending.write.catch(() => {});
         let snapshot: ClipboardFileSnapshot;
         for (;;) {
           const copyId = copyIdRef.current;
-          pending = pendingCopyRef.current;
+          // The latest Copy's write must settle and record its generation
+          // before the comparison below means anything.
+          await clipboardWriteRef.current;
           // The host reads its own snapshot inside pasteClipboardItems;
           // renderer-supplied source paths never enter the paste command.
           snapshot = await ipc.clipboardFileSnapshot();
+          // A Copy that arrived meanwhile changes both clipboards: decide again.
           if (copyIdRef.current === copyId) break;
         }
         if (!mountedRef.current) return;
-        const usePendingCopy =
-          pending &&
-          (snapshot.changeCount === null ||
-            (pending.beforeChangeCount !== undefined &&
-              snapshot.changeCount === pending.beforeChangeCount));
-        if (snapshot.paths.length > 0 && !usePendingCopy) {
+        const item = useFilesStore.getState().clipboard;
+        const source = choosePasteSource(snapshot, item);
+        if (source === "tree" && item) {
+          const result = await ipc.pasteItem(item.path, targetDir);
+          await revealInTree(targetDir, result.path, result.isDir);
+          return;
+        }
+        if (source === "system") {
           const { created, failed } = await ipc.pasteClipboardItems(targetDir);
           if (created.length > 0) {
             const last = created[created.length - 1];
@@ -230,19 +226,7 @@ export function useFileTreeOperations(): FileTreeOperations {
           }
           return;
         }
-        if (pending && !usePendingCopy) {
-          // A newer external clipboard containing only text must invalidate
-          // the failed write's tree fallback too.
-          setNotice(t("files.pasteUnavailable"));
-          return;
-        }
-        const item = useFilesStore.getState().clipboard;
-        if (!item) {
-          setNotice(t("files.pasteUnavailable"));
-          return;
-        }
-        const result = await ipc.pasteItem(item.path, targetDir);
-        await revealInTree(targetDir, result.path, result.isDir);
+        setNotice(t("files.pasteUnavailable"));
       } catch (e) {
         opFailed(e);
       }
@@ -262,37 +246,25 @@ export function useFileTreeOperations(): FileTreeOperations {
 
   const copyItem = useCallback(() => {
     if (!menu) return;
-    const item = { path: menu.path, isDir: menu.isDir };
+    const item: TreeClipboard = { path: menu.path, isDir: menu.isDir };
     const id = ++copyIdRef.current;
     useFilesStore.getState().setClipboard(item);
-    const pending: PendingTreeCopy = { id, write: Promise.resolve() };
-    pendingCopyRef.current = pending;
     // Serialize native writes: a late write for an older Copy must not
-    // overwrite the newer item. Capture the generation immediately before
-    // this copy's actual native write.
-    const write = clipboardWriteRef.current.catch(() => {}).then(async () => {
+    // overwrite the newer item.
+    clipboardWriteRef.current = clipboardWriteRef.current.then(async () => {
       if (copyIdRef.current !== id) return;
-      const before = await ipc.clipboardFileSnapshot();
-      if (copyIdRef.current !== id) return;
-      try {
-        await ipc.setClipboardFilePaths([item.path]);
-      } catch (error) {
-        const after = await ipc.clipboardFileSnapshot().catch(() => null);
-        pending.beforeChangeCount =
-          after?.changeCount === before.changeCount ? before.changeCount : undefined;
-        throw error;
-      }
+      // A refused write (clipboard held by another program, no native bridge
+      // on Linux) is not an error for the tree: the generation read below
+      // still tells Paste whether this item is the newest copy.
+      await ipc.setClipboardFilePaths([item.path]).catch(() => {});
+      // Reading the generation does not open the clipboard, so it answers
+      // even while another program holds it.
+      const osChangeCount = await ipc.clipboardChangeCount().catch(() => undefined);
+      if (osChangeCount === undefined) return;
+      const store = useFilesStore.getState();
+      // A newer Copy replaced the item meanwhile; it records its own.
+      if (store.clipboard === item) store.setClipboard({ ...item, osChangeCount });
     });
-    pending.write = write;
-    clipboardWriteRef.current = write;
-    void write.then(
-      () => {
-        if (copyIdRef.current === id) pendingCopyRef.current = null;
-      },
-      () => {
-        // Keep the failed copy for the unchanged-generation fallback.
-      },
-    );
   }, [menu]);
 
   const copyPath = useCallback(() => {

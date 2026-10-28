@@ -39,6 +39,12 @@ export function parentPath(path: string): string {
 export interface TreeClipboard {
   path: string;
   isDir: boolean;
+  /** OS clipboard generation read right after this item's Copy tried to put
+   *  it on the system clipboard, whether or not that write landed. `null`:
+   *  the platform keeps no generation; absent: not known. Rename remaps
+   *  `path` and keeps this, so Paste can tell the item is still the newest
+   *  copy (`choosePasteSource`). */
+  osChangeCount?: number | null;
 }
 
 export interface OpenFileState {
