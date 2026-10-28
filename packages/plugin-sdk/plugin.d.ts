@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.22
+ * @ccgui/plugin-sdk v0.3.23
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -14,6 +14,13 @@ export declare const SDK_VERSION: string;
 
 /** 每次注册的撤销句柄；卸载时逆序执行。 */
 export type Disposer = () => void;
+
+/** The clicked file link. run is dispatched only with a resolvedPath. */
+export interface FileLinkMenuTarget {
+  readonly path: string;
+  readonly resolvedPath: string | null;
+  readonly workspacePath: string;
+}
 
 export type PluginConversationProps = {
   conversationId: string;
@@ -578,6 +585,15 @@ export interface PluginContext {
       title: () => string;
       keywords?: () => string[];
       run: () => void;
+    }): Disposer;
+    /** Chat file-link actions before the external editor (ui:file-link-menu, 0.3.23). */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentLike<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
     }): Disposer;
     /** 侧栏会话右键菜单追加行（权限 ui:session-menu，0.3.5 起）；
      *  run 收到打开菜单的会话。 */

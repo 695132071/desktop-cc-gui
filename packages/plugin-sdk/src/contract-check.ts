@@ -17,6 +17,7 @@ import type {
   DocumentWriteResult,
   ExternalSessionRow,
   FileChangedEvent,
+  FileLinkMenuTarget,
   InternalMessageCapture,
   InternalMessageEvent,
   isValidPluginId,
@@ -97,6 +98,7 @@ export type _JsonSchemaObject = Assert<Mutual<JsonSchemaObject, Pub.JsonSchemaOb
 export type _JsonSchemaProperty = Assert<Mutual<JsonSchemaProperty, Pub.JsonSchemaProperty>>;
 export type _ComposerSlotId = Assert<Mutual<ComposerSlotId, Pub.ComposerSlotId>>;
 export type _SessionMenuTarget = Assert<Mutual<SessionMenuTarget, Pub.SessionMenuTarget>>;
+export type _FileLinkMenuTarget = Assert<Mutual<FileLinkMenuTarget, Pub.FileLinkMenuTarget>>;
 export type _PluginTier = Assert<Mutual<PluginTier, Pub.PluginTier>>;
 export type _Disposer = Assert<Mutual<Disposer, Pub.Disposer>>;
 export type _PluginIdValidator = Assert<Mutual<typeof isValidPluginId, typeof Pub.isValidPluginId>>;
