@@ -7,6 +7,7 @@ import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import { cx } from "@/utils/cx";
 import { StepRow, type TaskListChip } from "@/components/application/task-list/task-list";
 import { getFileTreeIconSvg } from "@/features/files/fileIcons";
+import { useChatFileOpener, type ChatFileOpener } from "@/features/chat/open-chat-file";
 import { markToolKeys, toolEntranceKey, type ProcessItem } from "./timeline-rows";
 import { ToolPayloadViewer } from "./ToolPayloadViewer";
 import { useLiveReveal } from "./use-live-reveal";
@@ -29,11 +30,29 @@ function toolTypeKey(text: string): string {
   return "toolTypeTool";
 }
 
+/** Tools whose path argument always names a file, or always a folder. The
+ * rest (grep's path can be either) fall back to the extension heuristic. */
+const FILE_TARGET_TOOLS = new Set(["read", "write", "edit", "multiedit", "notebookedit", "read_file", "write_file", "edit_file"]);
+const FOLDER_TARGET_TOOLS = new Set(["ls", "glob", "list_directory"]);
+
+function targetIsDir(tool: string, name: string): boolean {
+  const key = tool.trim().toLowerCase();
+  if (FILE_TARGET_TOOLS.has(key)) return false; // `Makefile`, `Dockerfile`
+  if (FOLDER_TARGET_TOOLS.has(key)) return true; // `release/v1.2`
+  // Same heuristic as the composer file tags: extension-less = folder.
+  return !name.includes(".");
+}
+
 /** File chip for a tool call's target path. Glob patterns, URLs, and
  * path-less calls get no chip — a pattern is not a file you can open, and a
  * URL's last segment (search targets like `artifact://0` → "0") would render
  * as a meaningless folder chip. */
-function fileChipFor(path: string | null | undefined): TaskListChip | null {
+function fileChipFor(
+  path: string | null | undefined,
+  tool: string,
+  opener: ChatFileOpener | null | undefined,
+  t: TFunction,
+): TaskListChip | null {
   if (!path || /[*?{}[\]]/.test(path) || path.includes("://")) return null;
   // Read selectors (`file.ts:301-591:raw`, `img.svg:img`) are read modifiers,
   // not part of the file name — strip trailing `:` segments that are line
@@ -46,10 +65,10 @@ function fileChipFor(path: string | null | undefined): TaskListChip | null {
       segments.pop();
     } else break;
   }
-  const name = segments.join(":").split(/[\\/]/).pop() ?? "";
+  const target = segments.join(":");
+  const name = target.split(/[\\/]/).pop() ?? "";
   if (!name || name === "." || name === "..") return null;
-  // Same heuristic as the composer file tags: extension-less = folder.
-  const isDir = !name.includes(".");
+  const isDir = targetIsDir(tool, name);
   return {
     label: name,
     icon: (
@@ -59,6 +78,17 @@ function fileChipFor(path: string | null | undefined): TaskListChip | null {
         dangerouslySetInnerHTML={{ __html: getFileTreeIconSvg(name, isDir) }}
       />
     ),
+    // Folders have no file to open, and `~/` / `../` targets never resolve;
+    // every other target opens in the center editor, which is also where
+    // image targets land (ImageFileView + lightbox), so clicking a
+    // screenshot's chip previews it.
+    ...(opener && !isDir && opener.canOpen(target)
+      ? {
+          title: target,
+          selectLabel: t("chat.toolFileOpen", { name }),
+          onSelect: () => opener.open(target),
+        }
+      : {}),
   };
 }
 
@@ -113,6 +143,7 @@ const FrozenStepRow = memo(function FrozenStepRow({
   first,
   last,
   index,
+  fileOpener,
 }: {
   play: boolean;
   text: string;
@@ -122,12 +153,14 @@ const FrozenStepRow = memo(function FrozenStepRow({
   first: boolean;
   last: boolean;
   index: number;
+  /** Opens a tool call's target file; null disables the chip affordance. */
+  fileOpener?: ChatFileOpener | null;
 }) {
   const reduceRef = useRef(!play);
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const hasPayload = args != null || result != null;
-  const fileChip = fileChipFor(path);
+  const fileChip = fileChipFor(path, text, fileOpener, t);
   const step = {
     label: text,
     chips: [
@@ -213,38 +246,46 @@ export function ThinkingSurface({
   );
 }
 
-type ExpansionProps = { auto: boolean; live: boolean; thinking: boolean };
+type ExpansionProps = { auto: boolean; live: boolean; thinking: boolean; answered: boolean };
 
 
 /** Pure transition table for the expanded-state machine: given the previous
  *  and current prop snapshot plus the user's override flag, decide the next
- *  expanded/overridden pair. Automation opens a row while its thinking is
- *  streaming and folds it the moment that thinking settles — unless
- *  `thinkingAutoCollapse` is off (设置 → 通用 → 行为), in which case the row
- *  stays open so the timeline does not jump shut. A superseded or
- *  turn-settled row folds either way, until the user's own click takes
- *  over. */
+ *  expanded/overridden pair. Automation opens a run while it is the latest
+ *  one and keeps it open through thinking pauses/resumes; it folds only once
+ *  the run is actually over — assistant text appeared after it, or the turn
+ *  settled. Thinking settles at every tool boundary, so folding there made a
+ *  still-running process disappear mid-turn. A superseded or turn-settled
+ *  row folds too, until the user's own click takes over. */
 function expansionTransition(
   prev: ExpansionProps,
   next: ExpansionProps,
   expanded: boolean,
   overridden: boolean,
   thinkingAutoCollapse: boolean,
+  hasThinking: boolean,
 ): { expanded: boolean; overridden: boolean } {
   if (next.auto && !prev.auto) {
     // Became the latest row: open it and hand control back to automation.
     return { expanded: true, overridden: false };
   }
-  if (next.thinking && !prev.thinking && !overridden) {
-    // Thinking resumed inside this row (extended thinking between tool
-    // calls): show it again unless the user folded the row on purpose.
+  if (next.thinking && !prev.thinking && !overridden && !next.answered) {
+    // Thinking resumed inside a still-running run (extended reasoning
+    // between tool calls): show it again, unless answer text after this run
+    // already marked the run as finished.
     return { expanded: true, overridden };
   }
-  if (thinkingAutoCollapse && !next.thinking && prev.thinking && !overridden) {
-    // The thinking settled: fold immediately — expanded-on-demand shows
-    // the full text afterwards. A deliberate user click wins: it keeps
-    // its chosen state and stays sticky across thinking resume cycles.
-    return { expanded: false, overridden };
+  if (thinkingAutoCollapse && !overridden && hasThinking) {
+    if (!next.auto && prev.auto) {
+      // A newer process run took over: this one is no longer the live tail.
+      return { expanded: false, overridden };
+    }
+    // Fold only when the run is actually over: the assistant started writing
+    // text after it, or the turn settled. The thinking-settled edge alone is
+    // not a boundary — it fires at every tool call.
+    if (next.answered || (prev.live && !next.live)) {
+      return { expanded: false, overridden };
+    }
   }
   if (!next.auto && !next.live) {
     const superseded = prev.auto;
@@ -263,6 +304,8 @@ function useProcessExpansion(
   autoExpand: boolean,
   turnLive: boolean,
   hasLiveThinking: boolean,
+  hasThinking: boolean,
+  answered: boolean,
   thinkingAutoCollapse: boolean,
   searchRequest?: string,
 ) {
@@ -273,13 +316,19 @@ function useProcessExpansion(
   // React-blessed adjust-during-render: previous prop values live in state,
   // so a prop change settles in the same commit that observed it — no
   // one-frame paint of the stale expanded value.
-  const [prev, setPrev] = useState({ auto: autoExpand, live: turnLive, thinking: hasLiveThinking, searchRequest });
-  const next = { auto: autoExpand, live: turnLive, thinking: hasLiveThinking, searchRequest };
-  if (prev.auto !== next.auto || prev.live !== next.live || prev.thinking !== next.thinking || prev.searchRequest !== next.searchRequest) {
+  const [prev, setPrev] = useState({ auto: autoExpand, live: turnLive, thinking: hasLiveThinking, answered, searchRequest });
+  const next = { auto: autoExpand, live: turnLive, thinking: hasLiveThinking, answered, searchRequest };
+  if (
+    prev.auto !== next.auto
+    || prev.live !== next.live
+    || prev.thinking !== next.thinking
+    || prev.answered !== next.answered
+    || prev.searchRequest !== next.searchRequest
+  ) {
     setPrev(next);
     const settled = searchRequest !== undefined && searchRequest !== prev.searchRequest
       ? { expanded: true, overridden: true }
-      : expansionTransition(prev, next, expanded, overridden, thinkingAutoCollapse);
+      : expansionTransition(prev, next, expanded, overridden, thinkingAutoCollapse, hasThinking);
     // Setting state to its current value bails out without a re-render, so
     // the no-op transitions are free.
     setOverridden(settled.overridden);
@@ -336,6 +385,7 @@ function ProcessDisclosureBody({
   processId,
   seenTools,
   searchTarget,
+  fileOpener,
 }: {
   items: ProcessItem[];
   expanded: boolean;
@@ -344,6 +394,7 @@ function ProcessDisclosureBody({
   processId: number;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
+  fileOpener?: ChatFileOpener | null;
 }) {
   const { t } = useTranslation();
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -412,6 +463,7 @@ function ProcessDisclosureBody({
                   result={call.result}
                   first={j === 0}
                   last={j === section.calls.length - 1}
+                  fileOpener={fileOpener}
                 />
               );
             })}
@@ -441,28 +493,46 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
   items,
   autoExpand = false,
   turnLive = false,
+  answered = false,
   thinkingAutoCollapse = true,
   processId,
   seenTools,
   searchTarget,
+  workspacePath = "",
 }: {
   items: ProcessItem[];
   autoExpand?: boolean;
-  /** True while the turn is still streaming. The row folds when its own
-   *  thinking settles even mid-turn; this only keeps pre-thinking content
-   *  (early tool rows) mounted until the turn ends. */
+  /** True while the turn is still streaming. A run folds when assistant text
+   *  starts after it or, with no answer text, when this goes false. */
   turnLive?: boolean;
-  /** True (default): fold the row when its thinking settles. False (设置 →
-   *  通用 → 行为): keep the settled thinking expanded so the timeline does
-   *  not jump shut; the user can still fold it by hand. */
+  /** True once assistant text exists after this process run in the same turn.
+   *  That — not a thinking-settled edge at a tool boundary — is when the run
+   *  may fold. */
+  answered?: boolean;
+  /** True (default): fold a thinking run once it is actually over (answer
+   *  text after it, or the turn settled). False (设置 → 通用 → 行为): keep the
+   *  run expanded; the user can still fold it by hand. */
   thinkingAutoCollapse?: boolean;
   processId: number;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
+  /** Session workspace root, anchoring relative tool paths for the
+   *  click-to-open chips. Empty keeps the chips inert. */
+  workspacePath?: string;
 }) {
   const { t } = useTranslation();
+  const fileOpener = useChatFileOpener(workspacePath);
   const hasLiveThinking = items.some((item) => item.type === "thinking" && item.live);
-  const { expanded, toggleExpanded } = useProcessExpansion(autoExpand, turnLive, hasLiveThinking, thinkingAutoCollapse, searchTarget?.requestKey);
+  const hasThinking = items.some((item) => item.type === "thinking");
+  const { expanded, toggleExpanded } = useProcessExpansion(
+    autoExpand,
+    turnLive,
+    hasLiveThinking,
+    hasThinking,
+    answered,
+    thinkingAutoCollapse,
+    searchTarget?.requestKey,
+  );
   const reduceMotion = useReducedMotion() ?? false;
   const largeProcess = items.length > PROCESS_PAGE_SIZE;
   const unseenToolCount = largeProcess
@@ -481,7 +551,10 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
   // "思考过程" title itself, and the expanded body drops the inner repeat.
   const singleThinking = items.length === 1 && items[0].type === "thinking";
   const label = processSummaryLabel(t, singleThinking, thinkingCount, toolCount);
-  const showBody = expanded || hasLiveThinking;
+  // A folded row does not keep live thinking mounted (or revealing) behind
+  // the clipped grid: expanding is the user's explicit request, and a fresh
+  // mount publishes everything already received.
+  const showBody = expanded;
   const [bodyMounted, setBodyMounted] = useState(showBody);
   useLayoutEffect(() => {
     if (showBody) {
@@ -534,6 +607,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
               processId={processId}
               seenTools={seenTools}
               searchTarget={searchTarget}
+              fileOpener={fileOpener}
             />
           ) : null}
         </div>

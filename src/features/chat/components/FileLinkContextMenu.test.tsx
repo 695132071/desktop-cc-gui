@@ -1,143 +1,111 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import * as sdk from "@ccgui/plugin-sdk";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ipc } from "@/lib/ipc";
+import { FileLinkContextMenu, type FileLinkMenuState } from "./FileLinkContextMenu";
 
-const mocks = vi.hoisted(() => ({
-  resolve: vi.fn(),
-  openWorkspaceIn: vi.fn().mockResolvedValue(undefined),
-  revealInFileManager: vi.fn().mockResolvedValue(undefined),
-  openFile: vi.fn(),
-  crash: vi.fn(),
+const platform = vi.hoisted(() => ({ isWeb: false }));
+vi.mock("@/lib/platform", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/platform")>(),
+  get isWeb() {
+    return platform.isWeb;
+  },
 }));
-vi.mock("@/lib/ipc", () => ({ ipc: {
-  openWorkspaceIn: mocks.openWorkspaceIn, revealInFileManager: mocks.revealInFileManager,
-} }));
-vi.mock("@/features/files/store", () => ({
-  useFilesStore: { getState: () => ({ openFile: mocks.openFile }) },
+vi.mock("react-i18next", async (importOriginal) => ({
+  ...await importOriginal<typeof import("react-i18next")>(),
+  useTranslation: () => ({ t: (key: string) => key }),
 }));
-vi.mock("@/features/chat/file-link-resolution", () => ({ resolveChatFileLink: mocks.resolve }));
-vi.mock("@/features/plugins/runtime/loader", () => ({
-  reportPluginCrash: mocks.crash, notePluginRenderOk: vi.fn(),
-}));
-vi.mock("@/lib/i18n", () => ({ default: { t: (key: string) => key } }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({
-  t: (key: string, options?: { app: string }) => key === "files.openInApp"
-    ? `Open in ${options?.app}` : key,
-}) }));
 
-import { FileLinkContextMenu } from "./FileLinkContextMenu";
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe("file-link menu plugin entries", () => {
-  const environment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
-  const previousActEnvironment = environment.IS_REACT_ACT_ENVIRONMENT;
-  beforeAll(() => { environment.IS_REACT_ACT_ENVIRONMENT = true; });
-  afterAll(() => { environment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment; });
+describe("FileLinkContextMenu open in browser", () => {
   let container: HTMLDivElement;
   let root: Root;
-  let disposers: (() => void)[];
-  const path = "C:/vault/Новая папка/Note & #1.md";
-  const workspacePath = "C:/vault";
-  const rows = () => [...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-  const row = (label: string) => rows().find(button => button.textContent === label)!;
-  const register = (def: Partial<sdk.FileLinkMenuItemDef> = {}) => {
-    const dispose = sdk.fileLinkMenuRegistry.register({
-      id: "plugin:obsidian-bridge:open", label: () => "Open in Obsidian", run: vi.fn(), ...def,
-    });
-    disposers.push(dispose);
-    return dispose;
+  const openInBrowser = vi.spyOn(ipc, "openInBrowser");
+  const listDir = vi.spyOn(ipc, "listDir");
+  const listFileIndex = vi.spyOn(ipc, "listFileIndex");
+  const noop = () => {};
+
+  const render = (menu: Omit<FileLinkMenuState, "x" | "y">) =>
+    act(() =>
+      root.render(<FileLinkContextMenu menu={{ x: 10, y: 10, ...menu }} onClose={noop} />),
+    );
+  const items = () =>
+    [...document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+  const labels = () => items().map((button) => button.textContent);
+  const clickItem = async (label: string) => {
+    const item = items().find((button) => button.textContent === label);
+    expect(item).toBeDefined();
+    await act(async () => item!.click());
   };
+
   beforeEach(() => {
-    vi.clearAllMocks();
-    localStorage.clear();
-    mocks.resolve.mockResolvedValue(path);
-    disposers = [];
+    platform.isWeb = false;
+    openInBrowser.mockReset().mockResolvedValue(undefined);
+    listDir.mockReset().mockResolvedValue([]);
+    listFileIndex.mockReset().mockResolvedValue([]);
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
   });
-  afterEach(async () => {
-    await act(async () => root.unmount());
-    disposers.forEach(dispose => dispose());
+
+  afterEach(() => {
+    act(() => root.unmount());
     container.remove();
-    vi.restoreAllMocks();
   });
-  async function render(resolvedPath: string | null = "C:/vault/Note & #1.md") {
-    await act(async () => root.render(<FileLinkContextMenu menu={{
-      x: 30, y: 30, path: "Note & #1.md", resolvedPath, workspacePath,
-    }} onClose={() => {}} />));
-  }
-  it("inserts ordered plugin rows between Open File and the selected editor", async () => {
-    register({ id: "plugin:z", label: () => "Second", order: 2 });
-    register({ id: "plugin:a", label: () => "First", order: 1 });
-    await render();
-    expect(rows().map(button => button.textContent).slice(0, 4)).toEqual([
-      "files.openFile", "First", "Second", "Open in VS Code",
+
+  it("offers it for an HTML link, right after 打开文件", () => {
+    render({
+      path: "/repo/docs/pr-flow-design.html",
+      resolvedPath: "/repo/docs/pr-flow-design.html",
+      workspacePath: "/repo",
+    });
+
+    const all = labels();
+    const index = all.indexOf("files.openInBrowser");
+    expect(index).toBe(all.indexOf("files.openFile") + 1);
+  });
+
+  it("opens the path resolved on disk, not the link text", async () => {
+    // Relative link whose file only exists nested below the workspace root:
+    // the sync candidate misses, the index fallback finds it.
+    listDir.mockRejectedValueOnce(new Error("missing"));
+    listFileIndex.mockResolvedValueOnce([
+      { rel: "nested/docs/pr-flow-design.html", isDir: false },
     ]);
+    render({
+      path: "docs/pr-flow-design.html",
+      resolvedPath: "/repo/docs/pr-flow-design.html",
+      workspacePath: "/repo",
+    });
+
+    await clickItem("files.openInBrowser");
+    await vi.waitFor(() =>
+      expect(openInBrowser).toHaveBeenCalledWith("/repo/nested/docs/pr-flow-design.html"),
+    );
   });
-  it("passes the clicked link's actual resolved path and workspace to run", async () => {
-    const run = vi.fn(); register({ run }); await render();
-    await act(async () => row("Open in Obsidian").click());
-    expect(run).toHaveBeenCalledWith({ path: "Note & #1.md", resolvedPath: path, workspacePath });
-    expect(mocks.openWorkspaceIn).not.toHaveBeenCalled();
+
+  it("omits it for other files and for web access", () => {
+    render({
+      path: "/repo/docs/notes.md",
+      resolvedPath: "/repo/docs/notes.md",
+      workspacePath: "/repo",
+    });
+    expect(labels()).not.toContain("files.openInBrowser");
+
+    platform.isWeb = true;
+    render({
+      path: "/repo/docs/pr-flow-design.html",
+      resolvedPath: "/repo/docs/pr-flow-design.html",
+      workspacePath: "/repo",
+    });
+    expect(labels()).not.toContain("files.openInBrowser");
   });
-  it("disables plugin rows for unresolvable paths", async () => {
-    const run = vi.fn(); register({ run }); await render(null);
-    expect(row("Open in Obsidian").disabled).toBe(true);
-    row("Open in Obsidian").click(); expect(run).not.toHaveBeenCalled();
-  });
-  it("does not dispatch when asynchronous resolution returns null", async () => {
-    mocks.resolve.mockResolvedValue(null);
-    const run = vi.fn(); register({ run }); await render();
-    await act(async () => row("Open in Obsidian").click());
-    expect(run).not.toHaveBeenCalled();
-  });
-  it("removes an unregistered contribution from an open menu", async () => {
-    const dispose = register(); await render();
-    await act(async () => dispose());
-    expect(row("Open in Obsidian")).toBeUndefined();
-    expect(row("Open in VS Code")).toBeDefined();
-  });
-  it("does not dispatch a contribution unloaded while its path resolves", async () => {
-    let resolve!: (path: string) => void;
-    mocks.resolve.mockImplementation(() => new Promise<string>(done => { resolve = done; }));
-    const run = vi.fn(); const dispose = register({ run }); await render();
-    await act(async () => row("Open in Obsidian").click());
-    await act(async () => { dispose(); resolve(path); });
-    expect(run).not.toHaveBeenCalled();
-  });
-  it("isolates throwing labels and visibility predicates from built-in entries", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    register({ label: () => { throw Error("label failed"); } });
-    register({ id: "plugin:broken", visible: () => { throw Error("visibility failed"); } });
-    await render();
-    expect(row("Open in VS Code")).toBeDefined();
-    expect(rows()).toHaveLength(4);
-  });
-  it("catches asynchronous plugin action failures", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    register({ run: async () => { throw Error("launch failed"); } }); await render();
-    await act(async () => row("Open in Obsidian").click());
-    expect(error).toHaveBeenCalled();
-  });
-  it("drops invalid labels and prevents one contribution mutating other targets", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    register({ id: "plugin:a", label: () => ({ invalid: true }) as unknown as string });
-    register({ id: "plugin:b", label: target => {
-      (target as { path: string }).path = "another-file.md";
-      return "Mutator";
-    } });
-    const label = vi.fn(() => "Valid");
-    register({ id: "plugin:c", label }); await render();
-    expect(rows().map(button => button.textContent).slice(0, 3)).toEqual([
-      "files.openFile", "Valid", "Open in VS Code",
-    ]);
-    expect(label).toHaveBeenCalledWith(expect.objectContaining({ path: "Note & #1.md" }));
-  });
-  it("isolates a crashing plugin icon", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    register({ icon: () => { throw Error("icon failed"); } }); await render();
-    expect(row("Open in VS Code")).toBeDefined();
-    expect(mocks.crash).toHaveBeenCalledWith("obsidian-bridge", expect.any(Error));
+
+  it("keeps it visible but disabled when the link does not resolve", () => {
+    render({ path: "~/docs/pr-flow-design.html", resolvedPath: null, workspacePath: "/repo" });
+
+    const entry = items().find((button) => button.textContent === "files.openInBrowser");
+    expect(entry?.disabled).toBe(true);
   });
 });

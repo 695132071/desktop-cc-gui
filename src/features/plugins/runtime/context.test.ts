@@ -33,6 +33,7 @@ import {
   dispatchRuntimeEvent,
 } from "./hooks";
 import { installHardening, runAsPlugin } from "./hardening";
+import { worktreeBadgeStore } from "./worktree-badges";
 // composer.setDraft 的 store 落点由 composer-draft.test.ts 单独覆盖；
 // 这里只验证权限门与委派，不拉入 chat store 依赖链。
 vi.mock("./composer-draft", () => ({ setActiveComposerDraft: vi.fn() }));
@@ -51,6 +52,7 @@ function fakeStorage(): PluginContextBackend & {
   bridgeInvoke: Mock;
   workspaceMetadata: Mock;
   pickDirectory: Mock;
+  pickFile: Mock;
   documentStorageGetLocation: Mock;
   documentStorageSelectLocation: Mock;
   documentStorageReadText: Mock;
@@ -67,6 +69,7 @@ function fakeStorage(): PluginContextBackend & {
     delete: async (id, key) => void data.delete(`${id}:${key}`),
     workspaceMetadata: vi.fn(async () => ({ id: "workspace-id", path: "C:/work" })),
     pickDirectory: vi.fn(async () => "C:/chosen"),
+    pickFile: vi.fn(async () => "C:/chosen/model.model3.json"),
     documentStorageGetLocation: vi.fn(async () => ({
       kind: "data" as const,
       displayPath: "C:/data/plugin-data/test-plugin",
@@ -131,6 +134,45 @@ describe("createPluginContext", () => {
     backend.pickDirectory.mockResolvedValueOnce(null);
     await expect(ctx.assets.grantDirectory()).rejects.toThrow(/cancel/i);
     expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+  });
+
+  it("denies file selection before opening the picker without directory permission", async () => {
+    const backend = fakeStorage();
+    const { ctx } = createPluginContext(manifest([]), backend, { appVersion: "1.0.0" });
+    await expect(ctx.assets.grantFile()).rejects.toThrow(/assets:directory/);
+    expect(backend.pickFile).not.toHaveBeenCalled();
+    expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+  });
+
+  it("returns null without granting access when file selection is cancelled", async () => {
+    const backend = fakeStorage();
+    backend.pickFile.mockResolvedValueOnce(null);
+    const { ctx } = createPluginContext(manifest(["assets:directory"]), backend, {
+      appVersion: "1.0.0",
+    });
+    await expect(ctx.assets.grantFile()).resolves.toBeNull();
+    expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects the native file picker error without attempting a grant", async () => {
+    const backend = fakeStorage();
+    const error = new Error("native file picker unavailable");
+    backend.pickFile.mockRejectedValueOnce(error);
+    const { ctx } = createPluginContext(manifest(["assets:directory"]), backend, {
+      appVersion: "1.0.0",
+    });
+    await expect(ctx.assets.grantFile()).rejects.toBe(error);
+    expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a failed parent-directory grant instead of reporting file selection success", async () => {
+    const backend = fakeStorage();
+    const error = new Error("selected parent directory is denied");
+    backend.bridgeInvoke.mockRejectedValueOnce(error);
+    const { ctx } = createPluginContext(manifest(["assets:directory"]), backend, {
+      appVersion: "1.0.0",
+    });
+    await expect(ctx.assets.grantFile()).rejects.toBe(error);
   });
 
   it("requires read permission for turn-start observers without granting prompt writes", () => {
@@ -1027,6 +1069,133 @@ describe("createPluginContext", () => {
   });
 });
 
+describe("ctx.ui.registerWorktreeBadges", () => {
+  const worktreeRows = [
+    {
+      id: "w1",
+      path: "/Users/me/proj",
+      name: "proj",
+      lastOpenedAt: 17,
+      sortOrder: null,
+      groupId: null,
+    },
+    {
+      id: "w2",
+      path: "/Users/me/proj-worktrees/pr-1",
+      name: "pr-1",
+      lastOpenedAt: null,
+      sortOrder: null,
+      groupId: null,
+      kind: "worktree" as const,
+      parentId: "w1",
+      meta: { worktree: { branch: "pr-1", prNumber: 12 }, secret: "must-not-leak" },
+    },
+  ];
+
+  beforeEach(() => worktreeBadgeStore.reset());
+
+  it("requires ui:worktree-badge", () => {
+    const { ctx } = createPluginContext(manifest(["host:workspace"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    expect(() => ctx.ui.registerWorktreeBadges({})).toThrow(/ui:worktree-badge/);
+  });
+
+  it("allows set/clear with only ui:worktree-badge but gates list/onChange on host:workspace", () => {
+    const { ctx } = createPluginContext(manifest(["ui:worktree-badge"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    try {
+      expect(() => handle.list()).toThrow(/host:workspace/);
+      expect(() => handle.onChange(() => {})).toThrow(/host:workspace/);
+
+      handle.set("w2", { label: "  TASK  ", tone: "cyan", tooltip: "task #12" });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]?.map((badge) => badge.label)).toEqual([
+        "TASK",
+      ]);
+      handle.clear();
+      expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  it("normalises bad tones and drops empty labels instead of rendering garbage", () => {
+    const { ctx } = createPluginContext(manifest(["ui:worktree-badge"]), fakeStorage(), {
+      appVersion: "1",
+    });
+    const handle = ctx.ui.registerWorktreeBadges({});
+    try {
+      expect(() => handle.set("  ", { label: "x", tone: "blue" })).toThrow(/workspace id/);
+      handle.set("w2", { label: "x", tone: "magenta" as never });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]?.[0]?.tone).toBe("neutral");
+      handle.set("w2", { label: "   ", tone: "blue" });
+      expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    } finally {
+      handle.dispose();
+    }
+  });
+
+  it("clears this plugin's badges on dispose and rejects later writes", () => {
+    const { ctx, disposers } = createPluginContext(
+      manifest(["ui:worktree-badge"]),
+      fakeStorage(),
+      { appVersion: "1" },
+    );
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    handle.set("w2", { label: "A", tone: "blue" });
+    expect(disposers.length).toBeGreaterThan(0);
+    handle.dispose();
+    expect(worktreeBadgeStore.getSnapshot()["w2"]).toBeUndefined();
+    expect(() => handle.set("w2", { label: "B", tone: "blue" })).toThrow(/dispose/);
+  });
+
+  it("lists worktree rows and only notifies onChange on relevant changes", async () => {
+    const { useChatStore } = await import("@/features/chat/store");
+    const previous = useChatStore.getState().workspaces;
+    useChatStore.setState({ workspaces: worktreeRows });
+    const { ctx } = createPluginContext(
+      manifest(["ui:worktree-badge", "host:workspace"]),
+      fakeStorage(),
+      { appVersion: "1" },
+    );
+    const handle = ctx.ui.registerWorktreeBadges({ key: "tasks" });
+    try {
+      expect(handle.list()).toEqual([
+        {
+          workspaceId: "w2",
+          parentWorkspaceId: "w1",
+          path: "/Users/me/proj-worktrees/pr-1",
+          branch: "pr-1",
+          prNumber: 12,
+        },
+      ]);
+
+      const onChange = vi.fn();
+      handle.onChange(onChange);
+
+      // 改名 / 排序 / 普通工作区变化都不该唤醒插件。
+      useChatStore.setState({
+        workspaces: [{ ...worktreeRows[0]!, name: "renamed" }, worktreeRows[1]!],
+      });
+      expect(onChange).not.toHaveBeenCalled();
+
+      useChatStore.setState({
+        workspaces: [
+          worktreeRows[0]!,
+          { ...worktreeRows[1]!, meta: { worktree: { branch: "pr-1", prNumber: 13 } } },
+        ],
+      });
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange.mock.calls[0]![0][0].prNumber).toBe(13);
+    } finally {
+      handle.dispose();
+      useChatStore.setState({ workspaces: previous });
+    }
+  });
+});
+
 describe("permissioned SDK calls from guarded plugin callbacks", () => {
   const originalInternals = window.__TAURI_INTERNALS__;
   const nativeInvoke = vi.fn(async (_cmd: string, _args?: unknown): Promise<unknown> => null);
@@ -1057,6 +1226,7 @@ describe("permissioned SDK calls from guarded plugin callbacks", () => {
           pluginId, relativePath, content, expectedVersion,
         }),
       pickDirectory: () => tauriInvoke("plugin:dialog|open"),
+      pickFile: () => tauriInvoke("plugin:dialog|open"),
       documentStorageSelectLocation: (pluginId, kind, customPath) =>
         tauriInvoke("plugin_document_storage_select_location", { pluginId, kind, customPath }),
       bridgeInvoke: (command, args) => tauriInvoke(command, args),
@@ -1101,6 +1271,78 @@ describe("permissioned SDK calls from guarded plugin callbacks", () => {
     }
   });
 
+  it("runs worktree badge onClick and onChange as plugin code", async () => {
+    const { useChatStore } = await import("@/features/chat/store");
+    const previous = useChatStore.getState().workspaces;
+    useChatStore.setState({
+      workspaces: [
+        {
+          id: "w2",
+          path: "/repo-wt/pr-1",
+          name: "pr-1",
+          lastOpenedAt: null,
+          sortOrder: null,
+          groupId: null,
+          kind: "worktree",
+          parentId: "w1",
+          meta: { worktree: { branch: "pr-1" } },
+        },
+      ],
+    });
+    worktreeBadgeStore.reset();
+    const { ctx } = createPluginContext(
+      manifest(["ui:worktree-badge", "host:workspace"]),
+      ipcStorage(),
+      { appVersion: "1.0.0" },
+    );
+    const clicks: string[] = [];
+    const changes: number[] = [];
+    const blocked: Promise<unknown>[] = [];
+    const handle = ctx.ui.registerWorktreeBadges({
+      key: "tasks",
+      onClick: (target) => {
+        clicks.push(target.workspaceId);
+        blocked.push(tauriInvoke("plugin_storage_get", { id: ctx.pluginId, key: "x" }));
+      },
+    });
+    try {
+      handle.set("w2", { label: "T", tone: "blue" });
+      handle.onChange((targets) => {
+        changes.push(targets.length);
+        blocked.push(tauriInvoke("plugin_storage_get", { id: ctx.pluginId, key: "y" }));
+      });
+
+      // Clicking is a host render path, not a plugin callback: the badge's
+      // own onClick must raise the plugin flag itself.
+      worktreeBadgeStore.getSnapshot()["w2"]![0]!.onClick!();
+      expect(clicks).toEqual(["w2"]);
+
+      useChatStore.setState({
+        workspaces: [
+          {
+            id: "w2",
+            path: "/repo-wt/pr-1",
+            name: "pr-1",
+            lastOpenedAt: null,
+            sortOrder: null,
+            groupId: null,
+            kind: "worktree",
+            parentId: "w1",
+            meta: { worktree: { branch: "pr-1", prNumber: 5 } },
+          },
+        ],
+      });
+      expect(changes).toEqual([1]);
+
+      for (const request of blocked) await expect(request).rejects.toThrow(/blocked/);
+      expect(blocked).toHaveLength(2);
+    } finally {
+      handle.dispose();
+      useChatStore.setState({ workspaces: previous });
+      worktreeBadgeStore.reset();
+    }
+  });
+
   it("allows document, chooser, metadata and granted bridge operations during activation", async () => {
     nativeInvoke.mockImplementation(async (cmd) => {
       if (cmd === "workspace_metadata") return { id: "work", path: "C:/work" };
@@ -1132,6 +1374,55 @@ describe("permissioned SDK calls from guarded plugin callbacks", () => {
       { kind: "custom", path: "C:/chosen/plugin-data/test-plugin" },
       { code: 0, stdout: "ready", stderr: "" },
     ]);
+  });
+
+  it("authorizes file selection and its parent grant without leaking IPC access to plugin code", async () => {
+    const grantedDirectories = new Set<string>();
+    const blocked: Promise<unknown>[] = [];
+    nativeInvoke.mockImplementation(async (cmd, args) => {
+      if (cmd === "plugin:dialog|open") {
+        blocked.push(runAsPlugin(() => tauriInvoke("plugin_asset_grant_file", {
+          pluginId: "another-plugin", path: "C:/private/secret.txt",
+        })));
+        return "C:/models/model.model3.json";
+      }
+      if (cmd === "plugin_asset_grant_file") {
+        const input = args as { pluginId: string; path: string };
+        if (input.pluginId !== "test-plugin" || input.path !== "C:/models/model.model3.json") {
+          throw new Error("file grant does not belong to the selecting plugin");
+        }
+        blocked.push(runAsPlugin(() => tauriInvoke("plugin_asset_revoke_directory", {
+          pluginId: "another-plugin", grantId: "other",
+        })));
+        grantedDirectories.add("C:/models");
+        return { grantId: "model-parent", path: "C:/models", relativePath: "model.model3.json" };
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    });
+    const { ctx } = createPluginContext(manifest(["assets:directory"]), ipcStorage(), {
+      appVersion: "1.0.0",
+    });
+    const selection = runAsPlugin(() => {
+      const selected = ctx.assets.grantFile({
+        get title() {
+          blocked.push(tauriInvoke("plugin_asset_revoke_directory", { grantId: "other" }));
+          return "Choose a model and allow this plugin to read its parent directory";
+        },
+        get filters() {
+          blocked.push(tauriInvoke("plugin_asset_grant_file", { path: "C:/private/secret.txt" }));
+          return [];
+        },
+      });
+      blocked.push(tauriInvoke("plugin_asset_grant_file", { path: "C:/private/secret.txt" }));
+      return selected;
+    });
+    const grant = await selection;
+    expect(grant).not.toBeNull();
+    expect(grantedDirectories).toEqual(new Set(["C:/models"]));
+    expect(new URL(ctx.assets.directoryUrl(grant!.grantId, grant!.relativePath), window.location.origin).pathname)
+      .toContain("/test-plugin/dir/model-parent/model.model3.json");
+    for (const attempt of blocked) await expect(attempt).rejects.toThrow(/blocked/);
+    expect(blocked).toHaveLength(5);
   });
 
   it("does not authorize undeclared SDK permissions or unknown bridge commands", async () => {

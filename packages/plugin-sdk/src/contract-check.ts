@@ -2,6 +2,8 @@ import type * as Pub from "../plugin";
 import type {
   AfterTurnEvent,
   AssetDirectoryGrant,
+  AssetFileGrant,
+  AssetFilePickerOptions,
   AssistantCompletedEvent,
   BeforeTurnEvent,
   BeforeTurnResult,
@@ -58,6 +60,10 @@ import type {
   WorkspaceMenuLabelValue,
   WorkspaceMenuStatusTone,
   WorkspaceMetadata,
+  WorktreeBadge,
+  WorktreeBadgeHandle,
+  WorktreeBadgeTarget,
+  WorktreeBadgeTone,
 } from "./index";
 
 /**
@@ -146,7 +152,13 @@ export type _DocumentReadResult = Assert<Mutual<DocumentReadResult, Pub.Document
 export type _DocumentWriteResult = Assert<Mutual<DocumentWriteResult, Pub.DocumentWriteResult>>;
 export type _DocumentStorage = Assert<Mutual<DocumentStorage, Pub.DocumentStorage>>;
 export type _AssetDirectoryGrant = Assert<Mutual<AssetDirectoryGrant, Pub.AssetDirectoryGrant>>;
+export type _AssetFileGrant = Assert<Mutual<AssetFileGrant, Pub.AssetFileGrant>>;
+export type _AssetFilePickerOptions = Assert<Mutual<AssetFilePickerOptions, Pub.AssetFilePickerOptions>>;
 export type _PluginAssets = Assert<Mutual<PluginAssets, Pub.PluginAssets>>;
+export type _WorktreeBadgeTone = Assert<Mutual<WorktreeBadgeTone, Pub.WorktreeBadgeTone>>;
+export type _WorktreeBadgeTarget = Assert<Mutual<WorktreeBadgeTarget, Pub.WorktreeBadgeTarget>>;
+export type _WorktreeBadge = Assert<Mutual<WorktreeBadge, Pub.WorktreeBadge>>;
+export type _WorktreeBadgeHandle = Assert<Mutual<WorktreeBadgeHandle, Pub.WorktreeBadgeHandle>>;
 
 // --- 可选成员漂移 -----------------------------------------------------------
 // Mutual 的双向可赋值对「一侧新增**可选**字段/可选参数」不敏感（可选属性
@@ -161,12 +173,37 @@ export type _TurnHooksKeys = Assert<KeyParity<TurnHooks, Pub.TurnHooks>>;
 export type _InternalMessageCaptureKeys = Assert<
   KeyParity<InternalMessageCapture, Pub.InternalMessageCapture>
 >;
+export type _AssetFileGrantKeys = Assert<KeyParity<AssetFileGrant, Pub.AssetFileGrant>>;
+export type _AssetFilePickerOptionsKeys = Assert<KeyParity<AssetFilePickerOptions, Pub.AssetFilePickerOptions>>;
+export type _PluginAssetsGrantFileParams = Assert<
+  Mutual<Params<PluginAssets["grantFile"]>, Params<Pub.PluginAssets["grantFile"]>>
+>;
 export type _DocumentStorageRemoveParams = Assert<
   Mutual<Params<DocumentStorage["remove"]>, Params<Pub.DocumentStorage["remove"]>>
 >;
 export type _ConversationProps = Assert<Mutual<PluginConversationProps, Pub.PluginConversationProps>>;
 export type _AgentCatalogEntry = Assert<Mutual<PluginAgentCatalogEntry, Pub.PluginAgentCatalogEntry>>;
 export type _AgentShape = Assert<Mutual<PluginContext["agent"], Pub.PluginContext["agent"]>>;
+
+/** 单成员类型：ui 组含组件类型，整组不能双向赋值，但注册 def 里的可选
+ *  回调/字段必须逐字一致（0.3.22 的 sidebar badge、worktree badge def）。 */
+type MemberType<F, K extends string> = F extends (def: infer D) => unknown
+  ? K extends keyof D
+    ? D[K]
+    : never
+  : never;
+export type _SidebarNavBadge = Assert<
+  Mutual<
+    MemberType<PluginContext["ui"]["registerSidebarNav"], "badge">,
+    MemberType<Pub.PluginContext["ui"]["registerSidebarNav"], "badge">
+  >
+>;
+export type _RegisterWorktreeBadgesParams = Assert<
+  Mutual<
+    Params<PluginContext["ui"]["registerWorktreeBadges"]>,
+    Params<Pub.PluginContext["ui"]["registerWorktreeBadges"]>
+  >
+>;
 
 // --- PluginContext：顶层与各能力组 key 完全对齐 ------------------------------
 

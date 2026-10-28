@@ -7,6 +7,24 @@
 - Throwing labels/visibility predicates, rejected actions and crashing icons are isolated. An entry unloaded or replaced during asynchronous path resolution is not dispatched.
 - 0.3.21 is already proposed separately in upstream PR #1421; 0.3.22 avoids reusing that contract version.
 
+## 0.3.22 — 2026-10-26
+
+- 新增权限 `ui:worktree-badge` 与 `ctx.ui.registerWorktreeBadges(def)`：把一块标签推到侧栏「WORKTREES」子行上，返回 `WorktreeBadgeHandle`。
+  - `set(workspaceId, badge | null)` / `clear()` 只需 `ui:worktree-badge`；`list()` / `onChange(cb)` 额外需要 `host:workspace`，缺失时抛可读错误（`requires "host:workspace"`）。
+  - `list()` 返回 `WorktreeBadgeTarget[]`（`workspaceId` / `parentWorkspaceId` / `path` / `branch` / `prNumber`）；`onChange` 只在 worktree 子行增删或 `branch` / `prNumber` / `path` 变化时回调，回调与 `onClick` 都在插件上下文中执行。`onClick` 的 target 不受 `host:workspace` 门禁（只有 `list` / `onChange` 需要它）。
+  - 渲染契约：每行最多 2 个徽标（按 `order`，再按注册先后）；`tone` 取 `"neutral" | "blue" | "cyan" | "green" | "lime" | "yellow" | "rose" | "purple"`，其余按 `neutral`；`label` 去空白后按码点截到 6，空 label 视为不显示；`tooltip` 为纯文本、截到 300；可点徽标不触发行展开。插件抛错只影响自己的徽标。
+  - 卸载（或 `handle.dispose()`）清掉该插件的徽标与订阅；宿主快照不可变，插件改返回值动不到宿主。
+- `ctx.ui.registerSidebarNav(def)` 新增可选 `badge?: () => string | number | null`：内建侧栏导航项的尾部计数 pill，每次渲染求值，抛错按「无徽标」处理；同一 `key` 重新注册即刷新（Registry upsert）。
+- `contract-check.ts` 补齐 `WorktreeBadge` / `WorktreeBadgeHandle` / `WorktreeBadgeTarget` / `WorktreeBadgeTone` 的双向断言，以及 `registerWorktreeBadges` 参数元组与 `registerSidebarNav.badge` 的漂移守卫。
+- `ctx.worktrees.create` 的失败分类新增 `repo_open_failed`：仓库存在但打不开（如 libgit2 属主校验拒绝）不再报成 `not_a_repo`，detail 以 `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。按 `not_a_repo` 判断「不是仓库」的插件无需改动，这类失败此前被误归到该类。
+
+## 0.3.21 — 2026-10-22
+
+- 新增 `ctx.assets.grantFile(options?)`、`AssetFileGrant` 与 `AssetFilePickerOptions`：用户选择一个文件后授权其父目录，返回目录 grant、规范父目录与文件名相对路径；沿用 `assets:directory` 权限及目录去重、上限、撤销和逐次读取复核。
+- 文件选择取消返回 `null`，不调用授权；原生选择或路径校验失败保持 rejection。桌面复用宿主文件选择器，Web 输入的是宿主绝对文件路径，不上传浏览器文件。
+- 文件授权在探测前核验插件状态和权限，拒绝非普通文件、敏感父目录及符号链接 / reparse 路径；公共镜像与可选参数漂移守卫同步。
+- 插件作者参考展开命名能力接口及其关联类型；声明代码统一为 LF，避免 Windows CRLF 源码检出触发派生文档漂移。
+
 ## 0.3.20 — 2026-10-06（共通兼容线：CCB + Live2D 通用能力，叠加上游 0.3.16–0.3.19）
 
 本条目把两批来源能力收敛为一份自洽的公共契约：CCB 通用层（截至 0.4.2 的会话/回合/切换 hooks、标准化运行时事件、内部提示贡献与 CAS 文档存储）与 Live2D 通用层（0.4.3 的常驻悬浮层、同源资源路由与目录授权）。两批能力叠加上游已发布的 `0.3.16`–`0.3.19`（`ctx.workspaces.list` / `worktrees.create|remove` / `ctx.window` / `ctx.models` / `sessions.startRun`）合并发布为 `0.3.20`：`0.3.17`–`0.3.19` 已被上游占用，本线不再复用；下方 0.4.0–0.4.3 条目是来源演进记录，不是本分支的版本号。CCB 与 Live2D 插件应以 `sdkVersion: ">=0.3.20"` 声明最低版本——`0.3.17`–`0.3.19` 的宿主没有这些能力，声明过低会让握手放行不存在的 API；允许更高版本宿主通过，不要求与宿主精确同版。
