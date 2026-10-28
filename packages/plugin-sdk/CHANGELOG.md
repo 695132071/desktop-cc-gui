@@ -1,10 +1,12 @@
 # @ccgui/plugin-sdk changelog
 
-## 0.3.21 — 2026-10-22
+## 0.3.24 — 2026-10-28
 
-- `session://activated` 的 payload 增加 `provider` 与 `model`：`provider` 是会话实际使用的渠道 id，引擎使用自身配置（如 pi 的 `auth.json`）时为 `null`——宿主哨兵 `__local_settings_json__` 不会外泄；`model` 是选择器（如 `deepseek/deepseek-flash`），CLI 默认时为 `null`。纯增量字段，旧插件忽略即可。
-- 新增 `session://selection-changed`（权限 `events`）：已激活会话切换渠道或模型时发出，payload 与 `session://activated` 相同。`session://activated` 的保留值同步更新，迟加载插件重放到的仍是当前选择。
+- `session://activated` 的 payload 增加 `provider` 与 `model`：`provider` 是会话实际使用的渠道 id，引擎使用自身配置（如 pi 的 `auth.json`）时为 `null`——宿主哨兵 `__local_settings_json__` 不会外泄；`model` 是输入框显示的模型（picker 选择器如 `deepseek/deepseek-flash`，或引擎回报的实际模型），CLI 默认且无记录时为 `null`。纯增量字段，旧插件忽略即可。
+- 新增 `session://selection-changed`（权限 `events`）：当前会话的 `provider` / `model` 变化时发出，payload 与 `session://activated` 相同。输入框选择、设置页改默认渠道、历史加载出会话模型、其他窗口修改与引擎回报实际模型都会触发；同值不重发，切换会话只发 `session://activated`。`session://activated` 的保留值同步更新，迟加载插件重放到的仍是当前选择。
+- 「点新对话」与「新对话拿到正式会话 id」现在也发 `session://activated`，此前插件会一直以为上一个会话仍是活动的；同一次认领只发一次。
 - 余额 / 额度、模型切换与用量统计类插件可据此确定当前供应商与模型选择，不再需要读各引擎的本地配置文件猜测。
+- 依赖这些字段的插件声明 `sdkVersion: ">=0.3.24"`。0.3.21–0.3.23 已被其他能力占用（`assets.grantFile`、worktree 徽标、文件链接菜单），那些宿主不带 `provider` / `model`。
 
 ## 0.3.23 — 2026-10-28
 

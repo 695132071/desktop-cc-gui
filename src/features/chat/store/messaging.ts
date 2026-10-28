@@ -485,6 +485,14 @@ export function createMessagingActions(
             ?.catch(() => {});
         }
         settleOrphanedRuns(set, routeRun(result.runId, newKey));
+        // Whether this set is the one that hands the active tab its native
+        // id: when the session event beat this response, onSession already
+        // adopted it and announced the activation.
+        const before = get().active;
+        const activeWasPending =
+          before?.engine === engine &&
+          before.sessionId === null &&
+          before.workspacePath === tab.workspacePath;
         set((s) => {
           const bySession = { ...s.bySession };
           if (bySession[key]) {
@@ -542,6 +550,7 @@ export function createMessagingActions(
         // Re-emit with the current selection.
         const adoptedActive = get().active;
         if (
+          activeWasPending &&
           adoptedActive?.engine === engine &&
           adoptedActive.sessionId === result.sessionId &&
           adoptedActive.workspacePath === tab.workspacePath

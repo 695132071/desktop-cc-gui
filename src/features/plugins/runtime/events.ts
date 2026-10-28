@@ -19,15 +19,17 @@ export const USAGE_UPDATED_TOPIC = "usage://updated";
  *  others. */
 export const USAGE_DONE_TOPIC = "usage://done";
 
-/** Active-session switches (SDK 0.3.8, selection since 0.3.21):
+/** Active-session switches (SDK 0.3.8, selection since 0.3.24):
  *  `{ engine, sessionId, provider, model }`; a pending tab reports sessionId
  *  null, clearing all tabs reports everything null. `provider` is the channel
  *  id the session runs with, or null when the engine uses its own settings;
- *  `model` is the picker's selector (e.g. `deepseek/deepseek-flash`), or null
- *  for the CLI default. */
+ *  `model` is what the composer shows — the picker's selector (e.g.
+ *  `deepseek/deepseek-flash`) or the model the engine reported — or null for
+ *  the CLI default. */
 export const SESSION_ACTIVATED_TOPIC = "session://activated";
 
-/** Provider/model changed for the session that is already active (SDK 0.3.21).
+/** Provider/model changed for the session that is already active (SDK 0.3.24),
+ *  through any path — see watchSessionSelection in chat/store/selection.ts.
  *  Same payload as `session://activated`, so consumers can merge both: the
  *  activation event is the baseline, this one keeps it current. */
 export const SESSION_SELECTION_CHANGED_TOPIC = "session://selection-changed";

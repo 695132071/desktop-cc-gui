@@ -7,8 +7,6 @@ import {
   type ActiveSession,
 } from "./persistence";
 import { patchSession } from "./stream";
-import { emitSessionSelectionChanged } from "@/features/plugins/runtime/events";
-import { sessionSelection } from "./selection";
 import { notifyCliConfigChanged } from "@/features/settings/providers";
 import { persistSettings } from "./settings-persist";
 import type { ChatStore } from "./types";
@@ -97,14 +95,6 @@ export function createPreferenceActions(
         // back to its own history/model default again.
         stampActiveTab({ model: model || undefined });
       }
-      const current = get().active;
-      if (current?.engine === engine) {
-        emitSessionSelectionChanged(
-          engine,
-          current.sessionId,
-          sessionSelection(get(), engine, current.sessionId, current.workspacePath),
-        );
-      }
     },
     setProvider: async (engine, providerId) => {
       const active = get().active;
@@ -123,14 +113,6 @@ export function createPreferenceActions(
           notifyCliConfigChanged();
         }
         set({ actionError: null });
-        const current = get().active;
-        if (current?.engine === engine) {
-          emitSessionSelectionChanged(
-            engine,
-            current.sessionId,
-            sessionSelection(get(), engine, current.sessionId, current.workspacePath),
-          );
-        }
       } catch (error) {
         // Migration conflicts and failed writes must not leave a checkmark
         // on a channel the backend never accepted.

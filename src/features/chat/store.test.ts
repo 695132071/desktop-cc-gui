@@ -4,6 +4,7 @@ import {
   pluginBus,
   resetPluginBusForTests,
   SESSION_ACTIVATED_TOPIC,
+  SESSION_SELECTION_CHANGED_TOPIC,
 } from "@/features/plugins/runtime/events";
 import { setPluginSessionEffort, useChatStore } from "./store";
 import { OPEN_TABS_KEY } from "./store/persistence";
@@ -32,6 +33,7 @@ vi.mock("@/lib/ipc", () => ({
     getAppSettings: vi.fn(async () => ({})),
     updateAppSettings: vi.fn(async () => {}),
     rescanSessions: vi.fn(async () => {}),
+    getCliConfig: vi.fn(async () => null),
   },
 }));
 vi.mock("@/lib/events", () => ({
@@ -55,6 +57,7 @@ function resetStore() {
     active: null,
     activeEngine: "claude",
     models: { omp: "kimi-k3" },
+    providers: {},
     efforts: {},
     archivedSessionKeys: {},
     bySession: {},
@@ -1072,5 +1075,196 @@ describe("session://activated emissions", () => {
         model: "claude-default-x",
       },
     ]);
+  });
+});
+
+describe("session://selection-changed emissions", () => {
+  beforeEach(resetStore);
+
+  function watch(topic: string) {
+    const seen: unknown[] = [];
+    const dispose = pluginBus.on(topic, (data) => seen.push(data));
+    return { seen, dispose };
+  }
+
+  function retained() {
+    const replay: unknown[] = [];
+    pluginBus.on(SESSION_ACTIVATED_TOPIC, (data) => replay.push(data))();
+    return replay;
+  }
+
+  it("announces the adoption once when the session event beats the send response", async () => {
+    useChatStore.setState({ activeEngine: "omp", sessions: [] });
+    useChatStore.getState().startNewChat(WS);
+    const activated = watch(SESSION_ACTIVATED_TOPIC);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      vi.mocked(ipc.sendMessage).mockImplementationOnce(async () => {
+        handleEngineEvents(
+          [
+            {
+              runId: "run-race",
+              sessionId: null,
+              engine: "omp",
+              seq: 1,
+              kind: "session",
+              data: "s-7",
+            },
+          ],
+          engineDeps(),
+        );
+        return { runId: "run-race", sessionId: "s-7" };
+      });
+
+      await useChatStore.getState().send("hi", []);
+
+      expect(useChatStore.getState().active?.sessionId).toBe("s-7");
+      expect(
+        activated.seen.filter(
+          (p) => (p as { sessionId: unknown }).sessionId === "s-7",
+        ),
+      ).toEqual([
+        { engine: "omp", sessionId: "s-7", provider: null, model: "kimi-k3" },
+      ]);
+      // Adopting the native id is an activation, not a selection change.
+      expect(changed.seen).toEqual([]);
+    } finally {
+      activated.dispose();
+      changed.dispose();
+    }
+  });
+
+  it("does not read the adoption's half-applied tab strip as a model change", async () => {
+    useChatStore.setState({ activeEngine: "omp", sessions: [] });
+    useChatStore.getState().startNewChat(WS);
+    await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({
+      runId: "run-reported",
+      sessionId: null,
+    });
+    await useChatStore.getState().send("hi", []);
+    const activated = watch(SESSION_ACTIVATED_TOPIC);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      // The engine names the concrete model before the session id: the
+      // tab's pick still wins on the composer, so nothing changed for plugins.
+      handleEngineEvents(
+        [
+          { runId: "run-reported", sessionId: null, engine: "omp", seq: 1, kind: "model", data: "glm-5" },
+          { runId: "run-reported", sessionId: null, engine: "omp", seq: 2, kind: "session", data: "s-9" },
+        ],
+        engineDeps(),
+      );
+
+      expect(useChatStore.getState().active?.sessionId).toBe("s-9");
+      expect(changed.seen).toEqual([]);
+      expect(activated.seen.at(-1)).toEqual({
+        engine: "omp",
+        sessionId: "s-9",
+        provider: null,
+        model: "fufei/kimi-k3",
+      });
+    } finally {
+      activated.dispose();
+      changed.dispose();
+    }
+  });
+
+  it("follows a default-channel edit made outside the picker (Settings)", async () => {
+    useChatStore.setState({ activeEngine: "omp", providers: { omp: "chan-a" } });
+    useChatStore.getState().startNewChat(WS);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      vi.mocked(ipc.getCliConfig).mockResolvedValueOnce({
+        omp: { current: "chan-b", providers: [] },
+      } as never);
+
+      await useChatStore.getState().refreshEngines();
+
+      expect(changed.seen).toEqual([
+        { engine: "omp", sessionId: null, provider: "chan-b", model: "kimi-k3" },
+      ]);
+      expect(retained()).toEqual([
+        { engine: "omp", sessionId: null, provider: "chan-b", model: "kimi-k3" },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("publishes the model the loaded history reveals", async () => {
+    useChatStore.setState({
+      activeEngine: "omp",
+      sessions: [
+        {
+          engine: "omp",
+          sessionId: "s-old",
+          workspacePath: WS,
+          title: "old",
+          updatedAt: 0,
+        } as SessionMeta,
+      ],
+    });
+    vi.mocked(ipc.loadSessionPage).mockResolvedValueOnce({
+      messages: [
+        { role: "user", text: "q", ts: "2026-01-01T00:00:00Z" },
+        {
+          role: "assistant",
+          text: "a",
+          ts: "2026-01-01T00:00:01Z",
+          model: "glm-5",
+        },
+      ],
+      nextBefore: null,
+      subagentHistory: [],
+    } as never);
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      await useChatStore.getState().selectSession("omp", "s-old", WS);
+
+      expect(changed.seen).toEqual([
+        { engine: "omp", sessionId: "s-old", provider: null, model: "glm-5" },
+      ]);
+      expect(retained()).toEqual([
+        { engine: "omp", sessionId: "s-old", provider: null, model: "glm-5" },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("emits a picker change exactly once", async () => {
+    const tab = { engine: "omp", sessionId: "s-1", workspacePath: WS };
+    useChatStore.setState({ activeEngine: "omp", active: tab, openTabs: [tab] });
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      await useChatStore.getState().setModel("omp", "fufei/kimi-k3");
+
+      expect(changed.seen).toEqual([
+        {
+          engine: "omp",
+          sessionId: "s-1",
+          provider: null,
+          model: "fufei/kimi-k3",
+        },
+      ]);
+    } finally {
+      changed.dispose();
+    }
+  });
+
+  it("leaves tab switches to session://activated", async () => {
+    const a = { engine: "omp", sessionId: "s-1", workspacePath: WS, model: "m-a" };
+    const b = { engine: "omp", sessionId: "s-2", workspacePath: WS, model: "m-b" };
+    useChatStore.setState({ activeEngine: "omp", active: a, openTabs: [a, b] });
+    const changed = watch(SESSION_SELECTION_CHANGED_TOPIC);
+    try {
+      useChatStore.getState().focusTab("omp", "s-2", WS);
+      useChatStore.getState().startNewChat(WS);
+
+      expect(changed.seen).toEqual([]);
+    } finally {
+      changed.dispose();
+    }
   });
 });
