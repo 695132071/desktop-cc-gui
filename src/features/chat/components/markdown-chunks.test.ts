@@ -106,6 +106,63 @@ describe("splitMarkdown", () => {
     }
   });
 
+  it("cuts an over-long list only before a top-level item so nested content keeps its nesting", () => {
+    const items = Array.from({ length: 40 }, (_, i) =>
+      [`${i + 1}. 第${i + 1}项 ${"字".repeat(60)}`, `    - 子要点 ${"字".repeat(30)}`].join("\n\n"),
+    );
+    const text = [para("前言", 20), ...items, para("结尾", 20)].join("\n\n");
+    const chunks = splitMarkdown(text, 600);
+
+    expect(chunks.length).toBeGreaterThan(2);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(text);
+    for (const chunk of chunks.slice(1)) {
+      // A chunk opening with 4 spaces would turn the nested bullet into an
+      // indented code block and drop the rest of that chunk out of the list.
+      expect(chunk.text).toMatch(/^\S/);
+    }
+    const whole = renderMarkdown(text);
+    const split = renderChunks(chunks);
+    expect(countElements(split, "pre")).toBe(countElements(whole, "pre"));
+    expect(countElements(split, "ul")).toBe(countElements(whole, "ul"));
+    expect(countElements(split, "li")).toBe(countElements(whole, "li"));
+  });
+
+  it("does not take a backtick line whose info string has a backtick for a fence", () => {
+    const text = [
+      para("前言", 300),
+      "",
+      "```js` 只是行内提到的围栏写法",
+      "",
+      para("说明", 300),
+      "",
+      "```",
+      `const a = "${"x".repeat(300)}";`,
+      "",
+      `const b = "${"y".repeat(300)}";`,
+      "```",
+      "",
+      para("结尾", 300),
+    ].join("\n");
+    const chunks = splitMarkdown(text, 250);
+
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(text);
+    const code = chunks.find((chunk) => chunk.text.includes("const a"));
+    expect(code?.text).toContain("const b");
+    expect(countElements(renderChunks(chunks), "pre")).toBe(1);
+  });
+
+  it("ignores display-math dollars quoted inside inline code", () => {
+    const blocks = [
+      "公式块用 `$$` 包起来",
+      ...Array.from({ length: 12 }, (_, i) => para(`第${i}段`)),
+    ];
+    const text = blocks.join("\n\n");
+    const chunks = splitMarkdown(text, 300);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(text);
+  });
+
   it("keeps a list together across a nested fenced code block", () => {
     const text = [
       para("前言", 300),

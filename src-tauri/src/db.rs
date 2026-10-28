@@ -25,6 +25,28 @@ pub fn next_write_stamp() -> i64 {
         }
     }
 }
+
+/// Raise the stamp counter past every stamp already on disk. The counter
+/// restarts with the process, so a row stamped while the wall clock ran ahead
+/// would otherwise make every later choice look stale (and be dropped by the
+/// `updated_at` guard) until real time caught up.
+fn seed_write_stamp(conn: &Connection) -> rusqlite::Result<()> {
+    let stored: Option<i64> = conn.query_row(
+        "SELECT MAX(updated_at) FROM (
+             SELECT MAX(updated_at) AS updated_at FROM session_models
+             UNION ALL SELECT MAX(updated_at) FROM session_efforts
+             UNION ALL SELECT MAX(updated_at) FROM session_providers
+         )",
+        [],
+        |r| r.get(0),
+    )?;
+    if let Some(stored) = stored {
+        WRITE_STAMP.fetch_max(stored, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+/// Folded into the scanner's stat signature so a schema/derivation change
 /// still invalidates cached parse results.
 pub const CACHE_VERSION: &str = "2";
 
@@ -97,6 +119,7 @@ impl Db {
         // FK, so enabling enforcement changes nothing else.
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&conn)?;
+        seed_write_stamp(&conn)?;
         // A separate connection takes its own WAL snapshot. `query_only`
         // turns an accidental write here into an immediate SQLITE_READONLY
         // instead of a second writer racing the indexer.
@@ -1285,6 +1308,41 @@ mod tests {
             read().as_deref(),
             Some("薄荷/claude-opus-5"),
             "stale stamp is ignored"
+        );
+    }
+
+    /// The stamp counter restarts with the process. A row stamped while the
+    /// wall clock ran ahead must not make every later choice look stale once
+    /// the clock is corrected and the app reopens the database.
+    #[test]
+    fn write_stamps_resume_above_stamps_already_on_disk() {
+        let scratch = Scratch::new();
+        let path = scratch.path("app.db");
+        let read = |db: &Db| -> Option<String> {
+            db.read()
+                .query_row(
+                    "SELECT model FROM session_models WHERE engine='omp' AND session_id='s1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        {
+            let db = Db::open_at(&path).unwrap();
+            let clock_ran_an_hour_ahead = next_write_stamp() + 3_600_000_000;
+            db.remember_session_model("omp", "s1", "fast-clock/model", clock_ran_an_hour_ahead)
+                .unwrap();
+            assert_eq!(read(&db).as_deref(), Some("fast-clock/model"));
+        }
+
+        let db = Db::open_at(&path).unwrap();
+        db.remember_session_model("omp", "s1", "after-restart/model", next_write_stamp())
+            .unwrap();
+        assert_eq!(
+            read(&db).as_deref(),
+            Some("after-restart/model"),
+            "a choice made after reopening wins over the fast-clock row"
         );
     }
 

@@ -764,7 +764,23 @@ pub async fn git_diff(path: String, file: String, staged: bool) -> Result<String
         .map_err(|e| e.to_string())?
 }
 
+/// Index and ref writers used to queue on the IPC main thread. Off it, two
+/// clicks in the changes panel (stage while an unstage is in flight) overlap,
+/// and libgit2 fails the loser with "the index is locked". One gate per
+/// repository path queues them instead; separate worktrees keep separate
+/// gates because each has its own index.
+fn repo_write_gate(path: &str) -> std::sync::Arc<parking_lot::Mutex<()>> {
+    static GATES: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<parking_lot::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path));
+    let mut gates = GATES.get_or_init(Default::default).lock();
+    std::sync::Arc::clone(gates.entry(key).or_default())
+}
+
 fn git_stage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     for file in files {
@@ -791,6 +807,8 @@ pub async fn git_stage(path: String, files: Vec<String>) -> Result<(), String> {
 }
 
 fn git_unstage_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let repo = open_repo(path)?;
     let head = repo.head().and_then(|h| h.peel_to_commit());
     let mut index = repo.index().map_err(|e| e.to_string())?;
@@ -848,6 +866,8 @@ pub async fn git_unstage(path: String, files: Vec<String>) -> Result<(), String>
 /// untracked path is deleted from disk. Staged deletions (in HEAD, removed
 /// from the index) are not offered discard in the UI; here they are a no-op.
 pub(crate) fn git_discard_blocking(path: &str, files: &[String]) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let repo = open_repo(path)?;
     let workdir = repo
         .workdir()
@@ -880,6 +900,8 @@ pub async fn git_discard(path: String, files: Vec<String>) -> Result<(), String>
 }
 
 fn git_commit_blocking(path: &str, message: &str) -> Result<String, String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let trimmed = message.trim();
     if trimmed.is_empty() {
         return Err("empty commit message".to_string());
@@ -1320,6 +1342,8 @@ fn checkout_remote_branch(
 }
 
 pub(crate) fn git_checkout_blocking(path: &str, branch: &str) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let repo = open_repo(path)?;
     // A remote-tracking branch never receives HEAD directly (that would
     // detach it): it is materialized as a local tracking branch instead.
@@ -1387,6 +1411,8 @@ pub async fn git_checkout(path: String, branch: String) -> Result<(), String> {
 }
 
 fn git_create_branch_blocking(path: &str, name: &str) -> Result<(), String> {
+    let gate = repo_write_gate(path);
+    let _queued = gate.lock();
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("empty branch name".to_string());
@@ -1907,6 +1933,56 @@ mod tests {
             &parents,
         )
         .unwrap();
+    }
+
+    /// Index writes used to queue on the IPC main thread. Off it, two clicks
+    /// in the changes panel (stage while an unstage is in flight) overlap,
+    /// and libgit2 fails the loser with "the index is locked". Both must land.
+    #[test]
+    fn overlapping_index_writes_on_one_repo_both_land() {
+        let scratch = Scratch::new();
+        let repo = Repository::init(&scratch.0).unwrap();
+        {
+            // A larger index widens the read-modify-write window.
+            let mut index = repo.index().unwrap();
+            for i in 0..2000 {
+                let relative = format!("f{i}.txt");
+                std::fs::write(scratch.0.join(&relative), format!("{i}\n")).unwrap();
+                index.add_path(Path::new(&relative)).unwrap();
+            }
+            index.write().unwrap();
+        }
+        commit_file(&repo, "a.txt", "base\n");
+        commit_file(&repo, "b.txt", "base\n");
+        let path = scratch.0.to_string_lossy().into_owned();
+
+        for round in 0..10 {
+            std::fs::write(scratch.0.join("a.txt"), format!("a{round}\n")).unwrap();
+            std::fs::write(scratch.0.join("b.txt"), format!("b{round}\n")).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let stage = |file: &'static str| {
+                let path = path.clone();
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    git_stage_blocking(&path, &[file.to_string()])
+                })
+            };
+            let (a, b) = (stage("a.txt"), stage("b.txt"));
+            a.join().unwrap().expect("staging a.txt");
+            b.join().unwrap().expect("staging b.txt");
+
+            let index = Repository::open(&scratch.0).unwrap().index().unwrap();
+            let head = repo.head().unwrap().peel_to_tree().unwrap();
+            for file in ["a.txt", "b.txt"] {
+                assert_ne!(
+                    index.get_path(Path::new(file), 0).unwrap().id,
+                    head.get_path(Path::new(file)).unwrap().id(),
+                    "{file} staged in round {round}"
+                );
+            }
+            git_unstage_blocking(&path, &["a.txt".to_string(), "b.txt".to_string()]).unwrap();
+        }
     }
 
     /// Clone with the initial checkout skipped, pin `core.autocrlf=false`, then

@@ -39,10 +39,16 @@ const HTML_VOID_TAGS: Record<string, true> = {
   track: true,
   wbr: true,
 };
+/** Inline code spans: a backtick run closed by the next run of equal length. */
+const INLINE_CODE = /(`+)[^`]*\1/g;
 function countDollars(line: string): number {
+  // `$$` quoted in inline code (common when a reply explains LaTeX) is text,
+  // not a display-math fence; counting it would hold "math open" forever and
+  // stop every later split.
+  const text = line.includes("`") ? line.replace(INLINE_CODE, "") : line;
   let count = 0;
-  for (let i = 0; i < line.length - 1; i += 1) {
-    if (line[i] === "$" && line[i + 1] === "$") {
+  for (let i = 0; i < text.length - 1; i += 1) {
+    if (text[i] === "$" && text[i + 1] === "$") {
       count += 1;
       i += 1;
     }
@@ -69,7 +75,13 @@ export function splitMarkdown(
   const chunks: MarkdownChunk[] = [];
   let chunkStart = 0;
   let lineStart = 0;
-  const hardMax = target * 2;
+  // Past `softMax` a long list/quote/indented run may be cut, but only before
+  // a line that starts at column 0 (the next top-level item): cutting before
+  // an indented continuation would make a fresh chunk read 4 spaces as an
+  // indented code block. A run with no such line before `forceMax` is
+  // pathological (unfenced code with list-like comments) and is cut anyway.
+  const softMax = target * 2;
+  const forceMax = target * 3;
   let fence: { char: string; length: number } | null = null;
   let mathOpen = false;
   let htmlCloseRe: RegExp | null = null;
@@ -127,9 +139,10 @@ export function splitMarkdown(
       // An indented line after a blank continues the previous list item or
       // code block. Starting a list/quote while already inside one continues
       // that same list/quote. Neither is a document boundary unless the chunk
-      // has already grown past the hard cap (e.g. unfenced code with list-like
-      // comments).
-      const overHardCap = blankEnd - chunkStart >= hardMax;
+      // has already grown past the caps above.
+      const overHardCap =
+        (blankEnd - chunkStart >= softMax && !/^\s/.test(line)) ||
+        lineEnd - chunkStart > forceMax;
       const continuesIndented = !overHardCap && inIndented && INDENTED.test(line);
       const continuesList =
         !overHardCap &&
@@ -146,7 +159,10 @@ export function splitMarkdown(
     }
 
     const open = (inList ? LIST_FENCE : FENCE).exec(line);
-    if (open) {
+    // A backtick fence's info string cannot contain a backtick (CommonMark
+    // 4.5): "```js` ..." is paragraph text. Taking it for a fence would invert
+    // the open/close pairing and cut a later real code block in half.
+    if (open && !(open[1][0] === "`" && line.slice(open[0].length).includes("`"))) {
       fence = { char: open[1][0], length: open[1].length };
       lineStart = lineEnd + 1;
       continue;
