@@ -1297,6 +1297,7 @@ pub struct Workspace {
     pub name: String,
     pub last_opened_at: Option<i64>,
     pub sort_order: Option<i64>,
+    pub pinned: bool,
     /// Sidebar group (工作区分组) this workspace belongs to; None = ungrouped.
     pub group_id: Option<String>,
     /// "worktree" = git worktree child hanging under its parent workspace
@@ -1316,7 +1317,7 @@ pub struct Workspace {
 fn list_workspaces_from(db: &crate::db::Db) -> Result<Vec<Workspace>, String> {
     query_rows(
         db,
-        "SELECT id, path, name, last_opened_at, sort_order, group_id, kind, parent_id, meta FROM workspaces
+        "SELECT id, path, name, last_opened_at, sort_order, group_id, kind, parent_id, meta, pinned FROM workspaces
          ORDER BY sort_order IS NULL, sort_order, COALESCE(last_opened_at, 0) DESC",
         |r| {
             let meta_json: Option<String> = r.get(8)?;
@@ -1326,6 +1327,7 @@ fn list_workspaces_from(db: &crate::db::Db) -> Result<Vec<Workspace>, String> {
                 name: r.get(2)?,
                 last_opened_at: r.get(3)?,
                 sort_order: r.get(4)?,
+                pinned: r.get::<_, i64>(9)? != 0,
                 group_id: r.get(5)?,
                 kind: r.get(6)?,
                 parent_id: r.get(7)?,
@@ -1467,6 +1469,7 @@ pub(crate) fn add_workspace_inner(
         name,
         last_opened_at: Some(now),
         sort_order: None,
+        pinned: false,
         group_id: None,
         kind,
         parent_id,
@@ -1524,6 +1527,37 @@ pub async fn reorder_workspaces(
 ) -> Result<(), String> {
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || reorder_workspaces_blocking(&db, &ids))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Worktree children follow their parent row, so only top-level workspaces
+/// (parent_id IS NULL) can be pinned.
+fn set_workspace_pinned_blocking(db: &crate::db::Db, id: &str, pinned: bool) -> Result<(), String> {
+    let conn = db.0.lock();
+    let changed = conn
+        .execute(
+            "UPDATE workspaces SET pinned=?2 WHERE id=?1 AND parent_id IS NULL",
+            rusqlite::params![id, pinned],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err("workspace not found or is a worktree child".into());
+    }
+    Ok(())
+}
+
+/// Async + spawn_blocking like the other workspace writes: a sync command
+/// runs on the main thread and would freeze the window while a background
+/// index pass holds the writer lock.
+#[tauri::command]
+pub async fn set_workspace_pinned(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || set_workspace_pinned_blocking(&db, &id, pinned))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -1987,6 +2021,35 @@ mod tests {
             1
         );
 
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_pin_only_applies_to_top_level_rows() {
+        let home = scratch_dir("workspace-pin");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        {
+            let conn = db.0.lock();
+            conn.execute_batch(
+                "INSERT INTO workspaces(id, path, name) VALUES('p', '/ws/p', 'p');
+                 INSERT INTO workspaces(id, path, name, kind, parent_id)
+                   VALUES('c', '/ws/p-wt', 'c', 'worktree', 'p');",
+            )
+            .unwrap();
+        }
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        // Writing the same value again still matches the row.
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        assert!(set_workspace_pinned_blocking(&db, "c", true).is_err());
+        assert!(set_workspace_pinned_blocking(&db, "missing", true).is_err());
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(rows.iter().find(|w| w.id == "p").unwrap().pinned);
+        assert!(!rows.iter().find(|w| w.id == "c").unwrap().pinned);
+
+        set_workspace_pinned_blocking(&db, "p", false).unwrap();
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(!rows.iter().find(|w| w.id == "p").unwrap().pinned);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
     }
