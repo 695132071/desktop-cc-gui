@@ -710,15 +710,16 @@ pub(super) mod tests {
     /// Serialized: two tests mutating HOME in parallel would clobber each other.
     pub(crate) use crate::paths::HOME_ENV_LOCK as HOME_LOCK;
 
-    /// 引擎自己的 home 变量：`engine_home()` **优先**读它们，读不到才回落到
-    /// HOME / USERPROFILE。
+    /// 引擎自己的 home 变量：`engine_home()` / `codex_home()` **优先**读它们，
+    /// 读不到才回落到 HOME / USERPROFILE。
     ///
     /// 测试要的是"整个引擎都指向临时 home"，只改 HOME 做不到：机器上设过
-    /// `DSH_HOME` / `CLAUDE_CONFIG_DIR` 这类变量时，扫描仍会落到**真实**目录（`DSH_HOME`
-    /// 下真的能扫出会话），于是同一套测试随环境变红、且红在别人的机器上。所以这些
-    /// 变量在 `set` 时一并摘掉、`drop` 时按原样恢复。
-    const ENGINE_HOME_KEYS: [&str; 4] = [
+    /// `DSH_HOME` / `CODEX_HOME` 这类变量时，扫描会落到 scratch 之外的目录，看不到
+    /// 测试布置的会话文件，于是同一套测试随环境变红、且只红在设过变量的机器上。
+    /// 所以这些变量在 `set` 时一并摘掉、`drop` 时按原样恢复。
+    const ENGINE_HOME_KEYS: [&str; 5] = [
         "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         "KIMI_HOME",
         "DSH_HOME",
         "MINIMAX_DATA_DIR",
