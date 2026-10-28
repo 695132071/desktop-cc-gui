@@ -126,6 +126,7 @@ export interface Message {
       comparisonModel?: string | null;
     };
     served: { model: string | null; effort: string | null };
+    reportsServed?: boolean;
   } | null;
   /** Turn duration in milliseconds (measured from prompt send to turn completion) */
   durationMs?: number | null;
@@ -168,6 +169,7 @@ export interface Workspace {
   name: string;
   lastOpenedAt: number | null;
   sortOrder: number | null;
+  pinned?: boolean;
   /** Sidebar group id (工作区分组); null = ungrouped. */
   groupId: string | null;
   /** "worktree" = git worktree child under its parent workspace row;
@@ -1080,36 +1082,6 @@ export interface WebAccessInfo {
   availableIps?: LanIpEntry[];
 }
 
-/** One finished turn as it enters the usage ledger. */
-export interface UsageEntryInput {
-  /** Epoch ms when the turn settled. */
-  ts: number;
-  engine: string;
-  model: string | null;
-  sessionId: string | null;
-  workspacePath: string | null;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  durationMs: number | null;
-  /** Model responses this turn reported (>= 1). */
-  reports: number;
-}
-
-/** Ledger totals for one (local day, engine, model) bucket. */
-export interface UsageRow {
-  /** Local "YYYY-MM-DD". */
-  day: string;
-  engine: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Model responses in this bucket — the request total. */
-  requests: number;
-}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1670,6 +1642,7 @@ export const ipc = {
   pluginAddWorkspace: (pluginId: string, path: string, meta?: Record<string, unknown>) =>
     invoke<Workspace>("plugin_add_workspace", { pluginId, path, meta: meta ?? null }),
   reorderWorkspaces: (ids: string[]) => invoke<void>("reorder_workspaces", { ids }),
+  setWorkspacePinned: (id: string, pinned: boolean) => invoke<void>("set_workspace_pinned", { id, pinned }),
   removeWorkspace: (id: string) => invoke<void>("remove_workspace", { id }),
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
@@ -2039,11 +2012,6 @@ export const ipc = {
   webAccessStatus: () => invoke<WebAccessInfo | null>("web_access_status"),
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
-  // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invokePersisted<void>("usage-ledger", "usage_record", { entry }),
-  usageSummary: (days: number, tzOffsetMinutes: number) =>
-    invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invokePersisted<void>("usage-ledger", "usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

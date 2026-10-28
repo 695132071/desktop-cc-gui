@@ -334,6 +334,8 @@ Thanks to all the contributors who help make ccgui better.
 
 This project originally started from [CodexMonitor](https://github.com/Dimillian/CodexMonitor). Since v1.0.0 the codebase has been rewritten from scratch — no CodexMonitor code remains, but the original inspiration is gratefully acknowledged.
 
+The local usage statistics and subscription limit lookup (used by the Usage & Limits plugin) reference [TokenTracker](https://github.com/xiufengsun/tokentracker) (MIT), and the bundled model price table is derived from [LiteLLM](https://github.com/BerriAI/litellm) (MIT). See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
 ---
 
 ## Star History

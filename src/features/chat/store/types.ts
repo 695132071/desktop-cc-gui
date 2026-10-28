@@ -131,6 +131,7 @@ export interface ChatStore {
    *  handleAddWorkspace）。 */
   addWorkspaces: (paths: string[]) => Promise<string[]>;
   reorderWorkspaces: (ids: string[]) => Promise<void>;
+  setWorkspacePinned: (id: string, pinned: boolean) => Promise<void>;
   removeWorkspace: (id: string) => Promise<void>;
   selectSession: (
     engine: string,

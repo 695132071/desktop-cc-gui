@@ -332,6 +332,8 @@ perf(chat): reveal streamed text per frame without reparsing markdown
 
 本项目最初源自 [CodexMonitor](https://github.com/Dimillian/CodexMonitor)。自 v1.0.0 起代码库已从零完全重写，不再包含 CodexMonitor 的任何代码，但仍感谢其最初带来的启发。
 
+本机用量统计与订阅限额查询（供「用量与限额」插件使用）参考了 [TokenTracker](https://github.com/xiufengsun/tokentracker)（MIT），内置的模型价格表来自 [LiteLLM](https://github.com/BerriAI/litellm)（MIT），详见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+
 ---
 
 ## Star History

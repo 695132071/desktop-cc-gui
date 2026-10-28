@@ -32,6 +32,7 @@ pub mod pet_overlay;
 pub mod pets;
 pub mod plugin_caps;
 pub mod plugin_host;
+pub mod plugin_usage;
 pub mod plugins;
 pub mod preview_protocol;
 pub mod prompts;
@@ -45,7 +46,8 @@ pub mod skills_hub;
 pub mod slash_commands;
 pub mod terminal;
 pub mod updater;
-pub mod usage;
+pub mod usage_limits;
+pub mod usage_stats;
 pub mod web;
 pub mod window_state;
 
@@ -451,6 +453,14 @@ pub fn run() {
             plugin_host::plugin_list_engines,
             plugin_host::plugin_list_engine_models,
             plugin_host::plugin_model_catalog,
+            // Usage statistics & subscription limits (plugin usage.read / limits.read)
+            plugin_usage::plugin_usage_query,
+            plugin_usage::plugin_usage_sources,
+            plugin_usage::plugin_usage_refresh,
+            plugin_usage::plugin_usage_rescan,
+            plugin_usage::plugin_usage_prices,
+            plugin_usage::plugin_usage_update_prices,
+            plugin_usage::plugin_limits_get,
             // plugin marketplace (Phase 3, plan §6)
             plugins::market::plugin_fetch_index,
             plugins::market::plugin_fetch_featured,
@@ -492,9 +502,6 @@ pub fn run() {
             history::reader::list_archived_sessions,
             history::reader::archive_session,
             history::reader::restore_session,
-            usage::usage_record,
-            usage::usage_summary,
-            usage::usage_clear,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
             history::search::search_messages,
@@ -509,6 +516,7 @@ pub fn run() {
             history::reader::list_workspaces,
             history::reader::add_workspace,
             history::reader::reorder_workspaces,
+            history::reader::set_workspace_pinned,
             history::reader::remove_workspace,
             history::reader::set_workspace_group,
             // files

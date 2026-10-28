@@ -877,21 +877,6 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             approved_at INTEGER,
             name TEXT
         );
-        CREATE TABLE IF NOT EXISTS usage_ledger(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            engine TEXT NOT NULL,
-            model TEXT NOT NULL DEFAULT '',
-            session_id TEXT,
-            workspace_path TEXT,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read INTEGER NOT NULL DEFAULT 0,
-            cache_write INTEGER NOT NULL DEFAULT 0,
-            duration_ms INTEGER,
-            reports INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_ledger_ts ON usage_ledger(ts);
         CREATE TABLE IF NOT EXISTS plugin_kv(
             plugin_id TEXT NOT NULL,
             key TEXT NOT NULL,
@@ -1050,18 +1035,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     // NB: no `cache_version` meta row — it was written but never read; cache
     // freshness is carried by the scanner's stat signature (see CACHE_VERSION).
-    // Additive migration: usage rows gained a per-turn request count.
-    let has_reports = conn
-        .prepare("PRAGMA table_info(usage_ledger)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(Result::ok)
-        .any(|name| name == "reports");
-    if !has_reports {
-        conn.execute(
-            "ALTER TABLE usage_ledger ADD COLUMN reports INTEGER NOT NULL DEFAULT 1",
-            [],
-        )?;
-    }
+    retire_usage_ledger(conn)?;
     // Additive migration: a name the user gave a paired device, shown instead
     // of the user-agent summary.
     let has_device_name = conn
@@ -1081,6 +1055,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         .any(|name| name == "sort_order");
     if !has_sort_order {
         conn.execute("ALTER TABLE workspaces ADD COLUMN sort_order INTEGER", [])?;
+    }
+    let has_pinned = conn
+        .prepare("PRAGMA table_info(workspaces)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "pinned");
+    if !has_pinned {
+        conn.execute("ALTER TABLE workspaces ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0", [])?;
     }
 
     // Additive migration: sidebar group assignment (工作区分组), matching the
@@ -1160,9 +1142,54 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The old in-app usage ledger (settings 用量) is retired: usage statistics are
+/// now computed read-only from each CLI's own session logs (`usage_stats`,
+/// separate usage-stats.db). Nothing writes or reads the table any more, but
+/// it is renamed rather than dropped: it holds turns of engines the new
+/// scanner does not cover yet and history whose CLI logs were cleaned up, so
+/// the data stays recoverable. A later release can drop the legacy table.
+fn retire_usage_ledger(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    if table_exists("usage_ledger")? && !table_exists("usage_ledger_legacy")? {
+        conn.execute_batch(
+            "ALTER TABLE usage_ledger RENAME TO usage_ledger_legacy;
+             DROP INDEX IF EXISTS idx_usage_ledger_ts;",
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_pin_migration_defaults_to_unpinned() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE workspaces(id TEXT PRIMARY KEY, path TEXT UNIQUE NOT NULL, name TEXT NOT NULL, last_opened_at INTEGER);
+             INSERT INTO workspaces(id, path, name) VALUES('w1', '/ws', 'ws');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let pinned: i64 = conn
+            .query_row("SELECT pinned FROM workspaces WHERE id='w1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pinned, 0);
+        conn.execute("UPDATE workspaces SET pinned=1 WHERE id='w1'", [])
+            .unwrap();
+        migrate(&conn).unwrap();
+        let pinned: i64 = conn
+            .query_row("SELECT pinned FROM workspaces WHERE id='w1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pinned, 1);
+    }
 
     struct Scratch(std::path::PathBuf);
     impl Scratch {
@@ -1749,5 +1776,29 @@ mod tests {
         let db = Db::open_at(&scratch.path("app.db")).unwrap();
         db.plugin_kv_set("p1", "k", &serde_json::json!(1)).unwrap();
         let (_log, _checkpointed) = db.wal_checkpoint_passive().unwrap();
+    }
+    #[test]
+    fn retired_usage_ledger_is_renamed_not_dropped() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_ledger(id INTEGER PRIMARY KEY, ts INTEGER NOT NULL);
+             CREATE INDEX idx_usage_ledger_ts ON usage_ledger(ts);
+             INSERT INTO usage_ledger(ts) VALUES (1), (2);",
+        )
+        .unwrap();
+        super::retire_usage_ledger(&conn).unwrap();
+        super::retire_usage_ledger(&conn).unwrap(); // idempotent
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_ledger_legacy", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 2, "legacy rows stay recoverable");
+        let old: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('usage_ledger', 'idx_usage_ledger_ts')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0);
     }
 }
