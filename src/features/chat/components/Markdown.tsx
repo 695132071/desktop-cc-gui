@@ -32,9 +32,13 @@ import Check from "lucide-react/dist/esm/icons/check";
 import { useCopied } from "@/hooks/use-copied";
 import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
-import { ipc } from "@/lib/ipc";
-import { readRemoteAware } from "@/features/files/remote-files";
-import { isPathUnder, resolveChatFileLink } from "@/features/chat/file-link-resolution";
+import {
+  imageCacheKey,
+  isDirectImageSource,
+  loadMarkdownImage,
+  markdownImageCache,
+} from "./markdown-image-source";
+import { transformMarkdownUrl } from "./markdown-url";
 import { openChatFilePath } from "@/features/chat/open-chat-file";
 import {
   decodeFileLink,
@@ -57,18 +61,6 @@ type PluginListProp = NonNullable<
  *  mount their chunks progressively across frames. */
 const PROGRESSIVE_MARKDOWN_FROM = 16_000;
 
-function transformMarkdownUrl(url: string): string {
-  // file: is deliberately excluded: model output must not smuggle in
-  // local-file URLs. Workspace image paths use MarkdownImage's scoped reader.
-  if (isFileLinkUrl(url) || SAFE_DATA_IMAGE_URL.test(url)) return url;
-  if (/^(https?|mailto):/i.test(url)) return url;
-  // Anything without a scheme is a relative reference ("#anchor",
-  // "/abs", "./rel" or a bare "dir/file.png"). Scheme-bearing URLs
-  // (file:, javascript:, vbscript:, …) stay blanked.
-  if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(url)) return url;
-  return "";
-}
-
 /** Let the plain snapshot paint before the transition starts parsing. */
 function afterPaint(callback: () => void): () => void {
   if (typeof requestAnimationFrame === "function") {
@@ -83,8 +75,6 @@ function openExternalUrl(url: string) {
   openExternal(url);
 }
 
-const SAFE_DATA_IMAGE_URL = /^data:image\/(?:apng|avif|bmp|gif|jpeg|png|webp|x-icon);base64,/i;
-
 function MarkdownImage({
   src,
   alt = "",
@@ -96,34 +86,31 @@ function MarkdownImage({
   title?: string;
   workspacePath: string;
 }) {
-  const imageSource = src ?? "";
-  const directImage = /^https?:/i.test(imageSource) || SAFE_DATA_IMAGE_URL.test(imageSource);
-  const [resolvedSource, setResolvedSource] = useState<string | null>();
+  const source = src ?? "";
+  const direct = isDirectImageSource(source);
+  const key = imageCacheKey(source, workspacePath);
+  // Keyed by source so a changed src never shows the previous image.
+  const [loaded, setLoaded] = useState<{ key: string; url: string | null } | null>(null);
 
   useEffect(() => {
-    if (!imageSource || directImage) return;
+    if (!source || direct) return;
     let cancelled = false;
-    setResolvedSource(undefined);
-    void resolveChatFileLink(imageSource, workspacePath)
-      .then((path) => {
-        if (!path || !isPathUnder(path, workspacePath)) return null;
-        return readRemoteAware(path, (localPath) => ipc.readFile(localPath));
-      })
-      .then((content) => {
-        if (!cancelled) {
-          setResolvedSource(content?.kind === "image" ? content.dataUrl : null);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setResolvedSource(null);
-      });
+    void loadMarkdownImage(source, workspacePath).then((image) => {
+      if (!cancelled) setLoaded({ key, url: image?.dataUrl ?? null });
+    });
     return () => {
       cancelled = true;
     };
-  }, [imageSource, workspacePath, directImage]);
+  }, [source, workspacePath, direct, key]);
 
-  const imageUrl = directImage ? imageSource : resolvedSource;
-  if (typeof imageUrl !== "string" || !imageUrl) {
+  // A remount (virtualizer scroll back) paints the cached copy at once while
+  // the effect checks the file is unchanged.
+  const imageUrl = direct
+    ? source
+    : loaded?.key === key
+      ? loaded.url
+      : markdownImageCache.peek(key)?.dataUrl ?? null;
+  if (!imageUrl) {
     return alt ? <span className="md-image-fallback">{alt}</span> : null;
   }
   return <img src={imageUrl} alt={alt} title={title} className="md-image" loading="lazy" />;
