@@ -19,6 +19,7 @@ pub mod event_sink;
 pub mod files;
 pub mod fonts;
 pub mod git;
+pub mod git_ignore;
 pub mod git_worktree;
 pub mod history;
 pub mod mcp;
@@ -31,6 +32,7 @@ pub mod pet_overlay;
 pub mod pets;
 pub mod plugin_caps;
 pub mod plugin_host;
+pub mod plugin_usage;
 pub mod plugins;
 pub mod preview_protocol;
 pub mod prompts;
@@ -44,8 +46,10 @@ pub mod skills_hub;
 pub mod slash_commands;
 pub mod terminal;
 pub mod updater;
-pub mod usage;
+pub mod usage_limits;
+pub mod usage_stats;
 pub mod web;
+pub mod window_state;
 
 use std::sync::Arc;
 use tauri::Emitter;
@@ -294,6 +298,9 @@ pub fn run() {
             // 状态必须已经就位。设置改动需重启应用。
             #[cfg(target_os = "windows")]
             let settings = settings::read_settings().unwrap_or_default();
+            // 窗口大小/位置/最大化/全屏跨启动记忆（issue #1381）。窗口以隐藏
+            // 状态建出来，几何与状态先应用再 show，避免先闪默认尺寸。
+            let (window_restore, saved_window) = window_state::restore_plan(app.handle());
             let mut window_builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -301,7 +308,10 @@ pub fn run() {
             )
             .title("CC GUI")
             .inner_size(1400.0, 900.0)
-            .min_inner_size(900.0, 600.0);
+            .min_inner_size(900.0, 600.0)
+            // 隐藏建窗，摆好几何再 show：最大化必须发生在几何之后，否则系统
+            // 记录的「还原矩形」是建窗默认值，取消最大化会跳回错误尺寸。
+            .visible(false);
             #[cfg(target_os = "macos")]
             {
                 // 原 tauri.conf.json: titleBarStyle "Overlay" + hiddenTitle true。
@@ -318,9 +328,15 @@ pub fn run() {
                     window_builder = window_builder.shadow(true);
                 }
             }
-            window_builder
+            let main_window = window_builder
                 .build()
                 .expect("failed to create main window");
+            if let Err(error) =
+                window_state::apply_and_track(&main_window, &window_restore, saved_window)
+            {
+                eprintln!("[window] restore failed, showing default window: {error}");
+                let _ = main_window.show();
+            }
             // Replace the automatic macOS menu with the same one minus its
             // Close Window (⌘W) item; the frontend shortcut runtime owns that
             // key and closes the tab in view (see app_menu.rs).
@@ -424,6 +440,7 @@ pub fn run() {
             plugins::storage::plugin_document_storage_remove,
             plugins::storage::plugin_document_storage_list,
             plugins::assets::plugin_asset_grant_directory,
+            plugins::assets::plugin_asset_grant_file,
             plugins::assets::plugin_asset_list_directories,
             plugins::assets::plugin_asset_revoke_directory,
             plugins::assets::plugin_reveal_path,
@@ -436,6 +453,14 @@ pub fn run() {
             plugin_host::plugin_list_engines,
             plugin_host::plugin_list_engine_models,
             plugin_host::plugin_model_catalog,
+            // Usage statistics & subscription limits (plugin usage.read / limits.read)
+            plugin_usage::plugin_usage_query,
+            plugin_usage::plugin_usage_sources,
+            plugin_usage::plugin_usage_refresh,
+            plugin_usage::plugin_usage_rescan,
+            plugin_usage::plugin_usage_prices,
+            plugin_usage::plugin_usage_update_prices,
+            plugin_usage::plugin_limits_get,
             // plugin marketplace (Phase 3, plan §6)
             plugins::market::plugin_fetch_index,
             plugins::market::plugin_fetch_featured,
@@ -450,6 +475,7 @@ pub fn run() {
             engine::list_plan_reviews,
             engine::list_engines,
             engine::models::list_engine_models,
+            engine::codebuddy::codebuddy_account_status,
             engine::pi_family_auth::pi_family_auth_list,
             engine::pi_family_auth::pi_family_auth_set_api_key,
             engine::pi_family_auth::pi_family_auth_delete_credential,
@@ -479,9 +505,6 @@ pub fn run() {
             history::reader::list_archived_sessions,
             history::reader::archive_session,
             history::reader::restore_session,
-            usage::usage_record,
-            usage::usage_summary,
-            usage::usage_clear,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
             history::search::search_messages,
@@ -496,6 +519,7 @@ pub fn run() {
             history::reader::list_workspaces,
             history::reader::add_workspace,
             history::reader::reorder_workspaces,
+            history::reader::set_workspace_pinned,
             history::reader::remove_workspace,
             history::reader::set_workspace_group,
             // files
@@ -551,6 +575,7 @@ pub fn run() {
             // git
             git::git_status,
             git::git_repository_summaries,
+            git::git_workspace_owners,
             git::git_file_colors,
             git::git_tree_status,
             git::git_diff,
@@ -563,6 +588,7 @@ pub fn run() {
             git::git_branches,
             git::git_checkout,
             git::git_create_branch,
+            git::git_init,
             git_worktree::git_worktree_list,
             git_worktree::git_worktree_create,
             git_worktree::git_worktree_create_cancel,
@@ -574,7 +600,9 @@ pub fn run() {
             open_app::open_custom_program,
             open_app::get_program_icon,
             open_app::reveal_in_file_manager,
+            open_app::browser::open_in_browser,
             // terminal
+            terminal::terminal_host_info,
             terminal::terminal_open,
             terminal::terminal_write,
             terminal::terminal_resize,
@@ -632,6 +660,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                // macOS 空闲时的 ⌘Q / 程序坞退出不经过窗口的 CloseRequested /
+                // Destroyed（见 quit_guard.rs），只走到这里：兜底落盘最后一次窗口
+                // 变化。其余平台窗口关闭时已 flush，这里重复写同一份快照，无害。
+                window_state::flush();
                 if let Some(metrics) = app.try_state::<metrics::MetricsState>() {
                     metrics.stop();
                 }

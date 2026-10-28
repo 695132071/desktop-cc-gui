@@ -13,7 +13,6 @@ import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import Bot from "lucide-react/dist/esm/icons/bot";
 import FileText from "lucide-react/dist/esm/icons/file-text";
 import Smartphone from "lucide-react/dist/esm/icons/smartphone";
-import ChartColumn from "lucide-react/dist/esm/icons/chart-column";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles";
 import Plug from "lucide-react/dist/esm/icons/plug";
 // 电脑操控入口：暂时隐藏，恢复时取消注释。
@@ -37,7 +36,6 @@ import { PerformanceDiagnosticsSection } from "./PerformanceDiagnostics";
 import { BetaFeaturesSection } from "./BetaFeaturesSection";
 import { UpdateSection } from "./UpdateSection";
 import { WebAccessSection } from "./WebAccessSection";
-import { UsageSection } from "./UsageSection";
 import { ShortcutsSection } from "@/features/shortcuts/ShortcutsSection";
 import { ENGINE_IDS, type EngineId } from "./providers";
 import { builtinSearchEntries } from "./builtin-search";
@@ -141,15 +139,6 @@ settingsRegistry.register({
   group: "system",
   order: 2,
   component: ShortcutsSection,
-});
-settingsRegistry.register({
-  id: "usage",
-  key: "usage",
-  label: () => i18n.t("usage.title"),
-  icon: ChartColumn,
-  group: "workspace",
-  order: 2,
-  component: UsageSection,
 });
 /**
  * Capability pages (Skills / MCP) load lazily: opening ordinary settings must

@@ -2,6 +2,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { sessionMenuRegistry, workspaceMenuRegistry } from "@ccgui/plugin-sdk";
+import { useChatStore } from "@/features/chat/store";
 import { AiChatSidebar } from "./ai-chat-sidebar";
 import type { AiChatRepo } from "./ai-chat-sidebar";
 
@@ -23,6 +24,7 @@ let root: Root;
 
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+  useChatStore.setState({ workspaces: [] });
   localStorage.clear();
   node = document.createElement("div");
   document.body.append(node);
@@ -352,6 +354,40 @@ it("renders plugin workspace-menu items for the right-clicked workspace", async 
   }
 });
 
+it("只有置顶回调时仍可打开工作区右键菜单", async () => {
+  useChatStore.setState({ workspaces: [{ id: "a", path: "/ws/a", name: "a", lastOpenedAt: null, sortOrder: 0, groupId: null, pinned: false }] });
+  const onSetWorkspacePinned = vi.fn();
+  await act(async () => root.render(<AiChatSidebar repos={[repo("a")]} onSetWorkspacePinned={onSetWorkspacePinned} />));
+  await rightClick(rowFor("a"));
+  await act(async () => menuItem(openMenu(), "chat.pinWorkspace").click());
+  expect(onSetWorkspacePinned).toHaveBeenCalledWith("a", true);
+});
+
+it("分组内置顶与普通工作区分段排序且仅置顶行显示图钉", async () => {
+  await act(async () => root.render(
+    <AiChatSidebar
+      repos={[]}
+      sections={[{ id: "g", name: "分组", repos: [
+        { ...repo("p1"), pinned: true },
+        { ...repo("p2"), pinned: true },
+        repo("r1"),
+        repo("r2"),
+      ] }]}
+      onReorderWorkspaces={() => {}}
+    />,
+  ));
+  const lists = [...node.querySelectorAll<HTMLElement>('[data-workspace-reorder-list="true"]')];
+  expect(lists.map((list) => [...list.querySelectorAll<HTMLElement>("[data-workspace-id]")].map((row) => row.dataset.workspaceId))).toEqual([
+    ["p1", "p2"], ["r1", "r2"],
+  ]);
+  expect(rowFor("p1").querySelector(".lucide-pin")).not.toBeNull();
+  expect(rowFor("r1").querySelector(".lucide-pin")).toBeNull();
+  // The glyph is aria-hidden; the pinned state reaches screen readers as
+  // visually hidden text inside the row button.
+  expect(rowFor("p1").querySelector(".sr-only")?.textContent).toBe("chat.workspacePinned");
+  expect(rowFor("r1").querySelector(".sr-only")).toBeNull();
+});
+
 it("draft 新对话右键只提供删除,不暴露重命名/复制 ID/插件项", async () => {
   const onThreadAction = vi.fn();
   const onCopyThreadId = vi.fn();
@@ -407,6 +443,69 @@ it("keeps right-click inert when no thread handler is wired", async () => {
   ]);
   await rightClick(threadRow("孤独会话"));
   expect(document.body.querySelector("[role='menu']")).toBeNull();
+});
+
+it("collapsed workspace groups keep their rows mounted for instant re-expand", async () => {
+  await act(async () => {
+    root.render(
+      <AiChatSidebar
+        repos={[]}
+        sections={[
+          {
+            id: "g1",
+            name: "开源项目",
+            repos: [repo("a"), repo("b")],
+          },
+        ]}
+      />,
+    );
+  });
+  const groupHeader = rowFor("开源项目");
+  const repoRow = rowFor("a");
+
+  await act(async () => groupHeader.click());
+
+  expect(groupHeader.getAttribute("aria-expanded")).toBe("false");
+  // Rows stay mounted under a clipped + inert region: remounting them would
+  // recreate the row avatar <img> and flash the folder fallback on re-expand.
+  const region = [...node.querySelectorAll<HTMLElement>("[aria-hidden='true']")].find(
+    (el) => (el.getAttribute("class") ?? "").includes("grid-rows-[0fr]"),
+  );
+  if (!region) throw new Error("no collapsed group region");
+  expect(region.hasAttribute("inert")).toBe(true);
+  expect(rowFor("a")).toBe(repoRow);
+
+  await act(async () => groupHeader.click());
+
+  expect(groupHeader.getAttribute("aria-expanded")).toBe("true");
+  // Same DOM node, so the avatar image (once loaded) is never reloaded.
+  expect(rowFor("a")).toBe(repoRow);
+});
+
+it("a group collapsed from a previous session mounts its rows on first expand", async () => {
+  localStorage.setItem(
+    "ccgui-next.sidebarCollapsedGroups:v1",
+    JSON.stringify(["g1"]),
+  );
+  await act(async () => {
+    root.render(
+      <AiChatSidebar
+        repos={[]}
+        sections={[{ id: "g1", name: "开源项目", repos: [repo("a")] }]}
+      />,
+    );
+  });
+  // keepMounted never force-mounts a group the user has not expanded in this
+  // session: a persisted-collapsed group costs no row/avatar work at startup.
+  expect(rowFor("开源项目").getAttribute("aria-expanded")).toBe("false");
+  expect(
+    [...node.querySelectorAll<HTMLElement>("button[aria-expanded]")].some((el) =>
+      el.textContent?.includes("a"),
+    ),
+  ).toBe(false);
+
+  await act(async () => rowFor("开源项目").click());
+  expect(rowFor("a")).toBeTruthy();
 });
 
 it("renders empty groups instead of hiding them", async () => {

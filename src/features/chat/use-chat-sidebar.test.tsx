@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "@/lib/i18n";
+import i18n from "@/lib/i18n";
 import type { AiChatRepo } from "@/components/application/ai-chat/ai-chat-sidebar";
 import { ipc, type SessionMeta, type Workspace } from "@/lib/ipc";
 import { useBrowserStore } from "@/features/browser/store";
@@ -24,6 +24,7 @@ vi.mock("@/lib/ipc", async (importOriginal) => ({
     // 无工作区时 handleAddWorkspace 会走这条链路：登记目录 + 重读列表。
     addWorkspace: vi.fn(async () => {}),
     listWorkspaces: vi.fn(async () => []),
+    setWorkspacePinned: vi.fn(async () => {}),
 
   
   },
@@ -40,7 +41,7 @@ vi.mock("@/lib/events", () => ({
 vi.mock("@/lib/platform", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/platform")>()),
   isWeb: false,
-  pickDirectory: vi.fn(async () => null),
+  pickDirectories: vi.fn(async () => []),
 }));
 // 聚焦助手自带 rAF 重试窗口，单测里只关心语义。
 vi.mock("./focus-composer", () => ({ focusComposerWhenVisible: vi.fn() }));
@@ -124,6 +125,48 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured).toHaveLength(1);
     expect(captured[0]?.threadLimit).toBe(7);
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
+  });
+
+  it("只在所属分组内把置顶工作区排在普通工作区前", async () => {
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [
+          { ...WS, id: "a", pinned: false, groupId: null },
+          { ...WS, id: "b", pinned: true, groupId: "g" },
+          { ...WS, id: "c", pinned: false, groupId: "g" },
+          { ...WS, id: "d", pinned: true, groupId: null },
+        ],
+        workspaceGroups: [{ id: "g", name: "分组", sortOrder: 0 }],
+      });
+    });
+    expect(sidebar.sections?.map((section) => section.repos.map((repo) => repo.id))).toEqual([
+      ["d", "a"],
+      ["b", "c"],
+    ]);
+    expect(sidebar.sections?.[0]?.repos[0]?.defaultOpen).toBe(true);
+    expect(sidebar.sections?.[1]?.repos[0]?.defaultOpen).toBe(false);
+  });
+
+  it("没有自定义分组时置顶项在工作区列表顶部", async () => {
+    await act(async () => {
+      useChatStore.setState({
+        workspaces: [{ ...WS, id: "a", pinned: false }, { ...WS, id: "b", pinned: true }],
+      });
+    });
+    expect(sidebar.sections).toBeUndefined();
+    expect(captured.map((repo) => repo.id)).toEqual(["b", "a"]);
+  });
+
+  it("置顶写入失败且刷新失败时恢复原状态并显示错误", async () => {
+    vi.mocked(ipc.setWorkspacePinned).mockRejectedValueOnce(new Error("写入失败"));
+    vi.mocked(ipc.listWorkspaces).mockRejectedValueOnce(new Error("刷新失败"));
+    await act(async () => {
+      await useChatStore.getState().setWorkspacePinned(WS.id, true);
+    });
+    expect(useChatStore.getState().workspaces[0]?.pinned).toBe(false);
+    expect(useChatStore.getState().actionError).toBe(
+      i18n.t("chat.pinWorkspaceFailed", { message: "写入失败" }),
+    );
   });
 
   it("pending 新对话出现在对应工作区线程列表顶部", async () => {
@@ -350,28 +393,28 @@ describe("首启无工作区时的新建会话", () => {
       root.unmount();
     });
     container.remove();
-    vi.mocked(platform.pickDirectory).mockResolvedValue(null);
+    vi.mocked(platform.pickDirectories).mockResolvedValue([]);
     vi.restoreAllMocks();
   });
 
   it("选完目录后直接开出待发会话，而不是停在「已登记工作区」", async () => {
     const picked = "/ws/picked";
-    vi.mocked(platform.pickDirectory).mockResolvedValue(picked);
-    // 断言落在 IPC 边界，而不是 spy store 的 addWorkspace：钩子在渲染时就把
+    vi.mocked(platform.pickDirectories).mockResolvedValue([picked]);
+    // 断言落在 IPC 边界，而不是 spy store 的 addWorkspaces：钩子在渲染时就把
     // store 上的动作引用读进了闭包，事后再 vi.spyOn 替换属性，钩子用的仍是
     // 旧引用（spy 永远 0 次）——测「真的登记了目录」要看它最终调用的 IPC。
     vi.mocked(ipc.addWorkspace).mockClear();
 
     await act(async () => {
       sidebar.handleNewSession();
-      // 目录选择器是异步链路：等 addWorkspace 与随后的开会话落地。
+      // 目录选择器是异步链路：等 addWorkspaces 与随后的开会话落地。
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
     });
 
-    expect(platform.pickDirectory).toHaveBeenCalled();
-    expect(ipc.addWorkspace).toHaveBeenCalledWith(picked, undefined);
+    expect(platform.pickDirectories).toHaveBeenCalled();
+    expect(ipc.addWorkspace).toHaveBeenCalledWith(picked);
     expect(useChatStore.getState().active).toEqual({
       engine: "codex",
       sessionId: null,
@@ -382,8 +425,53 @@ describe("首启无工作区时的新建会话", () => {
     ]);
   });
 
+  it("一次多选多个文件夹时全部登记，会话开在首个目录", async () => {
+    // 「添加工作区」支持一次选多个目录：对话框一次返回 N 个路径，逐个登记，
+    // 首个登记成功的目录承接「新建会话」的待发会话。
+    vi.mocked(platform.pickDirectories).mockResolvedValue(["/ws/one", "/ws/two"]);
+    vi.mocked(ipc.addWorkspace).mockClear();
+
+    await act(async () => {
+      sidebar.handleNewSession();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(ipc.addWorkspace).toHaveBeenCalledWith("/ws/one");
+    expect(ipc.addWorkspace).toHaveBeenCalledWith("/ws/two");
+    expect(useChatStore.getState().active).toEqual({
+      engine: "codex",
+      sessionId: null,
+      workspacePath: "/ws/one",
+    });
+  });
+
+  it("某个目录登记失败不影响其余目录，会话落在首个成功的目录", async () => {
+    vi.mocked(platform.pickDirectories).mockResolvedValue(["/ws/denied", "/ws/ok"]);
+    vi.mocked(ipc.addWorkspace).mockRejectedValueOnce(new Error("拒绝访问"));
+
+    await act(async () => {
+      sidebar.handleNewSession();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(ipc.addWorkspace).toHaveBeenCalledWith("/ws/ok");
+    expect(useChatStore.getState().active).toEqual({
+      engine: "codex",
+      sessionId: null,
+      workspacePath: "/ws/ok",
+    });
+    // 失败的目录仍要留一句给用户看。
+    expect(useChatStore.getState().actionError).toBeTruthy();
+  });
+
   it("取消目录选择时不建会话（不留空标签页）", async () => {
-    vi.mocked(platform.pickDirectory).mockResolvedValue(null);
+    vi.mocked(platform.pickDirectories).mockResolvedValue([]);
 
     await act(async () => {
       sidebar.handleNewSession();
@@ -396,10 +484,10 @@ describe("首启无工作区时的新建会话", () => {
   });
 
   it("登记失败时不建会话（不留下指向未登记目录的标签页）", async () => {
-    // store.addWorkspace 会吞掉异常只留 actionError；若「新建会话」据此仍往
+    // store.addWorkspaces 会吞掉异常只留 actionError；若「新建会话」据此仍往
     // 下走，就会开出一个指向未登记目录的待发会话——正是要消灭的「输入框灰着」
-    // 形态，所以它必须把成功与否报回来（Promise<boolean>）。
-    vi.mocked(platform.pickDirectory).mockResolvedValue("/ws/denied");
+    // 形态，所以它必须把成功与否（成功路径列表）报回来。
+    vi.mocked(platform.pickDirectories).mockResolvedValue(["/ws/denied"]);
     vi.mocked(ipc.addWorkspace).mockRejectedValueOnce(new Error("拒绝访问"));
 
     await act(async () => {
@@ -409,7 +497,7 @@ describe("首启无工作区时的新建会话", () => {
       await Promise.resolve();
     });
 
-    expect(ipc.addWorkspace).toHaveBeenCalledWith("/ws/denied", undefined);
+    expect(ipc.addWorkspace).toHaveBeenCalledWith("/ws/denied");
     expect(useChatStore.getState().active).toBeNull();
     expect(useChatStore.getState().openTabs).toEqual([]);
     // 失败原因仍要留给用户看（错误条由 store 负责）。

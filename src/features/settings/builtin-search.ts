@@ -139,6 +139,13 @@ const generalEntries: SettingsSearchEntry[] = [
     labelKey: "settings.promptHistory",
     sectionKey: "settings.behavior",
   },
+  {
+    page: "general",
+    anchor: "fileTreeHideIgnored",
+    labelKey: "settings.fileTreeHideIgnored",
+    sectionKey: "settings.behavior",
+    keywords: ["gitignore", ".gitignore", "ignored", "hidden", "file tree", "忽略", "隐藏", "文件树"],
+  },
   // 输入历史：行标题带条数（管理历史记录 ({{count}})），搜索结果里去掉计数。
   {
     page: "general",
@@ -269,6 +276,9 @@ function cliPageEntries(engine: EngineId): SettingsSearchEntry[] {
     rows.push({ anchor: "piAuthOauth", labelKey: "settings.piAuthOauthTitle" });
     rows.push({ anchor: "piAuthApiKey", labelKey: "settings.piAuthApiKeyTitle" });
     rows.push({ anchor: "piAuthCustom", labelKey: "settings.piAuthCustomTitle" });
+  }
+  if (engine === "codebuddy") {
+    rows.push({ anchor: "codebuddyAuth", labelKey: "settings.codebuddyAccountTitle" });
   }
   rows.push({ anchor: "cliChannels", labelKey: "settings.cliChannels" });
   return rows.map((row) => ({ page: `cli:${engine}`, ...row }));

@@ -13,7 +13,7 @@ import {
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { isWeb } from "@/lib/platform";
 import { Input } from "@/components/base/input/input";
-import { RepoItem } from "@/components/application/ai-chat/repo-tree";
+import { RepoItem, SidebarDisclosure } from "@/components/application/ai-chat/repo-tree";
 import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import { cx } from "@/utils/cx";
 
@@ -235,10 +235,20 @@ export function WorkspaceSection({
   const { t } = useTranslation();
   const hasGroups = Boolean(sections?.some((section) => section.id !== null));
 
-  const renderRepoList = (repos: AiChatRepo[], sectionId: string | null) =>
-    repos.length > 0 && (
+  const renderRepoList = (
+    repos: AiChatRepo[],
+    sectionId: string | null,
+    /** The owning group is collapsed: row headers stay mounted (avatar identity,
+     *  see the keepMounted disclosure) while their thread lists fold shut, so
+     *  pagination is still recycled like any other collapsed region. */
+    groupCollapsed = false,
+  ) => {
+    const pinned = repos.filter((repo) => repo.pinned);
+    const regular = repos.filter((repo) => !repo.pinned);
+    const renderPart = (items: AiChatRepo[], isPinned: boolean) => items.length > 0 && (
       <WorkspaceSortableList
-        items={repos}
+        key={isPinned ? "pinned" : "regular"}
+        items={items}
         sectionId={sectionId}
         onDropToSection={onDropWorkspaceToSection}
         onDragActiveChange={onWorkspaceDragActiveChange}
@@ -247,21 +257,24 @@ export function WorkspaceSection({
             ? (orderedIds) => {
                 // Rebuild the global order: other sections keep theirs, the
                 // dragged section takes the new one.
+                const sectionOrder = isPinned
+                  ? [...orderedIds, ...regular.map((repo) => repo.id)]
+                  : [...pinned.map((repo) => repo.id), ...orderedIds];
                 const all = (sections ?? [{ id: null, name: "", repos }]).flatMap(
                   (section) =>
                     section.id === sectionId
-                      ? orderedIds
+                      ? sectionOrder
                       : section.repos.map((repo) => repo.id),
                 );
                 onReorderWorkspaces(all.filter((id): id is string => Boolean(id)));
               }
             : undefined
         }
-        className="flex w-full flex-col gap-1"
+        className={`flex w-full flex-col gap-1${!isPinned && pinned.length > 0 ? " mt-1" : ""}`}
         renderItem={(repo, drag) => (
           <RepoItem
             repo={repo}
-            open={isRepoExpanded(repo)}
+            open={!groupCollapsed && isRepoExpanded(repo)}
             onToggleOpen={() => onToggleRepo(repo)}
             activeThreadId={activeThreadId}
             onThreadSelect={onThreadSelect}
@@ -284,6 +297,8 @@ export function WorkspaceSection({
         )}
       />
     );
+    return <>{renderPart(pinned, true)}{renderPart(regular, false)}</>;
+  };
 
   return (
     <div className="flex w-full flex-col gap-2.5">
@@ -298,7 +313,7 @@ export function WorkspaceSection({
           <button
             type="button"
             aria-label={t("chat.addWorkspace")}
-            title={t("chat.addWorkspace")}
+            title={t("chat.addWorkspaceHint")}
             onClick={onAddWorkspace}
             className="flex size-7 cursor-pointer items-center justify-center rounded-full text-foreground-icon-secondary transition-colors duration-150 hover:bg-background-tertiary-hover/55 hover:text-foreground-icon-primary"
           >
@@ -323,8 +338,20 @@ export function WorkspaceSection({
                 collapsed={collapsedGroups.has(section.id)}
                 onToggle={() => onToggleGroup?.(section.id!)}
               />
-              {!collapsedGroups.has(section.id) &&
-                renderRepoList(section.repos, section.id)}
+              {/* keepMounted: a collapsed group keeps its rows in the DOM so
+                  re-expanding does not recreate the row avatars (a fresh
+                  `<img>` flashes the folder glyph before its first paint).
+                  Thread lists still fold shut inside the hidden rows. */}
+              <SidebarDisclosure
+                expanded={!collapsedGroups.has(section.id)}
+                keepMounted
+              >
+                {renderRepoList(
+                  section.repos,
+                  section.id,
+                  collapsedGroups.has(section.id),
+                )}
+              </SidebarDisclosure>
             </div>
           ),
         )}

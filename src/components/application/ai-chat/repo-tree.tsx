@@ -14,10 +14,12 @@ import Plus from "lucide-react/dist/esm/icons/plus";
 import Trash2 from "lucide-react/dist/esm/icons/trash-2";
 import X from "lucide-react/dist/esm/icons/x";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
+import { WorkspaceAvatar } from "@/components/application/ai-chat/workspace-avatar";
 import { paginateThreads } from "@/components/application/ai-chat/repo-pagination";
 import { ipc } from "@/lib/ipc";
 import { useWorktreeStore } from "@/features/worktree/store";
 import { WorktreeProgressRow } from "@/features/worktree/WorktreeProgressRow";
+import { WorktreeBadgeChips } from "@/components/application/ai-chat/worktree-badge-chips";
 import type { AiChatRepo, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import { useDragSource } from "@/features/chat/split/drag";
 import { sessionFromThreadId } from "@/features/chat/split/store";
@@ -309,7 +311,8 @@ function RepoHeaderRow({
           isDragging && "cursor-grabbing",
         )}
       >
-        {/* One slot, two affordances: folder by default; on row hover it
+        {/* One slot, two affordances: the repo's GitHub owner avatar when its
+            origin remote has one (else the folder glyph); on row hover it
             fades out and the reorder grip fades in (when reorder is
             enabled). Plain click toggles collapse; press-and-move drags. */}
         <span
@@ -319,7 +322,10 @@ function RepoHeaderRow({
           )}
           aria-hidden
         >
-          <Icon className="size-4 text-foreground-icon-secondary" />
+          <WorkspaceAvatar
+            path={repo.path}
+            fallback={<Icon className="size-4 text-foreground-icon-secondary" />}
+          />
         </span>
         {dragHandleProps && (
           <span
@@ -344,6 +350,14 @@ function RepoHeaderRow({
         >
           {repo.label}
         </span>
+        {repo.pinned && (
+          <>
+            <Pin className="ml-1 size-3 shrink-0 text-foreground-icon-secondary" aria-hidden />
+            {/* The glyph is decorative; screen readers hear the state as part
+                of the row button's name. */}
+            <span className="sr-only">{t("chat.workspacePinned")}</span>
+          </>
+        )}
         {repo.labelSuffix && (
           <span className="ws-label-badge ml-1.5 shrink-0">
             {repo.labelSuffix}
@@ -453,20 +467,24 @@ function WorktreeChildRow({
         <span className="min-w-0 flex-1 truncate text-body-2-medium text-text-secondary">
           {repo.label}
         </span>
-        {repo.worktree?.prNumber != null && (
-          <span className="shrink-0 rounded-sm bg-status-purple-background px-1 py-px text-caption-2-medium text-status-purple-text">
-            {t("worktree.prBadge", { number: repo.worktree.prNumber })}
-          </span>
-        )}
-        {missing && (
-          <span
-            className="shrink-0 rounded-sm bg-status-rose-background px-1 py-px text-caption-2-medium text-status-rose-text"
-            title={t("worktree.missingDirectoryHint")}
-          >
-            {t("worktree.missingDirectory")}
-          </span>
-        )}
       </button>
+      {/* Chips are siblings of the toggle button, not children: a plugin badge
+          with onClick is a real <button>, and interactive content must not
+          nest inside one. Order stays label → plugin badges → PR# → 目录已丢失. */}
+      <WorktreeBadgeChips workspaceId={repo.id} />
+      {repo.worktree?.prNumber != null && (
+        <span className="shrink-0 rounded-sm bg-status-purple-background px-1 py-px text-caption-2-medium text-status-purple-text">
+          {t("worktree.prBadge", { number: repo.worktree.prNumber })}
+        </span>
+      )}
+      {missing && (
+        <span
+          className="shrink-0 rounded-sm bg-status-rose-background px-1 py-px text-caption-2-medium text-status-rose-text"
+          title={t("worktree.missingDirectoryHint")}
+        >
+          {t("worktree.missingDirectory")}
+        </span>
+      )}
       {repo.id && onNewSession && (
         <button
           type="button"
@@ -634,16 +652,26 @@ function prefersReducedMotion(): boolean {
 }
 
 /** Height disclosure shared by the sidebar's expandable regions (repo thread
- *  lists, the WORKTREES group): the grid track goes 1fr ⇄ 0fr so the region's
- *  real box grows and shrinks and the rows below are pushed smoothly.
- *  Content stays mounted until the close animation ends (instant unmount
- *  pops; unmount + opacity fade leaves a compositor ghost), then drops out of
- *  the DOM and the a11y tree. Reduced motion cuts straight to the end. */
-function SidebarDisclosure({
+ *  lists, the WORKTREES group, workspace groups): the grid track goes
+ *  1fr ⇄ 0fr so the region's real box grows and shrinks and the rows below
+ *  are pushed smoothly. Content stays mounted until the close animation ends
+ *  (instant unmount pops; unmount + opacity fade leaves a compositor ghost),
+ *  then drops out of the DOM and the a11y tree. Reduced motion cuts straight
+ *  to the end.
+ *
+ *  `keepMounted` is for regions whose rows must keep their DOM identity —
+ *  workspace groups (their row avatars re-decode and flash the folder glyph
+ *  when a remount recreates the `<img>`): once shown, the closed rows stay in
+ *  the DOM behind `inert` + `aria-hidden`. A group that starts collapsed is
+ *  still mounted lazily on its first expand, so never-seen rows cost nothing
+ *  at startup. */
+export function SidebarDisclosure({
   expanded,
+  keepMounted = false,
   children,
 }: {
   expanded: boolean;
+  keepMounted?: boolean;
   children: ReactNode;
 }) {
   const [mounted, setMounted] = useState(expanded);
@@ -652,13 +680,16 @@ function SidebarDisclosure({
       setMounted(true);
       return;
     }
+    // keepMounted only protects rows that have already been shown; it never
+    // force-mounts a group the user has not expanded yet.
+    if (keepMounted) return;
     if (prefersReducedMotion()) {
       setMounted(false);
       return;
     }
     const timeout = window.setTimeout(() => setMounted(false), SIDEBAR_COLLAPSE_MS);
     return () => window.clearTimeout(timeout);
-  }, [expanded]);
+  }, [expanded, keepMounted]);
 
   return (
     <div

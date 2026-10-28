@@ -9,7 +9,7 @@ import type { AiChatRepo, AiChatRepoSection, ThreadAction } from "@/components/a
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { copyText } from "@/lib/clipboard";
 import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
-import { isWeb, pickDirectory } from "@/lib/platform";
+import { isWeb, pickDirectories } from "@/lib/platform";
 import { recentPointerAnchor } from "@/lib/pointer-anchor";
 import { parseDraftSessionKey, sessionKey, useChatStore, sortedWorkspaceGroups } from "./store";
 import { dismissCenterSurfaces } from "./center-surfaces";
@@ -51,13 +51,14 @@ export function useChatSidebar({
     })),
   );
   // Store actions are stable references — one shallow subscription for all.
-  const { selectSession, startNewChat, addWorkspace, reorderWorkspaces, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
+  const { selectSession, startNewChat, addWorkspaces, reorderWorkspaces, setWorkspacePinned, pinSession, archiveSession, setWorkspaceArchived, assignWorkspaceGroup, createWorkspaceGroup, focusTab, closeTab } =
     useChatStore(
       useShallow((s) => ({
         selectSession: s.selectSession,
         startNewChat: s.startNewChat,
-        addWorkspace: s.addWorkspace,
+        addWorkspaces: s.addWorkspaces,
         reorderWorkspaces: s.reorderWorkspaces,
+        setWorkspacePinned: s.setWorkspacePinned,
         pinSession: s.pinSession,
         archiveSession: s.archiveSession,
         setWorkspaceArchived: s.setWorkspaceArchived,
@@ -92,10 +93,18 @@ export function useChatSidebar({
         parents.push(w);
       }
     }
-    return { parentWorkspaces: parents, childrenByParent: children };
+    return {
+      parentWorkspaces: [...parents.filter((w) => w.pinned), ...parents.filter((w) => !w.pinned)],
+      childrenByParent: children,
+    };
   }, [visibleWorkspaces]);
 
   const repos: AiChatRepo[] = useMemo(() => {
+    const groups = sortedWorkspaceGroups(workspaceGroups);
+    const groupIds = new Set(groups.map((group) => group.id));
+    const firstWorkspace = parentWorkspaces.find((w) => !w.groupId || !groupIds.has(w.groupId))
+      ?? groups.map((group) => parentWorkspaces.find((w) => w.groupId === group.id)).find(Boolean)
+      ?? parentWorkspaces[0];
     const sorted = [...sessions].sort((a, b) => {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
@@ -115,6 +124,7 @@ export function useChatSidebar({
       const children = childrenByParent.get(w.id);
       return {
         id: w.id,
+        pinned: w.pinned,
         path: w.path,
         // Worktree 子行的主名是分支名（mockup 场景 1），目录名进 tooltip。
         label: alias || (meta?.branch ?? w.name),
@@ -155,8 +165,8 @@ export function useChatSidebar({
         ],
       };
     };
-    return parentWorkspaces.map((w, index) => buildRepo(w, index === 0));
-  }, [parentWorkspaces, childrenByParent, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t]);
+    return parentWorkspaces.map((w) => buildRepo(w, w.id === firstWorkspace?.id));
+  }, [parentWorkspaces, childrenByParent, workspaceGroups, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t]);
   // 工作区二级分类: bucket repos by their workspace's group assignment.
   // Ungrouped repos come first (no header), then groups in settings order.
   // Empty groups stay in the tree — the sidebar renders them like populated
@@ -180,9 +190,10 @@ export function useChatSidebar({
       }
     });
     const result: AiChatRepoSection[] = [];
-    if (ungrouped.length > 0) result.push({ id: null, name: "", repos: ungrouped });
+    const pinnedFirst = (items: AiChatRepo[]) => [...items.filter((r) => r.pinned), ...items.filter((r) => !r.pinned)];
+    if (ungrouped.length > 0) result.push({ id: null, name: "", repos: pinnedFirst(ungrouped) });
     groups.forEach((group) => {
-      result.push({ id: group.id, name: group.name, repos: byGroup.get(group.id) ?? [] });
+      result.push({ id: group.id, name: group.name, repos: pinnedFirst(byGroup.get(group.id) ?? []) });
     });
     return result.some((s) => s.id !== null) ? result : undefined;
   }, [repos, parentWorkspaces, workspaceGroups]);
@@ -205,21 +216,23 @@ export function useChatSidebar({
     return result;
   }, [workspaces, archivedIds, workspaceAliases]);
 
-  /** 「添加工作区」：选目录并登记。返回选中的路径（取消 / web 模式 / 登记
-   *  失败返回 null），调用方据此接下一步——「新建会话」在没有工作区时要接着
-   *  把会话开出来，否则用户点的是新会话，拿到的只有一次选目录。登记失败时
-   *  store 已经把错误放进错误条，这里只负责不继续往下走。 */
+  /** 「添加工作区」：选目录并登记（对话框支持一次多选多个文件夹，逐个登记，
+   *  单个失败不影响其余）。返回首个登记成功的路径（取消 / web 模式 / 全部失败
+   *  返回 null），调用方据此接下一步——「新建会话」在没有工作区时要接着把会话
+   *  开出来，否则用户点的是新会话，拿到的只有一次选目录。登记失败时 store 已经
+   *  把错误放进错误条，这里只负责不继续往下走。 */
   const handleAddWorkspace = useCallback(async (): Promise<string | null> => {
     // 移动端/网页访问模式没有目录选择器，侧栏也不渲染添加入口。
     if (isWeb) return null;
     try {
-      const path = await pickDirectory(t("chat.addWorkspace"));
-      if (!path) return null;
-      return (await addWorkspace(path)) ? path : null;
+      const paths = await pickDirectories(t("chat.addWorkspace"));
+      if (paths.length === 0) return null;
+      const added = await addWorkspaces(paths);
+      return added[0] ?? null;
     } catch {
       return null;
     }
-  }, [t, addWorkspace]);
+  }, [t, addWorkspaces]);
 
   const handleThreadSelect = useCallback(
     (id: string) => {
@@ -299,6 +312,12 @@ export function useChatSidebar({
       void setWorkspaceArchived(workspaceId, archived);
     },
     [workspaces, setWorkspaceArchived, setDialog],
+  );
+  const handleSetWorkspacePinned = useCallback(
+    (workspaceId: string, pinned: boolean) => {
+      void setWorkspacePinned(workspaceId, pinned);
+    },
+    [setWorkspacePinned],
   );
   // 右键菜单/WORKTREES 分组 ＋：打开创建对话框（目标是该工作区所在仓库——
   // worktree 行上触发时落到它的父工作区）。
@@ -424,6 +443,7 @@ export function useChatSidebar({
     handleRemoveWorkspace,
     handleWorkspaceAlias,
     handleSetWorkspaceArchived,
+    handleSetWorkspacePinned,
     handleNewSession,
     handleNewSessionInWorkspace,
     handleNewBrowser,
