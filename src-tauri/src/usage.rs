@@ -6,8 +6,15 @@
 //! the numbers are the engines' own reports rather than estimates.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tauri::Emitter;
 
+/// Incremented synchronously at the start of `usage_clear` before its
+/// `spawn_blocking` task is scheduled. Any `usage_record` call that entered
+/// before the clear observes an older generation when it acquires the writer
+/// lock and drops its stale insert instead of resurrecting pre-clear usage.
+static USAGE_CLEAR_GEN: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageEntry {
@@ -43,10 +50,47 @@ pub struct UsageRow {
     pub requests: i64,
 }
 
+fn record_with_generation(
+    conn: &rusqlite::Connection,
+    entry: UsageEntry,
+    call_gen: u64,
+) -> Result<bool, String> {
+    if call_gen != USAGE_CLEAR_GEN.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO usage_ledger
+           (ts, engine, model, session_id, workspace_path,
+            input_tokens, output_tokens, cache_read, cache_write, duration_ms, reports)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            entry.ts,
+            entry.engine,
+            entry.model.unwrap_or_default(),
+            entry.session_id,
+            entry.workspace_path,
+            entry.input,
+            entry.output,
+            entry.cache_read,
+            entry.cache_write,
+            entry.duration_ms,
+            entry.reports.max(1),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn clear_ledger(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute("DELETE FROM usage_ledger", [])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Append one finished turn. A turn with no tokens (interrupted before the
 /// engine reported) is not a ledger row — it would only add noise.
 #[tauri::command]
-pub fn usage_record(
+pub async fn usage_record(
     app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     entry: UsageEntry,
@@ -54,31 +98,18 @@ pub fn usage_record(
     if entry.input + entry.output + entry.cache_read + entry.cache_write == 0 {
         return Ok(());
     }
-    {
-        let conn = state.db.0.lock();
-        conn.execute(
-            "INSERT INTO usage_ledger
-               (ts, engine, model, session_id, workspace_path,
-                input_tokens, output_tokens, cache_read, cache_write, duration_ms, reports)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            rusqlite::params![
-                entry.ts,
-                entry.engine,
-                entry.model.unwrap_or_default(),
-                entry.session_id,
-                entry.workspace_path,
-                entry.input,
-                entry.output,
-                entry.cache_read,
-                entry.cache_write,
-                entry.duration_ms,
-                entry.reports.max(1),
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+    let call_gen = USAGE_CLEAR_GEN.load(Ordering::SeqCst);
+    let db = Arc::clone(&state.db);
+    let inserted = tauri::async_runtime::spawn_blocking(move || {
+        let conn = db.0.lock();
+        record_with_generation(&conn, entry, call_gen)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if inserted {
+        // The page re-reads on this; the ledger is the only writer.
+        let _ = app.emit("usage://changed", ());
     }
-    // The page re-reads on this; the ledger is the only writer.
-    let _ = app.emit("usage://changed", ());
     Ok(())
 }
 
@@ -87,13 +118,18 @@ pub fn usage_record(
 /// `days` calendar days. `tz_offset_minutes` is the caller's UTC offset so
 /// buckets match the calendar the user is looking at.
 #[tauri::command]
-pub fn usage_summary(
+pub async fn usage_summary(
     state: tauri::State<'_, crate::AppState>,
     days: u32,
     tz_offset_minutes: i32,
 ) -> Result<Vec<UsageRow>, String> {
-    let conn = state.db.0.lock();
-    summarize(&conn, days, tz_offset_minutes).map_err(|e| e.to_string())
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db.read();
+        summarize(&conn, days, tz_offset_minutes).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The ledger read behind `usage_summary`, split out so the day-window logic
@@ -151,11 +187,15 @@ fn summarize(
 /// Drop the whole ledger. The page offers this as an explicit reset; nothing
 /// else reads the table.
 #[tauri::command]
-pub fn usage_clear(state: tauri::State<'_, crate::AppState>) -> Result<(), String> {
-    let conn = state.db.0.lock();
-    conn.execute("DELETE FROM usage_ledger", [])
-        .map_err(|e| e.to_string())?;
-    Ok(())
+pub async fn usage_clear(state: tauri::State<'_, crate::AppState>) -> Result<(), String> {
+    USAGE_CLEAR_GEN.fetch_add(1, Ordering::SeqCst);
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db.0.lock();
+        clear_ledger(&conn)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
@@ -250,5 +290,40 @@ mod tests {
             10,
             "a wider window is no longer clamped to 365 days",
         );
+    }
+
+    #[test]
+    fn stale_usage_record_captured_before_clear_does_not_resurrect_after_clear() {
+        let conn = ledger();
+        let now = now_ms();
+        let entry = || UsageEntry {
+            ts: now,
+            engine: "omp".into(),
+            model: Some("m".into()),
+            session_id: None,
+            workspace_path: None,
+            input: 42,
+            output: 10,
+            cache_read: 0,
+            cache_write: 0,
+            duration_ms: Some(100),
+            reports: 1,
+        };
+
+        // Call A enters usage_record before usage_clear, but acquires the writer
+        // lock only after usage_clear has bumped USAGE_CLEAR_GEN and wiped rows.
+        let gen_before_clear = USAGE_CLEAR_GEN.load(Ordering::SeqCst);
+        USAGE_CLEAR_GEN.fetch_add(1, Ordering::SeqCst);
+        clear_ledger(&conn).unwrap();
+
+        let inserted = record_with_generation(&conn, entry(), gen_before_clear).unwrap();
+        assert!(!inserted, "stale pre-clear record must be dropped");
+        assert!(summarize(&conn, 0, 0).unwrap().is_empty());
+
+        // A fresh record after clear still lands normally.
+        let gen_after_clear = USAGE_CLEAR_GEN.load(Ordering::SeqCst);
+        let inserted = record_with_generation(&conn, entry(), gen_after_clear).unwrap();
+        assert!(inserted);
+        assert_eq!(summarize(&conn, 0, 0).unwrap().len(), 1);
     }
 }
