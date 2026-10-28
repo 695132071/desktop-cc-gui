@@ -376,7 +376,9 @@ function ModelGroupList({
         <div key={group.key || "__flat__"} className="flex w-full flex-col">
           {group.key && (
             <span className="sticky top-0 z-10 bg-background-primary-default px-2 pt-1.5 pb-0.5 text-body-2-medium text-text-tertiary">
-              {group.key}
+              {group.key === "enterprise"
+                ? t("chat.modelGroupEnterprise")
+                : group.key}
             </span>
           )}
           {group.rows.map((model) => (
@@ -426,11 +428,17 @@ function useOrderedModelGroups(
     // known).
     const layered = groups.length > 0 && groups[0].key !== "";
     if (layered) {
-      const ordered = [...groups].sort(
-        (a, b) =>
+      const ordered = [...groups].sort((a, b) => {
+        const aIsEnterprise = a.key === "enterprise";
+        const bIsEnterprise = b.key === "enterprise";
+        if (aIsEnterprise !== bIsEnterprise) {
+          return aIsEnterprise ? 1 : -1;
+        }
+        return (
           Number(b.rows.some((m) => m.id === selectedModelId)) -
-          Number(a.rows.some((m) => m.id === selectedModelId)),
-      );
+          Number(a.rows.some((m) => m.id === selectedModelId))
+        );
+      });
       return { groups: ordered, empty: filtered.length === 0 };
     }
     const flat = [...filtered].sort(
