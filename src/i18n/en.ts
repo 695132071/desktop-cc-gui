@@ -315,6 +315,7 @@ export const en: Messages = {
     toolCallArgs: "Arguments",
     toolCallExpand: "Expand tool arguments",
     toolCallCollapse: "Collapse tool arguments",
+    toolFileOpen: "Open {{name}}",
     toolResult: "Output",
     toolFailed: "Failed",
     diffEmpty: "No changes",

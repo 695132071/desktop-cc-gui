@@ -300,6 +300,7 @@ export const zh = {
     toolCallArgs: "参数",
     toolCallExpand: "展开工具参数",
     toolCallCollapse: "收起工具参数",
+    toolFileOpen: "打开 {{name}}",
     toolResult: "执行结果",
     toolFailed: "失败",
     diffEmpty: "无修改内容",

@@ -1,4 +1,6 @@
+import { useMemo } from "react";
 import { useFilesStore } from "@/features/files/store";
+import { resolveFilePath } from "@/lib/fileLinks";
 import { resolveChatFileLink } from "./file-link-resolution";
 
 /**
@@ -17,11 +19,28 @@ export function openChatFilePath(rawPath: string, workspacePath: string): void {
   });
 }
 
-/** Bound variant for render paths that hand a callback down (tool chips).
- *  Returns null without a workspace root: a relative tool path has nothing to
- *  anchor on, and an affordance that always no-ops is worse than no
- *  affordance. */
-export function useOpenChatFilePath(workspacePath: string) {
+/** Opener bound to one session workspace, handed down to the tool chips. */
+export interface ChatFileOpener {
+  /** False for paths the resolver rejects outright (`~/`, `../`): a chip for
+   *  them would be a button that never opens anything. */
+  canOpen: (rawPath: string) => boolean;
+  open: (rawPath: string) => void;
+}
+
+/** Null without a workspace root: a relative tool path has nothing to anchor
+ *  on, and an affordance that always no-ops is worse than no affordance.
+ *  Memoized on the root — the opener reaches memoized tool rows, and a fresh
+ *  object per render would re-render every settled row on each stream flush. */
+export function useChatFileOpener(workspacePath: string): ChatFileOpener | null {
   const root = workspacePath.trim();
-  return root ? (rawPath: string) => openChatFilePath(rawPath, root) : null;
+  return useMemo(
+    () =>
+      root
+        ? {
+            canOpen: (rawPath: string) => resolveFilePath(rawPath, root) !== null,
+            open: (rawPath: string) => openChatFilePath(rawPath, root),
+          }
+        : null,
+    [root],
+  );
 }

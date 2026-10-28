@@ -7,7 +7,7 @@ import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
 import { cx } from "@/utils/cx";
 import { StepRow, type TaskListChip } from "@/components/application/task-list/task-list";
 import { getFileTreeIconSvg } from "@/features/files/fileIcons";
-import { useOpenChatFilePath } from "@/features/chat/open-chat-file";
+import { useChatFileOpener, type ChatFileOpener } from "@/features/chat/open-chat-file";
 import { markToolKeys, toolEntranceKey, type ProcessItem } from "./timeline-rows";
 import { ToolPayloadViewer } from "./ToolPayloadViewer";
 import { useLiveReveal } from "./use-live-reveal";
@@ -30,13 +30,28 @@ function toolTypeKey(text: string): string {
   return "toolTypeTool";
 }
 
+/** Tools whose path argument always names a file, or always a folder. The
+ * rest (grep's path can be either) fall back to the extension heuristic. */
+const FILE_TARGET_TOOLS = new Set(["read", "write", "edit", "multiedit", "notebookedit", "read_file", "write_file", "edit_file"]);
+const FOLDER_TARGET_TOOLS = new Set(["ls", "glob", "list_directory"]);
+
+function targetIsDir(tool: string, name: string): boolean {
+  const key = tool.trim().toLowerCase();
+  if (FILE_TARGET_TOOLS.has(key)) return false; // `Makefile`, `Dockerfile`
+  if (FOLDER_TARGET_TOOLS.has(key)) return true; // `release/v1.2`
+  // Same heuristic as the composer file tags: extension-less = folder.
+  return !name.includes(".");
+}
+
 /** File chip for a tool call's target path. Glob patterns, URLs, and
  * path-less calls get no chip — a pattern is not a file you can open, and a
  * URL's last segment (search targets like `artifact://0` → "0") would render
  * as a meaningless folder chip. */
 function fileChipFor(
   path: string | null | undefined,
-  onOpen?: ((path: string) => void) | null,
+  tool: string,
+  opener: ChatFileOpener | null | undefined,
+  t: TFunction,
 ): TaskListChip | null {
   if (!path || /[*?{}[\]]/.test(path) || path.includes("://")) return null;
   // Read selectors (`file.ts:301-591:raw`, `img.svg:img`) are read modifiers,
@@ -53,8 +68,7 @@ function fileChipFor(
   const target = segments.join(":");
   const name = target.split(/[\\/]/).pop() ?? "";
   if (!name || name === "." || name === "..") return null;
-  // Same heuristic as the composer file tags: extension-less = folder.
-  const isDir = !name.includes(".");
+  const isDir = targetIsDir(tool, name);
   return {
     label: name,
     icon: (
@@ -64,14 +78,15 @@ function fileChipFor(
         dangerouslySetInnerHTML={{ __html: getFileTreeIconSvg(name, isDir) }}
       />
     ),
-    // Folders have no file to open; every other target opens in the center
-    // editor, which is also where image targets land (ImageFileView +
-    // lightbox), so clicking a screenshot's chip previews it.
-    ...(onOpen && !isDir
+    // Folders have no file to open, and `~/` / `../` targets never resolve;
+    // every other target opens in the center editor, which is also where
+    // image targets land (ImageFileView + lightbox), so clicking a
+    // screenshot's chip previews it.
+    ...(opener && !isDir && opener.canOpen(target)
       ? {
           title: target,
-          selectLabel: name,
-          onSelect: () => onOpen(target),
+          selectLabel: t("chat.toolFileOpen", { name }),
+          onSelect: () => opener.open(target),
         }
       : {}),
   };
@@ -128,7 +143,7 @@ const FrozenStepRow = memo(function FrozenStepRow({
   first,
   last,
   index,
-  onOpenPath,
+  fileOpener,
 }: {
   play: boolean;
   text: string;
@@ -139,13 +154,13 @@ const FrozenStepRow = memo(function FrozenStepRow({
   last: boolean;
   index: number;
   /** Opens a tool call's target file; null disables the chip affordance. */
-  onOpenPath?: ((path: string) => void) | null;
+  fileOpener?: ChatFileOpener | null;
 }) {
   const reduceRef = useRef(!play);
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const hasPayload = args != null || result != null;
-  const fileChip = fileChipFor(path, onOpenPath);
+  const fileChip = fileChipFor(path, text, fileOpener, t);
   const step = {
     label: text,
     chips: [
@@ -370,7 +385,7 @@ function ProcessDisclosureBody({
   processId,
   seenTools,
   searchTarget,
-  onOpenPath,
+  fileOpener,
 }: {
   items: ProcessItem[];
   expanded: boolean;
@@ -379,7 +394,7 @@ function ProcessDisclosureBody({
   processId: number;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
-  onOpenPath?: ((path: string) => void) | null;
+  fileOpener?: ChatFileOpener | null;
 }) {
   const { t } = useTranslation();
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -448,7 +463,7 @@ function ProcessDisclosureBody({
                   result={call.result}
                   first={j === 0}
                   last={j === section.calls.length - 1}
-                  onOpenPath={onOpenPath}
+                  fileOpener={fileOpener}
                 />
               );
             })}
@@ -506,7 +521,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
   workspacePath?: string;
 }) {
   const { t } = useTranslation();
-  const openFile = useOpenChatFilePath(workspacePath);
+  const fileOpener = useChatFileOpener(workspacePath);
   const hasLiveThinking = items.some((item) => item.type === "thinking" && item.live);
   const hasThinking = items.some((item) => item.type === "thinking");
   const { expanded, toggleExpanded } = useProcessExpansion(
@@ -592,7 +607,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
               processId={processId}
               seenTools={seenTools}
               searchTarget={searchTarget}
-              onOpenPath={openFile}
+              fileOpener={fileOpener}
             />
           ) : null}
         </div>

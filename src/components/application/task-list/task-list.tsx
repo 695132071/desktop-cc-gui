@@ -26,7 +26,8 @@ export interface TaskListChip {
   onSelect?: () => void;
   /** Native tooltip for the selectable chip (usually the full path). */
   title?: string;
-  /** Accessible name; the visible label is a truncated file name. */
+  /** Accessible name naming the action (e.g. "Open a.png"); the visible label
+   *  is only a truncated file name. */
   selectLabel?: string;
 }
 

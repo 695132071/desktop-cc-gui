@@ -300,6 +300,7 @@ export const ko: Messages = {
     toolCallArgs: "인수",
     toolCallExpand: "도구 인수 펼치기",
     toolCallCollapse: "도구 인수 접기",
+    toolFileOpen: "{{name}} 열기",
     toolResult: "출력",
     toolFailed: "실패",
     diffEmpty: "변경 사항 없음",
