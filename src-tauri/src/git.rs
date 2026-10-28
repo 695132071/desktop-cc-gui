@@ -387,7 +387,29 @@ pub async fn git_tree_status(levels: Vec<GitTreeLevel>) -> Result<GitTreeStatus,
 }
 
 pub(crate) fn open_repo(path: &str) -> Result<Repository, String> {
-    Repository::discover(path).map_err(|_| "NOT_A_REPO".to_string())
+    Repository::discover(path).map_err(map_open_repo_error)
+}
+
+/// libgit2 打开仓库失败的分类。
+///
+/// 旧实现把**所有**错误都报成 `NOT_A_REPO`：Windows 上常见的「所有权不受
+/// 信任」（仓库由其它用户/管理员创建）、路径过长、仓库损坏、无权限等，
+/// 在界面上全部被误报成「不是 Git 仓库」，用户无法判断真正原因。
+/// 这里按错误类型分流：确实不是仓库才给 `NOT_A_REPO`（前端据此显示空态），
+/// 其余错误保留可操作的具体信息。
+fn map_open_repo_error(error: git2::Error) -> String {
+    if error.code() == git2::ErrorCode::NotFound {
+        return "NOT_A_REPO".to_string();
+    }
+    let message = error.message().trim().to_string();
+    // libgit2 的属主校验以 GIT_EOWNER 失败（git2 的 `ErrorCode::Owner`）；
+    // 提示语只作兜底，措辞变了也不会退回成通用失败。
+    if error.code() == git2::ErrorCode::Owner
+        || message.to_lowercase().contains("not owned by current user")
+    {
+        return format!("GIT_UNSAFE_REPO:{message}");
+    }
+    format!("GIT_OPEN_FAILED:{message}")
 }
 
 fn status_label(status: git2::Status) -> &'static str {
@@ -629,15 +651,28 @@ fn ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     repo.graph_ahead_behind(local_oid, upstream_oid).ok()
 }
 
+/// Branch label for the status header. An unborn HEAD (fresh `git init`, no
+/// commit yet) fails `repo.head()` but still points at its branch
+/// symbolically — show that name rather than a bare "HEAD".
+fn head_branch_label(repo: &Repository) -> String {
+    if let Some(name) = repo.head().ok().and_then(|h| h.shorthand().map(str::to_string)) {
+        return name;
+    }
+    repo.find_reference("HEAD")
+        .ok()
+        .and_then(|head| {
+            head.symbolic_target()
+                .and_then(|target| target.strip_prefix("refs/heads/"))
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
 /// Sync body of `git_status` — libgit2 walks can touch thousands of files,
 /// far too heavy for the IPC main thread.
 fn git_status_blocking(path: &str) -> Result<GitStatus, String> {
     let repo = open_repo(path)?;
-    let branch = repo
-        .head()
-        .ok()
-        .and_then(|h| h.shorthand().map(str::to_string))
-        .unwrap_or_else(|| "HEAD".to_string());
+    let branch = head_branch_label(&repo);
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let index = repo.index().map_err(|e| e.to_string())?;
@@ -1307,6 +1342,41 @@ pub(crate) fn git_checkout_blocking(path: &str, branch: &str) -> Result<(), Stri
             .set_head_detached(object.id())
             .map_err(|e| e.to_string()),
     }
+}
+
+/// `git init` for a workspace the changes panel reported as NOT_A_REPO. The
+/// initial branch follows the user's `init.defaultBranch`, like the CLI.
+/// Unlike the other git commands this creates a repository where none
+/// exists, so it keeps to the registered workspaces like the file tree's
+/// create commands — the remote bridge routes here too.
+#[tauri::command]
+pub fn git_init(
+    db: tauri::State<'_, std::sync::Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    crate::files::ensure_allowed(&path, &db)?;
+    init_repository(&path)
+}
+
+fn init_repository(path: &str) -> Result<(), String> {
+    let dir = Path::new(path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    match Repository::discover(dir) {
+        // The panel's NOT_A_REPO can be stale (`git init` ran in a terminal
+        // meanwhile); a nested repository would hide the outer one's changes.
+        Ok(_) => return Ok(()),
+        // Anything but "none found" — e.g. libgit2's ownership check on a
+        // repository cloned by another account — may hide one above us.
+        Err(e) if e.code() != git2::ErrorCode::NotFound => return Err(e.message().to_string()),
+        Err(_) => {}
+    }
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.mkdir(false).mkpath(false).no_reinit(true);
+    Repository::init_opts(dir, &opts)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2182,6 +2252,63 @@ mod tests {
     }
 
     #[test]
+    fn init_turns_a_plain_directory_into_a_repository() {
+        let scratch = Scratch::new();
+        std::fs::write(scratch.0.join("a.txt"), "a\n").unwrap();
+        let path = scratch.0.to_string_lossy().into_owned();
+        assert_eq!(git_status_blocking(&path).unwrap_err(), "NOT_A_REPO");
+
+        init_repository(&path).unwrap();
+
+        let status = git_status_blocking(&path).unwrap();
+        let untracked: Vec<_> = status.untracked.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(untracked, vec!["a.txt"]);
+    }
+
+    #[test]
+    fn status_names_the_unborn_branch_of_a_fresh_repository() {
+        let scratch = Scratch::new();
+        let repo = Repository::init(&scratch.0).unwrap();
+        // Whatever init.defaultBranch the machine has, the label must be
+        // that branch rather than the bare "HEAD" an unborn head reads as.
+        let expected = repo
+            .find_reference("HEAD")
+            .unwrap()
+            .symbolic_target()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .unwrap()
+            .to_string();
+
+        let status = git_status_blocking(scratch.0.to_str().unwrap()).unwrap();
+
+        assert_eq!(status.branch, expected);
+        assert_ne!(status.branch, "HEAD");
+    }
+
+    #[test]
+    fn init_inside_an_existing_repository_leaves_it_alone() {
+        let scratch = Scratch::new();
+        Repository::init(&scratch.0).unwrap();
+        let nested = scratch.0.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        init_repository(nested.to_str().unwrap()).unwrap();
+
+        // A stale NOT_A_REPO must not nest a second repository that would
+        // hide the outer one's changes under `sub/`.
+        assert!(!nested.join(".git").exists());
+    }
+
+    #[test]
+    fn init_never_creates_a_missing_directory() {
+        let scratch = Scratch::new();
+        let missing = scratch.0.join("gone");
+
+        assert!(init_repository(missing.to_str().unwrap()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn branches_list_locals_then_remote_tracking_skipping_origin_head() {
         let scratch = Scratch::new();
         let origin_path = scratch.0.join("origin");
@@ -2390,5 +2517,63 @@ mod tests {
             std::fs::read_to_string(scratch.0.join("a.txt")).unwrap(),
             "a\n"
         );
+    }
+    #[test]
+    fn open_repo_error_mapping_keeps_real_causes() {
+        assert_eq!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::NotFound,
+                git2::ErrorClass::Repository,
+                "could not find repository"
+            )),
+            "NOT_A_REPO"
+        );
+        // libgit2 的属主校验失败：GIT_EOWNER + GIT_ERROR_CONFIG（repository.c
+        // validate_ownership）。按错误码判定，不依赖提示语措辞。
+        assert_eq!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::Owner,
+                git2::ErrorClass::Config,
+                "repository path 'C:/x' is owned by someone else"
+            )),
+            "GIT_UNSAFE_REPO:repository path 'C:/x' is owned by someone else"
+        );
+        // 错误码丢失时（例如经过别的包装）仍按 libgit2 的提示语兜底。
+        assert!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::GenericError,
+                git2::ErrorClass::Os,
+                "repository path 'C:/x' is not owned by current user"
+            ))
+            .starts_with("GIT_UNSAFE_REPO:")
+        );
+        assert!(
+            map_open_repo_error(git2::Error::new(
+                git2::ErrorCode::GenericError,
+                git2::ErrorClass::Os,
+                "path too long"
+            ))
+            .starts_with("GIT_OPEN_FAILED:")
+        );
+    }
+
+    #[test]
+    fn open_repo_non_repo_is_not_a_repo() {
+        let scratch = Scratch::new();
+        match open_repo(scratch.0.to_str().unwrap()) {
+            Err(error) => assert_eq!(error, "NOT_A_REPO"),
+            Ok(_) => panic!("plain directory should not open as a repository"),
+        }
+    }
+
+    /// 中文/空格路径不应被误判为「不是仓库」。
+    #[test]
+    fn open_repo_supports_unicode_paths() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("中文 目录");
+        let repo = Repository::init(&path).unwrap();
+        commit_file(&repo, "a.txt", "a\n");
+        let opened = open_repo(path.to_str().unwrap()).expect("unicode path opens");
+        assert!(opened.workdir().is_some());
     }
 }
