@@ -817,7 +817,17 @@ pub(super) async fn dispatch(
         // The web bridge has no OS pasteboard to read (and browsers expose no
         // file path to page JavaScript): pasted files stay limited to the
         // flavors the paste event itself carried.
-        "clipboard_file_paths" => ser(Ok::<Vec<String>, String>(Vec::new())),
+        "clipboard_file_snapshot" => ser(Ok::<crate::clipboard::ClipboardFileSnapshot, String>(
+            crate::clipboard::ClipboardFileSnapshot {
+                paths: Vec::new(),
+                change_count: None,
+            },
+        )),
+        // No generation either: the tree then always pastes its own item.
+        "clipboard_change_count" => ser(Ok::<Option<u64>, String>(None)),
+        // Same reason: nothing to write. The tab keeps the in-app tree
+        // clipboard, so Copy/Paste inside the tree still works.
+        "clipboard_set_file_paths" => ser(Ok::<(), String>(())),
         // history
         "list_sessions" => ser(crate::history::reader::list_sessions(app.state()).await),
         "list_archived_sessions" => {
@@ -1035,6 +1045,15 @@ pub(super) async fn dispatch(
             )
             .await)
         }
+        // The clipboard is the client machine's, not the host's: a LAN
+        // browser tab has no file paths to hand over, so paste reports an
+        // empty file list and the tree falls back to its own clipboard.
+        "paste_clipboard_items" => ser(Ok::<crate::files::PasteClipboardResult, String>(
+            crate::files::PasteClipboardResult {
+                created: Vec::new(),
+                failed: Vec::new(),
+            },
+        )),
         "search_text" => {
             let a: SearchTextArgs = parse_args(&raw)?;
             ser(crate::files::search_text(app.state(), a.path, a.query).await)

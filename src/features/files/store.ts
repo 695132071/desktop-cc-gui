@@ -121,6 +121,12 @@ export function parentPath(path: string): string {
 export interface TreeClipboard {
   path: string;
   isDir: boolean;
+  /** OS clipboard generation read right after this item's Copy tried to put
+   *  it on the system clipboard, whether or not that write landed. `null`:
+   *  the platform keeps no generation; absent: not known. Rename remaps
+   *  `path` and keeps this, so Paste can tell the item is still the newest
+   *  copy (`choosePasteSource`). */
+  osChangeCount?: number | null;
 }
 
 export interface OpenFileState {
@@ -653,7 +659,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       loadingDirs: remap(s.loadingDirs),
       dirErrors: remap(s.dirErrors),
       selectedPath: s.selectedPath ? mapPath(s.selectedPath) : s.selectedPath,
-      clipboard: s.clipboard ? { ...s.clipboard, path: mapPath(s.clipboard.path) } : s.clipboard,
+      // Keep the object unless its own path moved: a Copy whose OS write is
+      // still in flight records its generation onto that same object.
+      clipboard:
+        s.clipboard && mapPath(s.clipboard.path) !== s.clipboard.path
+          ? { ...s.clipboard, path: mapPath(s.clipboard.path) }
+          : s.clipboard,
       repositories: remap(s.repositories),
       fileColors: remap(s.fileColors),
     }));

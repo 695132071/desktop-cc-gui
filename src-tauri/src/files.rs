@@ -110,18 +110,17 @@ fn allowed_roots(db: &crate::db::Db) -> Vec<PathBuf> {
 }
 
 pub(crate) fn ensure_allowed(path: &str, db: &crate::db::Db) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    // No trim: a trailing-space filename is a real, distinct path. Only a
+    // whitespace-only input is rejected as empty.
+    if path.trim().is_empty() {
         return Err("empty path".to_string());
     }
-    let resolved = canonicalize_lenient(Path::new(trimmed))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let roots = allowed_roots(db);
     if roots.iter().any(|root| resolved.starts_with(root)) {
         Ok(resolved)
     } else {
-        Err(format!(
-            "path is outside the registered workspaces: {trimmed}"
-        ))
+        Err(format!("path is outside the registered workspaces: {path}"))
     }
 }
 
@@ -140,7 +139,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// a directory, otherwise its parent (granting a single file would not cover
 /// its siblings, which is never what the file-tree user wants).
 fn grant_dir_for(path: &str) -> Result<PathBuf, String> {
-    let resolved = canonicalize_lenient(Path::new(path.trim()))?;
+    let resolved = canonicalize_lenient(Path::new(path))?;
     let dir = if resolved.is_dir() {
         resolved
     } else {
@@ -462,7 +461,11 @@ fn copy_destination_name(source: &Path, is_dir: bool, counter: u32) -> Result<St
     })
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+fn copy_dir_recursive_with(
+    src: &Path,
+    dst: &Path,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
+) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries {
@@ -476,10 +479,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             return Err(format!("cannot copy symlink {}", src_path.display()));
         }
         if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
+            copy_dir_recursive_with(&src_path, &dst_path, copy_file)?;
         } else {
-            std::fs::copy(&src_path, &dst_path)
-                .map_err(|e| format!("copy {}: {e}", src_path.display()))?;
+            copy_file(&src_path, &dst_path)?;
         }
     }
     Ok(())
@@ -488,11 +490,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 /// Copy `source` into `target_dir`, picking a collision-free destination
 /// (`prefer_original_name` keeps the plain name when it is free — paste;
 /// duplicates always take the " copy" suffix). Returns the destination.
-fn copy_item_into_dir(
+fn copy_item_into_dir_with(
     source: &Path,
     is_dir: bool,
     target_dir: &Path,
     prefer_original_name: bool,
+    copy_file: &mut impl FnMut(&Path, &Path) -> Result<u64, String>,
 ) -> Result<PathBuf, String> {
     if is_dir && target_dir.starts_with(source) {
         return Err("cannot paste a folder into itself or its descendant".to_string());
@@ -511,13 +514,176 @@ fn copy_item_into_dir(
             .find(|candidate| !candidate.exists())
             .ok_or_else(|| "too many copies exist".to_string())?;
     }
+    // A unique staged name isolates concurrent copies; only this operation's
+    // temporary item is ever cleaned up. It does not embed the source name:
+    // a long name plus the suffix would exceed the 255-unit name limit and
+    // fail a copy whose real destination fits.
+    let temporary = target_dir.join(format!(".ccgui-copying-{}", uuid::Uuid::new_v4()));
     if is_dir {
-        copy_dir_recursive(source, &destination)?;
+        std::fs::create_dir(&temporary)
+            .map_err(|error| format!("mkdir {}: {error}", temporary.display()))?;
+    }
+    let copy_result = if is_dir {
+        copy_dir_recursive_with(source, &temporary, copy_file)
     } else {
-        std::fs::copy(source, &destination)
-            .map_err(|e| format!("copy {}: {e}", source.display()))?;
+        copy_file(source, &temporary).map(|_| ())
+    };
+    if let Err(error) = copy_result {
+        return Err(remove_partial_copy(&temporary, is_dir, error));
+    }
+    if let Err(error) = publish_copy(&temporary, &destination) {
+        let error = format!("rename {}: {error}", destination.display());
+        return Err(remove_partial_copy(&temporary, is_dir, error));
     }
     Ok(destination)
+}
+
+/// Publish a complete staged item without replacing a destination that
+/// appeared while it was being copied. All staging paths are siblings of the
+/// destination, so the rename stays on one filesystem.
+fn publish_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish_copy_with(from, to, rename_exclusive)
+}
+
+/// Some filesystems have no exclusive rename: exFAT on macOS answers
+/// `RENAME_EXCL` with ENOTSUP, and network or FUSE mounts on Linux may reject
+/// `RENAME_NOREPLACE` with EINVAL. Duplicate and paste must keep working
+/// there, so the fallback checks the destination and then renames; a
+/// destination created in that narrow window can still be replaced, which is
+/// the best such a filesystem offers.
+fn publish_copy_with(
+    from: &Path,
+    to: &Path,
+    exclusive: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match exclusive(from, to) {
+        Err(error) if exclusive_rename_unsupported(&error) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
+            }
+            std::fs::rename(from, to)
+        }
+        result => result,
+    }
+}
+
+#[cfg(unix)]
+fn exclusive_rename_unsupported(error: &std::io::Error) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EINVAL, libc::ENOSYS].contains(&code)
+    })
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` works on every Windows
+/// filesystem, so there is nothing to fall back from.
+#[cfg(windows)]
+fn exclusive_rename_unsupported(_error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Without MOVEFILE_REPLACE_EXISTING, MoveFileExW refuses to replace an
+    // existing file; existing directories are rejected either way.
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: both NUL-terminated paths are alive for the call; RENAME_EXCL
+    // asks the host filesystem to reject an existing destination atomically.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("copy path contains a NUL byte"))?;
+    // SAFETY: AT_FDCWD resolves both relative paths against this process's
+    // unchanged working directory. Absolute staging paths are used in practice.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn remove_partial_copy(path: &Path, is_dir: bool, error: String) -> String {
+    let cleanup = if is_dir {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    match cleanup {
+        Ok(()) => error,
+        // A copy may fail before creating its temporary file. There is no
+        // partial item to report in that case.
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => error,
+        Err(cleanup_error) => format!(
+            "{error}; partial copy remains at {}: {cleanup_error}",
+            path.display()
+        ),
+    }
+}
+
+fn copy_item_into_dir(
+    source: &Path,
+    is_dir: bool,
+    target_dir: &Path,
+    prefer_original_name: bool,
+) -> Result<PathBuf, String> {
+    copy_item_into_dir_with(
+        source,
+        is_dir,
+        target_dir,
+        prefer_original_name,
+        // std::fs::copy is what duplicate/paste used before staging: it keeps
+        // mode bits, and on macOS clones on APFS (instant, no extra space)
+        // keeping timestamps and extended attributes. The staged name is
+        // unique, so the only file it can overwrite is the AppleDouble
+        // `._name` sidecar macOS itself just wrote on a FAT / exFAT volume.
+        &mut |source, destination| {
+            std::fs::copy(source, destination)
+                .map_err(|e| format!("copy {}: {e}", source.display()))
+        },
+    )
 }
 
 #[tauri::command]
@@ -572,6 +738,92 @@ pub async fn paste_item(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Outcome of pasting the OS clipboard: items that landed, and the reason
+/// each rejected one stayed behind (one bad entry must not lose the rest).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PasteClipboardResult {
+    pub created: Vec<FileOpResult>,
+    pub failed: Vec<String>,
+}
+
+/// Copy host-clipboard file references into `target_dir`.
+///
+/// The source paths are read from the OS clipboard **inside the host** and
+/// never travel through IPC: a renderer-supplied "paste from anywhere" would
+/// be an arbitrary-filesystem read once the copy lands inside a workspace
+/// (where `read_file` is allowed). The destination is still confined to the
+/// registered roots.
+fn copy_clipboard_items_into(sources: &[String], target_dir: &Path) -> PasteClipboardResult {
+    let mut created = Vec::new();
+    let mut failed = Vec::new();
+    for raw in sources {
+        let original = Path::new(raw);
+        let original_meta = match std::fs::symlink_metadata(original) {
+            Ok(meta) => meta,
+            Err(e) => {
+                failed.push(format!("stat {}: {e}", original.display()));
+                continue;
+            }
+        };
+        if original_meta.file_type().is_symlink() {
+            failed.push(format!("cannot copy symlink {}", original.display()));
+            continue;
+        }
+        let source = match canonicalize_lenient(original) {
+            Ok(source) => source,
+            Err(e) => {
+                failed.push(e);
+                continue;
+            }
+        };
+        let is_dir = match std::fs::metadata(&source) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) => {
+                failed.push(format!("stat {}: {e}", source.display()));
+                continue;
+            }
+        };
+        match copy_item_into_dir(&source, is_dir, target_dir, true) {
+            Ok(destination) => created.push(FileOpResult {
+                path: destination.to_string_lossy().into_owned(),
+                is_dir,
+            }),
+            Err(e) => failed.push(e),
+        }
+    }
+    PasteClipboardResult { created, failed }
+}
+
+/// Paste whatever file list the OS clipboard holds (a Finder / Explorer
+/// copy). Empty `created` + empty `failed` means the clipboard carried no
+/// file at all; the frontend then falls back to its own tree clipboard.
+///
+/// Only the clipboard read runs on the main thread. The copy, which can be a
+/// whole folder from another volume, runs on a blocking worker like
+/// `paste_item`, so the window keeps responding while it lasts.
+#[tauri::command]
+pub async fn paste_clipboard_items(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    target_dir: String,
+) -> Result<PasteClipboardResult, String> {
+    let db = Arc::clone(db.inner());
+    let dir = tauri::async_runtime::spawn_blocking(move || {
+        let dir = ensure_allowed(&target_dir, &db)?;
+        if !dir.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        Ok(dir)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let snapshot = crate::clipboard::os_file_snapshot_on_main_thread(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || copy_clipboard_items_into(&snapshot.paths, &dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an
@@ -825,6 +1077,289 @@ mod tests {
         let dir = grant_dir_for(&outside.0.to_string_lossy()).unwrap();
         let want = strip_verbatim_prefix(std::fs::canonicalize(&outside.0).unwrap());
         assert_eq!(dir, want);
+    }
+
+    /// A trailing space is a real part of the filename on Unix; the
+    /// authorization entry points must resolve it verbatim instead of
+    /// trimming it into the sibling file without the space.
+    #[cfg(unix)]
+    #[test]
+    fn trailing_space_path_is_authorized_verbatim() {
+        let scratch = Scratch::new();
+        let plain = scratch.0.join("report");
+        let spaced = scratch.0.join("report ");
+        std::fs::write(&plain, b"plain").unwrap();
+        std::fs::write(&spaced, b"spaced").unwrap();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        db.add_granted_root(&scratch.0.to_string_lossy()).unwrap();
+
+        let resolved = ensure_allowed(&spaced.to_string_lossy(), &db).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(&spaced).unwrap());
+
+        let grant = grant_dir_for(&spaced.to_string_lossy()).unwrap();
+        let want = strip_verbatim_prefix(std::fs::canonicalize(&scratch.0).unwrap());
+        assert_eq!(grant, want);
+    }
+
+    #[test]
+    fn clipboard_paste_copies_what_it_can_and_names_the_rest() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let notes = source.0.join("notes.md");
+        std::fs::write(&notes, b"hi").unwrap();
+        std::fs::create_dir_all(source.0.join("assets")).unwrap();
+        std::fs::write(source.0.join("assets").join("a.txt"), b"a").unwrap();
+        let sources = vec![
+            notes.to_string_lossy().to_string(),
+            source.0.join("gone.md").to_string_lossy().to_string(),
+            source.0.join("assets").to_string_lossy().to_string(),
+        ];
+
+        let result = copy_clipboard_items_into(&sources, &destination.0);
+        assert_eq!(result.created.len(), 2);
+        assert_eq!(result.failed.len(), 1);
+        assert!(result.failed[0].contains("gone.md"));
+        assert_eq!(
+            std::fs::read(destination.0.join("notes.md")).unwrap(),
+            b"hi"
+        );
+        assert!(destination.0.join("assets").join("a.txt").is_file());
+
+        // Pasting the same item twice keeps the first copy intact.
+        let again = copy_clipboard_items_into(&sources[..1], &destination.0);
+        assert_eq!(again.created.len(), 1);
+        assert!(again.created[0].path.ends_with("notes copy.md"));
+        assert_eq!(
+            std::fs::read(destination.0.join("notes.md")).unwrap(),
+            b"hi"
+        );
+    }
+
+    /// Regression: duplicate/paste must preserve permission bits — an
+    /// executable script's copy has to stay executable (io::copy alone only
+    /// moves bytes).
+    #[cfg(unix)]
+    #[test]
+    fn copy_preserves_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let script = source.0.join("deploy.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        let copied = copy_item_into_dir(&script, false, &destination.0, true).unwrap();
+        let mode = std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+    }
+
+    #[test]
+    fn failed_directory_copy_leaves_no_destination_and_retry_keeps_its_name() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("a.txt"), b"a").unwrap();
+        std::fs::write(directory.join("b.txt"), b"b").unwrap();
+
+        let mut copies = 0;
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, destination| {
+                copies += 1;
+                if copies == 2 {
+                    Err("injected copy failure after a completed file".to_string())
+                } else {
+                    std::fs::copy(source, destination).map_err(|error| error.to_string())
+                }
+            },
+        );
+        assert_eq!(copies, 2, "the failure must happen after a real file copy");
+        assert!(copied.unwrap_err().contains("injected copy failure"));
+        assert!(!destination.0.join("assets").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+
+        let retry = copy_item_into_dir(&directory, true, &destination.0, true).unwrap();
+        assert_eq!(retry, destination.0.join("assets"));
+        assert_eq!(std::fs::read(retry.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(retry.join("b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn a_file_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("notes.md");
+        std::fs::write(&file, b"new copy").unwrap();
+        let mut competing_file = None;
+
+        let copied = copy_item_into_dir_with(
+            &file,
+            false,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                let competing = destination.0.join("notes.md");
+                std::fs::write(&competing, b"external").unwrap();
+                competing_file = Some(competing);
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(std::fs::read(competing_file.unwrap()).unwrap(), b"external");
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_directory_created_during_copy_is_never_replaced() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let directory = source.0.join("assets");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("copy.txt"), b"copy").unwrap();
+
+        let copied = copy_item_into_dir_with(
+            &directory,
+            true,
+            &destination.0,
+            true,
+            &mut |source, temporary| {
+                let result = std::fs::copy(source, temporary).map_err(|error| error.to_string());
+                std::fs::create_dir(destination.0.join("assets")).unwrap();
+                std::fs::write(
+                    destination.0.join("assets").join("external.txt"),
+                    b"external",
+                )
+                .unwrap();
+                result
+            },
+        );
+
+        assert!(copied.unwrap_err().contains("rename"));
+        assert_eq!(
+            std::fs::read(destination.0.join("assets").join("external.txt")).unwrap(),
+            b"external"
+        );
+        assert!(!destination.0.join("assets").join("copy.txt").exists());
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 1);
+    }
+    #[test]
+    fn cleanup_failure_reports_the_staged_item_path() {
+        let scratch = Scratch::new();
+        let directory = scratch.0.join("incomplete");
+        std::fs::create_dir(&directory).unwrap();
+
+        let error = remove_partial_copy(&directory, false, "copy failed".to_string());
+
+        assert!(error.starts_with("copy failed"));
+        assert!(error.contains("partial copy remains at"));
+        assert!(error.contains(&directory.to_string_lossy().to_string()));
+        assert!(directory.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clipboard_paste_rejects_top_level_file_and_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        std::fs::write(source.0.join("target.txt"), b"target").unwrap();
+        std::fs::create_dir(source.0.join("target-dir")).unwrap();
+        symlink(source.0.join("target.txt"), source.0.join("file-link")).unwrap();
+        symlink(source.0.join("target-dir"), source.0.join("dir-link")).unwrap();
+        let sources = ["file-link", "dir-link"]
+            .map(|name| source.0.join(name).to_string_lossy().into_owned());
+
+        let result = copy_clipboard_items_into(&sources, &destination.0);
+
+        assert!(result.created.is_empty());
+        assert_eq!(result.failed.len(), 2);
+        assert!(result.failed.iter().all(|error| error.contains("symlink")));
+        assert_eq!(std::fs::read_dir(&destination.0).unwrap().count(), 0);
+    }
+
+    /// exFAT on macOS answers `RENAME_EXCL` with ENOTSUP: the copy must
+    /// still publish, and still refuse to replace an existing destination.
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_exclusive_rename_falls_back_without_replacing() {
+        let scratch = Scratch::new();
+        let unsupported =
+            |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        publish_copy_with(&staged, &destination, unsupported).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert!(!staged.exists());
+
+        std::fs::write(&staged, b"second").unwrap();
+        let error = publish_copy_with(&staged, &destination, unsupported).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"copy");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn other_exclusive_rename_errors_do_not_fall_back() {
+        let scratch = Scratch::new();
+        let staged = scratch.0.join(".staged");
+        let destination = scratch.0.join("notes.md");
+        std::fs::write(&staged, b"copy").unwrap();
+
+        let error = publish_copy_with(&staged, &destination, |_, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(!destination.exists());
+        assert!(staged.exists());
+    }
+
+    /// The staged name must not grow with the source name: a 213-character
+    /// name fits the 255 limit, its staged sibling must too.
+    #[test]
+    fn long_names_paste_and_duplicate() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let name = format!("{}.md", "a".repeat(210));
+        let file = source.0.join(&name);
+        std::fs::write(&file, b"hi").unwrap();
+
+        let pasted = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(pasted, destination.0.join(&name));
+        let duplicated = copy_item_into_dir(&file, false, &source.0, false).unwrap();
+        assert_eq!(std::fs::read(duplicated).unwrap(), b"hi");
+    }
+
+    /// Duplicate/paste keep the modification time like a file-manager copy
+    /// (APFS clone / copyfile on macOS, CopyFileEx on Windows).
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn copy_keeps_the_source_modification_time() {
+        let source = Scratch::new();
+        let destination = Scratch::new();
+        let file = source.0.join("photo.txt");
+        std::fs::write(&file, b"data").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_880_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let copied = copy_item_into_dir(&file, false, &destination.0, true).unwrap();
+        assert_eq!(std::fs::metadata(copied).unwrap().modified().unwrap(), old);
     }
 
     #[test]
