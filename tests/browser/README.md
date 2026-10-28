@@ -1,5 +1,14 @@
 # Chat streaming regression
 
+Open `/tests/browser/file-tree-features.html?reset=1` for the real file tree
+against a synthetic directory listing. Expand `a` once to reach
+`a/b/c` and show its file. The readout shows every
+`listDir` call: Expand Loaded must not add calls, Collapse All leaves the
+workspace root open. The Git ignore toggle hides only entries marked ignored;
+dotfiles and tracked `build` remain visible. Switch between workspaces A and B, then reload
+without `?reset=1` to verify independent expanded paths. The
+fixture does not read the real disk or test native directory permissions.
+
 Open `/tests/browser/interface-typography.html` for the real General settings
 controls with in-memory persistence. Expand Advanced and change the UI,
 content and code sizes independently using px inputs (blur or Enter to save).

@@ -1,9 +1,10 @@
 import { ipc, type PluginInfo } from "@/lib/ipc";
-import { getAppVersion, pickDirectory } from "@/lib/platform";
+import { getAppVersion, pickDirectory, pickFile } from "@/lib/platform";
 import i18n from "@/lib/i18n";
 import { buildAgentCatalog } from "../conversation/agent-catalog";
 import { APP_VERSION } from "@/version/app-version";
 import { invoke } from "@/lib/transport";
+import { ipcUsageBackend } from "./usage-bridge";
 import { useChatStore } from "@/features/chat/store";
 import {
   createPluginContext,
@@ -56,6 +57,7 @@ export interface LoaderBackend extends PluginContextBackend {
 }
 
 export const ipcBackend: LoaderBackend = {
+  ...ipcUsageBackend,
   agentCatalog: (workspacePath) => buildAgentCatalog(ipc, workspacePath, (key) => i18n.t(key)),
   windowGetState: (pluginId) => invoke("plugin_window_state", { pluginId }),
   windowSetNormalBounds: (pluginId, bounds) =>
@@ -88,6 +90,7 @@ export const ipcBackend: LoaderBackend = {
     return ipc.pluginWorkspaceMetadata(id, workspacePath);
   },
   pickDirectory: (title = "Select plugin document storage directory") => pickDirectory(title),
+  pickFile,
   documentStorageGetLocation: (id) => ipc.pluginDocumentStorageGetLocation(id),
   documentStorageSelectLocation: (id, kind, customPath) =>
     ipc.pluginDocumentStorageSelectLocation(id, kind, customPath),

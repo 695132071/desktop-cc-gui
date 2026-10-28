@@ -29,9 +29,12 @@ describe("isKnownPermission", () => {
       "assets:bundle",
       "assets:directory",
       "ui:conversation-mode",
+      "ui:worktree-badge",
       "host:worktree",
       "host:window",
       "host:models",
+      "usage.read",
+      "limits.read",
     ]) {
       expect(isKnownPermission(permission)).toBe(true);
     }
