@@ -103,6 +103,7 @@ const TimelineRowView = memo(function TimelineRowView({
         processId={row.firstSeq}
         seenTools={seenTools}
         searchTarget={searchTarget}
+        workspacePath={workspacePath}
       />
     );
   }

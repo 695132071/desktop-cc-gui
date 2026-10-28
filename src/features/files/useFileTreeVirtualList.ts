@@ -1,20 +1,25 @@
 import { useEffect, useMemo, useRef } from "react";
 import { measureElement as defaultMeasureElement, useVirtualizer } from "@tanstack/react-virtual";
-import { fileName, joinPath, useFilesStore } from "./store";
+import { joinPath, useFilesStore } from "./store";
 import type { VisibleNode } from "./FileTreeRow";
+import { useFileTreePreferencesStore } from "./tree-preferences";
+import { buildVisibleNodes } from "./visible-nodes";
 
 /**
- * Flattens the expanded store tree into the visible row list and owns the
- * virtualizer that renders it, including the root-load effect and the
- * hidden-panel scroll/measure safeguards.
+ * Derives the visible row list from the store (`visible-nodes.ts`, honoring
+ * the hide-Git-ignored preference) and owns the virtualizer that renders it,
+ * including the root-load effect and the hidden-panel scroll/measure
+ * safeguards.
  */
 export function useFileTreeVirtualList() {
   const root = useFilesStore((s) => s.root);
   const children = useFilesStore((s) => s.children);
   const expanded = useFilesStore((s) => s.expanded);
   const loadingDirs = useFilesStore((s) => s.loadingDirs);
+  const dirErrors = useFilesStore((s) => s.dirErrors);
   const repositories = useFilesStore((s) => s.repositories);
   const fileColors = useFilesStore((s) => s.fileColors);
+  const hideIgnored = useFileTreePreferencesStore((s) => s.hideIgnored);
   const ensureDir = useFilesStore((s) => s.ensureDir);
   const toggleDir = useFilesStore((s) => s.toggleDir);
 
@@ -27,53 +32,34 @@ export function useFileTreeVirtualList() {
     }
   }, [root, ensureDir, toggleDir]);
 
-
-  const visible = useMemo<VisibleNode[]>(() => {
-    const out: VisibleNode[] = [];
-    // Synthetic root row: the workspace root itself is the first tree row
-    // with its repository badge (`open-reverselab main M1 ?12`); clicking
-    // it expands the tree below it.
-    if (root) {
-      out.push({
-        name: fileName(root),
-        isDir: true,
-        size: 0,
-        mtimeMs: 0,
-        path: root,
-        depth: 0,
-        expanded: !!expanded[root],
-        loading: !!loadingDirs[root],
-        repository: repositories[root],
-        // Repo-root rows are blue (the workspace repo root row here; nested
-        // repo dirs get theirs from the backend color pass).
-        color: repositories[root] ? "repository" : undefined,
-      });
-    }
-    const walk = (dirPath: string, depth: number) => {
-      const entries = children[dirPath];
-      if (!entries) return;
-      for (const e of entries) {
-        const path = joinPath(dirPath, e.name);
-        out.push({
-          ...e,
-          path,
-          depth,
-          expanded: e.isDir && !!expanded[path],
-          loading: e.isDir && !!loadingDirs[path],
-          repository: e.isDir ? repositories[path] : undefined,
-          // Plain folders never carry color; files take their git state;
-          // nested repo dirs take their own repo's status color from the
-          // backend. Blue stays exclusive to the workspace root row.
-          color: fileColors[dirPath]?.[e.name],
-        });
-        // Only already-expanded levels are walked — the tree never loads
-        // recursively; each expansion triggers exactly one listDir call.
-        if (e.isDir && expanded[path]) walk(path, depth + 1);
+  useEffect(() => {
+    if (!root || !expanded[root]) return;
+    const visit = (dir: string) => {
+      for (const entry of children[dir] ?? []) {
+        if (!entry.isDir || (hideIgnored && entry.ignored)) continue;
+        const path = joinPath(dir, entry.name);
+        if (!expanded[path]) continue;
+        if (children[path]) visit(path);
+        else if (!loadingDirs[path] && !dirErrors[path]) void ensureDir(path);
       }
     };
-    if (root && expanded[root]) walk(root, 1);
-    return out;
-  }, [children, expanded, loadingDirs, repositories, fileColors, root]);
+    visit(root);
+  }, [root, expanded, children, loadingDirs, dirErrors, hideIgnored, ensureDir]);
+
+  const visible = useMemo<VisibleNode[]>(
+    () =>
+      buildVisibleNodes({
+        root,
+        children,
+        expanded,
+        loadingDirs,
+        dirErrors,
+        repositories,
+        fileColors,
+        hideIgnored,
+      }),
+    [children, expanded, loadingDirs, dirErrors, repositories, fileColors, root, hideIgnored],
+  );
 
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({

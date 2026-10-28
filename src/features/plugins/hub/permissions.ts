@@ -41,9 +41,11 @@ const UI_LABELS: Record<string, string> = {
   "ui:page": "uiPage",
   "ui:timeline-row": "uiTimelineRow",
   "ui:session-menu": "uiSessionMenu",
+  "ui:file-link-menu": "uiFileLinkMenu",
   "ui:sidebar-entry": "uiSidebarEntry",
   "ui:center-tab": "uiCenterTab",
   "ui:conversation-mode": "uiConversationMode",
+  "ui:worktree-badge": "uiWorktreeBadge",
 };
 
 export function describePermission(permission: string): PermissionDescription {

@@ -342,6 +342,13 @@ struct RememberProviderArgs {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ListDirArgs {
+    path: String,
+    /// File tree root: opts into per-entry Git ignore flags.
+    git_ignore_root: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PathArgs {
     path: String,
     /// Optional workspace meta passthrough (plugin workspaces.add keeps
@@ -773,16 +780,17 @@ pub(super) async fn dispatch(
         // flavors the paste event itself carried.
         "clipboard_file_paths" => ser(Ok::<Vec<String>, String>(Vec::new())),
         // history
-        "list_sessions" => ser(crate::history::reader::list_sessions(app.state())),
+        "list_sessions" => ser(crate::history::reader::list_sessions(app.state()).await),
         "list_archived_sessions" => {
-            ser(crate::history::reader::list_archived_sessions(app.state()))
+            ser(crate::history::reader::list_archived_sessions(app.state()).await)
         }
         "archive_session" => {
             let a: ArchiveSessionArgs = parse_args(&raw)?;
             ser(crate::history::reader::archive_session(
                 app.state(),
                 a.session,
-            ))
+            )
+            .await)
         }
         "restore_session" => {
             let a: EngineSessionArgs = parse_args(&raw)?;
@@ -790,7 +798,8 @@ pub(super) async fn dispatch(
                 app.state(),
                 a.engine,
                 a.session_id,
-            ))
+            )
+            .await)
         }
         // Usage ledger: the mobile/web client renders the same page, so the
         // bridge must route it like every other settings surface.
@@ -800,7 +809,8 @@ pub(super) async fn dispatch(
                 app.state(),
                 a.days,
                 a.tz_offset_minutes,
-            ))
+            )
+            .await)
         }
         "usage_record" => {
             let a: UsageRecordArgs = parse_args(&raw)?;
@@ -808,9 +818,10 @@ pub(super) async fn dispatch(
                 app.clone(),
                 app.state(),
                 a.entry,
-            ))
+            )
+            .await)
         }
-        "usage_clear" => ser(crate::usage::usage_clear(app.state())),
+        "usage_clear" => ser(crate::usage::usage_clear(app.state()).await),
         "load_session_page" => {
             let a: LoadSessionPageArgs = parse_args(&raw)?;
             ser(crate::history::reader::load_session_page(
@@ -857,7 +868,8 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.pinned,
-            ))
+            )
+            .await)
         }
         "rename_session" => {
             let a: RenameSessionArgs = parse_args(&raw)?;
@@ -866,7 +878,8 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.title,
-            ))
+            )
+            .await)
         }
         "remember_session_model" => {
             let a: RememberModelArgs = parse_args(&raw)?;
@@ -875,7 +888,8 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.model,
-            ))
+            )
+            .await)
         }
         "add_workspace" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -885,7 +899,8 @@ pub(super) async fn dispatch(
                 a.meta,
                 a.kind,
                 a.parent_id,
-            ))
+            )
+            .await)
         }
         "plugin_add_workspace" => {
             let a: PluginAddWorkspaceArgs = parse_args(&raw)?;
@@ -901,7 +916,8 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.effort,
-            ))
+            )
+            .await)
         }
         "remember_session_provider" => {
             let a: RememberProviderArgs = parse_args(&raw)?;
@@ -910,7 +926,8 @@ pub(super) async fn dispatch(
                 a.engine,
                 a.session_id,
                 a.provider_id,
-            ))
+            )
+            .await)
         }
         "rescan_sessions" => {
             crate::history::reader::rescan_sessions(app.state());
@@ -927,17 +944,18 @@ pub(super) async fn dispatch(
             )
             .await)
         }
-        "list_workspaces" => ser(crate::history::reader::list_workspaces(app.state())),
+        "list_workspaces" => ser(crate::history::reader::list_workspaces(app.state()).await),
         "reorder_workspaces" => {
             let a: IdsArgs = parse_args(&raw)?;
             ser(crate::history::reader::reorder_workspaces(
                 app.state(),
                 a.ids,
-            ))
+            )
+            .await)
         }
         "remove_workspace" => {
             let a: IdArgs = parse_args(&raw)?;
-            ser(crate::history::reader::remove_workspace(app.state(), a.id))
+            ser(crate::history::reader::remove_workspace(app.state(), a.id).await)
         }
         "set_workspace_group" => {
             let a: SetWorkspaceGroupArgs = parse_args(&raw)?;
@@ -945,12 +963,13 @@ pub(super) async fn dispatch(
                 app.state(),
                 a.id,
                 a.group_id,
-            ))
+            )
+            .await)
         }
         // files
         "list_dir" => {
-            let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::list_dir(app.state(), a.path))
+            let a: ListDirArgs = parse_args(&raw)?;
+            ser(crate::files::list_dir(app.state(), a.path, a.git_ignore_root).await)
         }
         "read_file" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -958,27 +977,27 @@ pub(super) async fn dispatch(
         }
         "write_file" => {
             let a: WriteFileArgs = parse_args(&raw)?;
-            ser(crate::files::write_file(app.state(), a.path, a.content))
+            ser(crate::files::write_file(app.state(), a.path, a.content).await)
         }
         "create_dir" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::create_dir(app.state(), a.path))
+            ser(crate::files::create_dir(app.state(), a.path).await)
         }
         "create_file" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::create_file(app.state(), a.path))
+            ser(crate::files::create_file(app.state(), a.path).await)
         }
         "rename_item" => {
             let a: RenameItemArgs = parse_args(&raw)?;
-            ser(crate::files::rename_item(app.state(), a.from, a.to))
+            ser(crate::files::rename_item(app.state(), a.from, a.to).await)
         }
         "trash_item" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::trash_item(app.state(), a.path))
+            ser(crate::files::trash_item(app.state(), a.path).await)
         }
         "duplicate_item" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::files::duplicate_item(app.state(), a.path))
+            ser(crate::files::duplicate_item(app.state(), a.path).await)
         }
         "paste_item" => {
             let a: PasteItemArgs = parse_args(&raw)?;
@@ -986,7 +1005,8 @@ pub(super) async fn dispatch(
                 app.state(),
                 a.source,
                 a.target_dir,
-            ))
+            )
+            .await)
         }
         "search_text" => {
             let a: SearchTextArgs = parse_args(&raw)?;
@@ -1029,38 +1049,36 @@ pub(super) async fn dispatch(
         // 远程界面才能和桌面一致地本地化「超限 / 安全扫描」。
         "memory_list" => {
             let a: MemoryListArgs = parse_args(&raw)?;
-            memory_ser(crate::memory::view(&app.state(), a.bot_id.as_deref()))
+            memory_ser(crate::memory::commands::memory_list(app.state(), a.bot_id).await)
         }
         "memory_add" => {
             let a: MemoryAddArgs = parse_args(&raw)?;
-            let target = crate::memory::Target::parse(&a.target)
-                .map_err(|error| serde_json::to_string(&error).unwrap_or(error.message))?;
             memory_ser(
-                crate::memory::add(&app.state(), target, a.bot_id.as_deref(), &a.content, "user")
-                    .map(|(entry, _created)| entry),
+                crate::memory::commands::memory_add(app.state(), a.bot_id, a.target, a.content)
+                    .await,
             )
         }
         "memory_update" => {
             let a: MemoryUpdateArgs = parse_args(&raw)?;
-            memory_ser(crate::memory::update(&app.state(), &a.id, &a.content))
+            memory_ser(crate::memory::commands::memory_update(app.state(), a.id, a.content).await)
         }
         "memory_remove" => {
             let a: IdArgs = parse_args(&raw)?;
-            memory_ser(crate::memory::remove_by_id(&app.state(), &a.id))
+            memory_ser(crate::memory::commands::memory_remove(app.state(), a.id).await)
         }
         "memory_clear" => {
             let a: MemoryClearArgs = parse_args(&raw)?;
-            let target = crate::memory::Target::parse(&a.target)
-                .map_err(|error| serde_json::to_string(&error).unwrap_or(error.message))?;
-            memory_ser(crate::memory::clear(&app.state(), target, a.bot_id.as_deref()))
+            memory_ser(
+                crate::memory::commands::memory_clear(app.state(), a.bot_id, a.target).await,
+            )
         }
         "memory_pending_approve" => {
             let a: IdArgs = parse_args(&raw)?;
-            memory_ser(crate::memory::pending::approve(&app.state(), &a.id))
+            memory_ser(crate::memory::commands::memory_pending_approve(app.state(), a.id).await)
         }
         "memory_pending_reject" => {
             let a: IdArgs = parse_args(&raw)?;
-            memory_ser(crate::memory::pending::reject(&app.state(), &a.id))
+            memory_ser(crate::memory::commands::memory_pending_reject(app.state(), a.id).await)
         }
         "memory_review" => {
             let a: MemoryReviewArgs = parse_args(&raw)?;
@@ -1169,21 +1187,21 @@ pub(super) async fn dispatch(
         }
         "git_stage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_stage(a.path, a.files))
+            ser(crate::git::git_stage(a.path, a.files).await)
         }
         "git_unstage" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_unstage(a.path, a.files))
+            ser(crate::git::git_unstage(a.path, a.files).await)
         }
         // Same shared changes panel as the desktop, so the remote client's
         // 「撤销更改」 must route too (it falls through to unknown otherwise).
         "git_discard" => {
             let a: GitFilesArgs = parse_args(&raw)?;
-            ser(crate::git::git_discard(a.path, a.files))
+            ser(crate::git::git_discard(a.path, a.files).await)
         }
         "git_commit" => {
             let a: GitCommitArgs = parse_args(&raw)?;
-            ser(crate::git::git_commit(a.path, a.message))
+            ser(crate::git::git_commit(a.path, a.message).await)
         }
         "git_push" => {
             let a: PathArgs = parse_args(&raw)?;
@@ -1195,15 +1213,19 @@ pub(super) async fn dispatch(
         }
         "git_branches" => {
             let a: PathArgs = parse_args(&raw)?;
-            ser(crate::git::git_branches(a.path))
+            ser(crate::git::git_branches(a.path).await)
         }
         "git_checkout" => {
             let a: GitCheckoutArgs = parse_args(&raw)?;
-            ser(crate::git::git_checkout(a.path, a.branch))
+            ser(crate::git::git_checkout(a.path, a.branch).await)
         }
         "git_create_branch" => {
             let a: GitCreateBranchArgs = parse_args(&raw)?;
-            ser(crate::git::git_create_branch(a.path, a.name))
+            ser(crate::git::git_create_branch(a.path, a.name).await)
+        }
+        "git_init" => {
+            let a: PathArgs = parse_args(&raw)?;
+            ser(crate::git::git_init(app.state(), a.path))
         }
         // open-app
         "open_workspace_in" => {
@@ -1282,11 +1304,11 @@ pub(super) async fn dispatch(
         "web_devices" => ser(web_devices(app.clone())),
         "web_device_approve" => {
             let a: DeviceIdArgs = parse_args(&raw)?;
-            ser(web_device_approve(app.clone(), a.id))
+            ser(web_device_approve(app.clone(), a.id).await)
         }
         "web_device_revoke" => {
             let a: DeviceIdArgs = parse_args(&raw)?;
-            ser(web_device_revoke(app.clone(), a.id))
+            ser(web_device_revoke(app.clone(), a.id).await)
         }
         // plugins (plan §9 risk table ruling): read commands ride the bridge
         // so web clients render plugin UI; install/uninstall/enable stay
@@ -1315,7 +1337,8 @@ pub(super) async fn dispatch(
                 a.id,
                 a.key,
                 a.value,
-            ))
+            )
+            .await)
         }
         "plugin_storage_delete" => {
             let a: PluginStorageKeyArgs = parse_args(&raw)?;
@@ -1323,7 +1346,8 @@ pub(super) async fn dispatch(
                 app.state(),
                 a.id,
                 a.key,
-            ))
+            )
+            .await)
         }
         // Asset capabilities use the same authenticated bridge and the same
         // backend permission gates as desktop; they grant no general file
