@@ -1,6 +1,7 @@
 import type { DirEntry, FileTreeColor, RepositorySummary } from "@/lib/ipc";
 import type { VisibleNode } from "./FileTreeRow";
 import { fileName, joinPath } from "./store";
+import { nextChainDir } from "./tree-chain";
 
 /** The store slices the visible row list is derived from. */
 export interface TreeSnapshot {
@@ -45,22 +46,25 @@ export function buildVisibleNodes({
     // repo dirs get theirs from the backend color pass).
     color: repositories[root] ? "repository" : undefined,
   });
+  const chain = { children, loadingDirs, dirErrors, repositories, hideIgnored };
   const walk = (dirPath: string, depth: number) => {
     const entries = children[dirPath];
     if (!entries) return;
     for (const e of entries) {
       if (hideIgnored && e.ignored) continue;
+      let parent = dirPath;
+      let leaf = e.name;
       let path = joinPath(dirPath, e.name);
       let name = e.name;
       const compactPaths = [path];
-      if (e.isDir) {
-        while (!repositories[path] && !loadingDirs[path] && !dirErrors[path]) {
-          const visible = children[path]?.filter((entry) => !hideIgnored || !entry.ignored);
-          if (visible?.length !== 1 || !visible[0].isDir) break;
-          name += `/${visible[0].name}`;
-          path = joinPath(path, visible[0].name);
-          compactPaths.push(path);
-        }
+      let next = e.isDir ? nextChainDir(path, !!e.ignored, chain) : null;
+      while (next) {
+        parent = path;
+        leaf = next.name;
+        name += `/${next.name}`;
+        path = joinPath(path, next.name);
+        compactPaths.push(path);
+        next = nextChainDir(path, !!e.ignored, chain);
       }
       const isExpanded = compactPaths.every((part) => !!expanded[part]);
       out.push({
@@ -74,8 +78,9 @@ export function buildVisibleNodes({
         repository: e.isDir ? repositories[path] : undefined,
         // Plain folders never carry color; files take their git state;
         // nested repo dirs take their own repo's status color from the
-        // backend. Blue stays exclusive to the workspace root row.
-        color: fileColors[dirPath]?.[e.name],
+        // backend. Blue stays exclusive to the workspace root row. A merged
+        // row takes its last folder's color (a nested repo ends a chain).
+        color: fileColors[parent]?.[leaf],
       });
       // Only already-expanded levels are walked. Listing requests belong to
       // the click handler, which follows a single chain when needed.

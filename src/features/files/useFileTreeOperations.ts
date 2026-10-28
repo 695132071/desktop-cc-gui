@@ -53,9 +53,8 @@ export interface FileTreeOperations {
  */
 export function useFileTreeOperations(): FileTreeOperations {
   const { t } = useTranslation();
-  const root = useFilesStore((s) => s.root);
   const clipboard = useFilesStore((s) => s.clipboard);
-  const toggleDir = useFilesStore((s) => s.toggleDir);
+  const revealDir = useFilesStore((s) => s.revealDir);
   const invalidateDir = useFilesStore((s) => s.invalidateDir);
   const selectPath = useFilesStore((s) => s.selectPath);
 
@@ -84,17 +83,16 @@ export function useFileTreeOperations(): FileTreeOperations {
     [selectPath],
   );
 
-  /** Refresh the (loaded) parent listing, expand it when collapsed, and
+  /** Refresh the (loaded) parent listing, expand it and every folder above
+   *  it (a merged single-chain row may hold closed middle folders), and
    *  select the operation result so the user sees what changed. */
   const revealInTree = useCallback(
     async (dir: string, target: string | null, isDir: boolean) => {
-      if (dir && dir !== root && !useFilesStore.getState().expanded[dir]) {
-        await toggleDir(dir);
-      }
+      if (dir) await revealDir(dir);
       await invalidateDir(dir);
       if (target) selectPath(target, isDir);
     },
-    [root, toggleDir, invalidateDir, selectPath],
+    [revealDir, invalidateDir, selectPath],
   );
 
   const closeMenu = useCallback(() => setMenu(null), []);

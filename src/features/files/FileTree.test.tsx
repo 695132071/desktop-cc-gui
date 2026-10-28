@@ -52,3 +52,16 @@ it("工具条按钮和文件树内快捷键执行同一操作", () => {
   expect(expandLoadedDirs).toHaveBeenCalledTimes(2);
   expect(collapseAllDirs).toHaveBeenCalledTimes(2);
 });
+
+it("按钮提示写明快捷键，文件树容器可接住鼠标点击后的焦点", () => {
+  const buttons = container.querySelectorAll<HTMLButtonElement>("button[aria-keyshortcuts]");
+  expect(buttons[0].title).toMatch(/^展开已加载的文件夹 \((⌥⇧→|Alt\+Shift\+.+)\)$/);
+  expect(buttons[1].title).toMatch(/^收起全部文件夹 \((⌥⇧←|Alt\+Shift\+.+)\)$/);
+  const tree = container.firstElementChild as HTMLElement;
+  // jsdom reports tabIndex -1 for any div; the attribute is what counts.
+  expect(tree.getAttribute("tabindex")).toBe("-1");
+  act(() => {
+    tree.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }));
+  });
+  expect(expandLoadedDirs).toHaveBeenCalledTimes(1);
+});
