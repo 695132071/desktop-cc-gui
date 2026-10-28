@@ -46,10 +46,15 @@ export interface TodoItem {
   detail?: string | null;
 }
 
+/** One entry of a todo payload. A patch entry may leave `status` out: the
+ *  update did not set one (a TaskUpdate that only renames), so the item
+ *  keeps its current status. */
+export type TodoPayloadItem = Omit<TodoItem, "status"> & { status?: TodoStatus };
+
 /** Todo-list payload on todo-class tool rows: replace = full snapshot,
- * otherwise a patch matched by content (status "dropped" removes). */
+ * otherwise a patch matched by id, then content (status "dropped" removes). */
 export interface TodosPayload {
-  items: TodoItem[];
+  items: TodoPayloadItem[];
   replace: boolean;
 }
 

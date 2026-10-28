@@ -271,7 +271,7 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
                         .rposition(|m| m.role == "tool" && m.result.is_none()),
                 };
                 if let Some(index) = index {
-                    if let Some(todos) = crate::engine::parse_todo_result(&res) {
+                    if let Some(todos) = crate::engine::parse_todo_result(&messages[index].text, &res) {
                         messages[index].todos = Some(todos);
                     }
                     messages[index].result = Some(res);
@@ -2436,6 +2436,50 @@ mod tests {
         assert_eq!(first_todos.items[0].id.as_deref(), Some("1"));
         let second_todos = second.todos.as_ref().expect("create payload");
         assert_eq!(second_todos.items[0].id.as_deref(), Some("2"));
+    }
+
+    /// Reading a task back (TaskGet) is not an update: its row carries no todo
+    /// patch, so replaying history cannot reset a finished task to pending.
+    #[test]
+    fn claude_task_get_row_carries_no_todo_patch() {
+        let call = |id: &str, name: &str, input: Value| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-21T08:10:10Z",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": id, "name": name, "input": input}
+                ]}
+            })
+        };
+        let result = |call_id: &str, text: &str| {
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-21T08:10:11Z",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                ]}
+            })
+        };
+        let lines = vec![
+            call("call-c", "TaskCreate", serde_json::json!({"subject": "A", "description": ""})),
+            result("call-c", "Task #1 created successfully: A"),
+            call("call-u", "TaskUpdate", serde_json::json!({"taskId": "1", "status": "completed"})),
+            result("call-u", "Updated task #1 status"),
+            call("call-g", "TaskGet", serde_json::json!({"taskId": "1"})),
+            result("call-g", "Task #1: A\nStatus: completed\nDescription: "),
+        ];
+        let input = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extractor: LineExtractor<'_> =
+            Box::new(|value: &Value| extract_claude_line(value, ImageMode::Collect));
+        let parsed = collect_session(std::io::Cursor::new(input), &extractor, &HashSet::new());
+
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(parsed.messages[0].todos.as_ref().unwrap().items[0].id.as_deref(), Some("1"));
+        assert_eq!(parsed.messages[1].todos.as_ref().unwrap().items[0].status, "complete");
+        assert_eq!(parsed.messages[2].text, "TaskGet");
+        assert!(parsed.messages[2].todos.is_none());
     }
 
     #[test]

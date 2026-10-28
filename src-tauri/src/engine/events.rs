@@ -174,6 +174,10 @@ pub struct TodoItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub content: String,
+    /// Empty only on a patch that leaves the status as it is (a TaskUpdate
+    /// that renames without naming a status); it is then left off the wire
+    /// and the frontend keeps the item's current status.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -351,14 +355,19 @@ fn created_task(result: &Value) -> Option<(String, String)> {
 /// own args carry no id, so without this the created item can never be
 /// matched by an update patch and the list stays "pending" for the rest of
 /// the session. The payload is a patch (`replace: false`) carrying both the
-/// id and the subject, so it lands on the row the args created.
-pub(crate) fn parse_todo_result(result: &Value) -> Option<TodosPayload> {
+/// id and the subject, so it lands on the row the args created. Only
+/// TaskCreate's answer counts: TaskGet answers with the same envelope, and
+/// reading it as a creation reset the task it read back to "pending".
+pub(crate) fn parse_todo_result(tool: &str, result: &Value) -> Option<TodosPayload> {
     if let Some(phases) = result
         .get("details")
         .and_then(|d| d.get("phases"))
         .and_then(Value::as_array)
     {
         return phases_payload(phases);
+    }
+    if !is_task_create(tool) {
+        return None;
     }
     created_task(result).map(|(id, content)| TodosPayload {
         items: vec![TodoItem {
@@ -371,6 +380,12 @@ pub(crate) fn parse_todo_result(result: &Value) -> Option<TodosPayload> {
         }],
         replace: false,
     })
+}
+
+/// Claude Code's task-creation tool, matched the way the frontend names it.
+fn is_task_create(tool: &str) -> bool {
+    let tool = tool.to_ascii_lowercase();
+    tool.contains("taskcreate") || tool.contains("task_create")
 }
 
 /// omp's per-phase task list flattened into one payload.
@@ -427,10 +442,11 @@ pub(crate) fn tool_result_patch_with_id(
     result: Option<&Value>,
     tool_call_id: Option<&str>,
 ) -> EngineEvent {
-    let todos = result.and_then(parse_todo_result);
+    let name = name.into();
+    let todos = result.and_then(|result| parse_todo_result(&name, result));
     EngineEvent::Message {
         role: "tool".to_string(),
-        text: name.into(),
+        text: name,
         path: None,
         todos,
         args: None,
@@ -567,7 +583,10 @@ pub(crate) fn parse_todo_args(args: &Value) -> Option<TodosPayload> {
         }
     }
 
-    // TaskUpdate tool call support: MUST have `taskId`
+    // TaskUpdate tool call support: MUST have `taskId`. Only what the call
+    // names is patched — a status it leaves out stays as it was. TaskGet
+    // (a bare `taskId`) and owner/dependency-only updates change nothing the
+    // list shows, so they are no patch at all.
     if args.get("op").is_none() {
         if let Some(task_id) = args
             .get("taskId")
@@ -581,8 +600,15 @@ pub(crate) fn parse_todo_args(args: &Value) -> Option<TodosPayload> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("");
-            let status = todo_status(args.get("status").and_then(Value::as_str));
+            let status = args
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|raw| todo_status(Some(raw)))
+                .unwrap_or("");
             let detail = args.get("description").or_else(|| args.get("detail")).and_then(Value::as_str).map(str::to_string);
+            if content.is_empty() && status.is_empty() && detail.is_none() {
+                return None;
+            }
             return Some(TodosPayload {
                 items: vec![TodoItem {
                     id: Some(task_id.to_string()),
@@ -720,7 +746,7 @@ mod tool_args_tests {
     #[test]
     fn created_task_result_carries_the_id_task_update_addresses() {
         // Live wire shape: the structured object the CLI streams back.
-        let payload = parse_todo_result(&json!({
+        let payload = parse_todo_result("TaskCreate", &json!({
             "task": {"id": "1", "subject": "编写 bili_app.py 网页版"}
         }))
         .expect("create envelope is a todo fact");
@@ -731,7 +757,7 @@ mod tool_args_tests {
         assert_eq!(payload.items[0].status, "pending");
 
         // Transcript shape: the same fact as the CLI's own result line.
-        let payload = parse_todo_result(&json!("Task #12 created successfully: 樱花\"整季选集\"批量下载设计"))
+        let payload = parse_todo_result("TaskCreate", &json!("Task #12 created successfully: 樱花\"整季选集\"批量下载设计"))
             .expect("result line is a todo fact");
         assert_eq!(payload.items[0].id.as_deref(), Some("12"));
         assert_eq!(payload.items[0].content, "樱花\"整季选集\"批量下载设计");
@@ -741,22 +767,60 @@ mod tool_args_tests {
     /// a phantom "pending" row per update would inflate the task count.
     #[test]
     fn non_create_results_are_not_todos() {
-        assert!(parse_todo_result(&json!({
+        assert!(parse_todo_result("TaskUpdate", &json!({
             "success": true,
             "taskId": "13",
             "statusChange": {"from": "pending", "to": "in_progress"}
         }))
         .is_none());
-        assert!(parse_todo_result(&json!("Updated task #13 status")).is_none());
-        assert!(parse_todo_result(&json!({"stdout": "Task #1 created successfully: x"})).is_none());
-        assert!(parse_todo_result(&json!("Task #1 created successfully: x\nextra line")).is_none());
+        assert!(parse_todo_result("TaskUpdate", &json!("Updated task #13 status")).is_none());
+        assert!(parse_todo_result("TaskCreate", &json!({"stdout": "Task #1 created successfully: x"})).is_none());
+        assert!(parse_todo_result("TaskCreate", &json!("Task #1 created successfully: x\nextra line")).is_none());
+    }
+
+    /// TaskGet answers with the same `{task:{id,subject}}` envelope as
+    /// TaskCreate (plus the task's status), and its args are a bare `taskId`.
+    /// Reading a task changes nothing, so neither half may become a todo
+    /// patch: as a "creation" it forced the task back to pending.
+    #[test]
+    fn task_get_is_not_a_todo_fact() {
+        let envelope = json!({
+            "task": {"id": "1", "subject": "A", "description": "",
+                     "status": "completed", "blocks": [], "blockedBy": []}
+        });
+        assert!(parse_todo_result("TaskGet", &envelope).is_none());
+        assert!(parse_todo_args(&json!({"taskId": "1"})).is_none());
+        // Only TaskCreate's answer is a creation, whatever text another tool
+        // happens to print.
+        assert!(parse_todo_result("Bash", &json!("Task #1 created successfully: x")).is_none());
+        assert!(parse_todo_result("", &json!({"task": {"id": "1", "subject": "A"}})).is_none());
+    }
+
+    /// A TaskUpdate that does not name a status leaves the status alone:
+    /// renames and description edits patch only what they carry, and
+    /// owner/dependency-only updates have nothing the list shows.
+    #[test]
+    fn status_less_task_update_keeps_the_status() {
+        assert!(parse_todo_args(&json!({"taskId": "3", "addBlockedBy": ["1"]})).is_none());
+        assert!(parse_todo_args(&json!({"taskId": "3", "owner": "researcher"})).is_none());
+
+        let rename = parse_todo_args(&json!({"taskId": "12", "subject": "新标题"})).expect("rename patch");
+        assert_eq!(rename.items[0].id.as_deref(), Some("12"));
+        assert_eq!(rename.items[0].content, "新标题");
+        let wire = serde_json::to_value(&rename).unwrap();
+        assert!(wire["items"][0].get("status").is_none(), "unchanged status stays off the wire: {wire}");
+
+        let done = parse_todo_args(&json!({"taskId": "12", "status": "completed"})).expect("status patch");
+        assert_eq!(done.items[0].status, "complete");
+        let wire = serde_json::to_value(&done).unwrap();
+        assert_eq!(wire["items"][0]["status"], "complete");
     }
 
     /// omp still owns the `details.phases` shape; the created-task branch must
     /// not swallow it.
     #[test]
     fn phases_snapshot_still_wins_over_the_create_envelope() {
-        let payload = parse_todo_result(&json!({
+        let payload = parse_todo_result("todo", &json!({
             "details": {"phases": [{"name": "P1", "tasks": [{"content": "Task 1", "status": "completed"}]}]}
         }))
         .expect("phases payload");
