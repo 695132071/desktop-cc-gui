@@ -58,6 +58,8 @@ import {
 } from "@/features/plugins/runtime/hooks";
 import { normalizeEngineEvent, type EngineTerminalFact } from "../normalized-runtime-events";
 import { workspaceMetadata } from "./lifecycle";
+import { emitSessionActivated } from "@/features/plugins/runtime/events";
+import { sessionSelection } from "./selection";
 import type { AfterTurnEvent, InternalMessageCapture, WorkspaceMetadata } from "@ccgui/plugin-sdk";
 import { migrateSelectedBot } from "@/features/bots/selected-bot";
 interface RunLifecycle {
@@ -885,6 +887,14 @@ function onSession(
     deps.get().active?.workspacePath ||
     "";
   const newKey = sessionKey(event.engine, nativeId, workspacePath);
+  // The active tab may be the pending tab about to adopt this native id: its
+  // retained activation (sessionId:null) can never be repaired afterwards —
+  // emitSessionSelectionChanged matches the retained payload on
+  // engine+sessionId — so it needs a fresh activation emit below.
+  const activeAdoptsPending =
+    state.active?.engine === event.engine &&
+    state.active.sessionId === null &&
+    state.active.workspacePath === workspacePath;
   // The event can resolve straight to the native key when it beat the send
   // response (the run had no routing entry yet). The turn rows and streaming
   // flag still sit under the pending key then; migrate from there instead of
@@ -1020,6 +1030,13 @@ function onSession(
     persistTabs(openTabs, s.active);
     return { openTabs };
   });
+  if (activeAdoptsPending && deps.get().active?.sessionId === nativeId) {
+    emitSessionActivated(
+      event.engine,
+      nativeId,
+      sessionSelection(deps.get(), event.engine, nativeId, workspacePath),
+    );
+  }
   const createdKey = sessionKey(event.engine, nativeId, workspacePath);
   if (!deps.get().createdSessionKeys[createdKey]) {
     deps.set((s) => ({
