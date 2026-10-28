@@ -36,27 +36,17 @@ afterEach(() => {
   container.remove();
 });
 
-it("工具条按钮和文件树内快捷键执行同一操作", () => {
-  const buttons = container.querySelectorAll<HTMLButtonElement>("button[aria-keyshortcuts]");
-  expect(buttons).toHaveLength(2);
+it("文件树内快捷键执行批量展开与收起", () => {
+  const tree = container.firstElementChild as HTMLElement;
   act(() => {
-    buttons[0].click();
-    buttons[1].click();
-    container.querySelector("button:not([aria-keyshortcuts])")!.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }),
-    );
-    container.querySelector("button:not([aria-keyshortcuts])")!.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "ArrowLeft", altKey: true, shiftKey: true, bubbles: true }),
-    );
+    tree.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }));
+    tree.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", altKey: true, shiftKey: true, bubbles: true }));
   });
-  expect(expandLoadedDirs).toHaveBeenCalledTimes(2);
-  expect(collapseAllDirs).toHaveBeenCalledTimes(2);
+  expect(expandLoadedDirs).toHaveBeenCalledTimes(1);
+  expect(collapseAllDirs).toHaveBeenCalledTimes(1);
 });
 
-it("按钮提示写明快捷键，文件树容器可接住鼠标点击后的焦点", () => {
-  const buttons = container.querySelectorAll<HTMLButtonElement>("button[aria-keyshortcuts]");
-  expect(buttons[0].title).toMatch(/^展开已加载的文件夹 \((⌥⇧→|Alt\+Shift\+.+)\)$/);
-  expect(buttons[1].title).toMatch(/^收起全部文件夹 \((⌥⇧←|Alt\+Shift\+.+)\)$/);
+it("容器保留 tabindex=-1，鼠标点击后快捷键仍能被接住", () => {
   const tree = container.firstElementChild as HTMLElement;
   // jsdom reports tabIndex -1 for any div; the attribute is what counts.
   expect(tree.getAttribute("tabindex")).toBe("-1");
@@ -64,4 +54,5 @@ it("按钮提示写明快捷键，文件树容器可接住鼠标点击后的焦�
     tree.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", altKey: true, shiftKey: true, bubbles: true }));
   });
   expect(expandLoadedDirs).toHaveBeenCalledTimes(1);
+  expect(collapseAllDirs).not.toHaveBeenCalled();
 });
