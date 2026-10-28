@@ -17,7 +17,7 @@ use std::time::Duration;
 use tauri::{State, WebviewWindow};
 use tokio::sync::Mutex;
 
-const BAIDU_TONGJI_SITE_ID: &str = "daa60bcc45c658ee35054b93be3cf2e4";
+const BAIDU_TONGJI_SITE_ID: &str = "b18f7c7bbeab70682b0a359e6b7b058d";
 const BAIDU_TONGJI_SCRIPT_URL_PREFIX: &str = "https://hm.baidu.com/hm.js?";
 const BAIDU_TONGJI_SCRIPT_MARKER: &str = "hm.baidu.com/hm.gif";
 const BAIDU_TONGJI_REFERER: &str = "https://tauri.localhost/";
@@ -510,7 +510,7 @@ mod tests {
     use uuid::Uuid;
 
     const VALID_BEACON: &str =
-        "http://hm.baidu.com/hm.gif?si=daa60bcc45c658ee35054b93be3cf2e4&hca=visitor-1&et=0";
+        "http://hm.baidu.com/hm.gif?si=b18f7c7bbeab70682b0a359e6b7b058d&hca=visitor-1&et=0";
 
     fn test_state(visitor_cookie: Option<&str>, storage_path: Option<PathBuf>) -> BaiduTongjiState {
         BaiduTongjiState {
@@ -537,10 +537,10 @@ mod tests {
     #[test]
     fn rejects_beacons_outside_the_fixed_site_contract() {
         for candidate in [
-            "https://example.com/hm.gif?si=daa60bcc45c658ee35054b93be3cf2e4&hca=v",
-            "https://hm.baidu.com/other?si=daa60bcc45c658ee35054b93be3cf2e4&hca=v",
+            "https://example.com/hm.gif?si=b18f7c7bbeab70682b0a359e6b7b058d&hca=v",
+            "https://hm.baidu.com/other?si=b18f7c7bbeab70682b0a359e6b7b058d&hca=v",
             "https://hm.baidu.com/hm.gif?si=wrong&hca=v",
-            "https://hm.baidu.com/hm.gif?si=daa60bcc45c658ee35054b93be3cf2e4",
+            "https://hm.baidu.com/hm.gif?si=b18f7c7bbeab70682b0a359e6b7b058d",
         ] {
             assert!(
                 validate_beacon_url(candidate).is_err(),
@@ -766,6 +766,6 @@ mod tests {
 
     #[test]
     fn site_id_constant_matches_the_existing_frontend_contract() {
-        assert_eq!(BAIDU_TONGJI_SITE_ID, "daa60bcc45c658ee35054b93be3cf2e4");
+        assert_eq!(BAIDU_TONGJI_SITE_ID, "b18f7c7bbeab70682b0a359e6b7b058d");
     }
 }

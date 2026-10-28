@@ -40,6 +40,7 @@ import {
 } from "./font";
 import { changeZoom, onZoomChange, readZoomPct, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP } from "@/lib/zoom";
 import { PromptHistoryManager, PromptHistoryToggleRow } from "./PromptHistorySettings";
+import { FileTreeHideIgnoredRow } from "./FileTreeHideIgnoredRow";
 import { useChatStore } from "@/features/chat/store";
 
 export const LANGUAGE_STORAGE_KEY = "ccgui-next.language";
@@ -395,6 +396,7 @@ function AppearanceCard({
           >
             <SelectItem id="zh">{t("settings.langZh")}</SelectItem>
             <SelectItem id="en">{t("settings.langEn")}</SelectItem>
+            <SelectItem id="ko">{t("settings.langKo")}</SelectItem>
           </Select>
         </SettingsRow>
         <ZoomRow />
@@ -755,7 +757,7 @@ function fileName(path: string): string {
 }
 
 /** Behavior card: composer send shortcut, thinking auto-collapse, prompt
- *  history. */
+ *  history, hiding Git-ignored files in the file tree. */
 function BehaviorCard({
   settings,
   onSendShortcutChange,
@@ -801,6 +803,7 @@ function BehaviorCard({
           />
         </SettingsRow>
         <PromptHistoryToggleRow />
+        <FileTreeHideIgnoredRow />
       </SettingsCard>
     </div>
   );

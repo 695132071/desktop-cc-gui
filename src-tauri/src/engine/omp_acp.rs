@@ -1001,6 +1001,7 @@ mod tests {
             engine_id: "omp".to_string(),
             run_id: "test-run".to_string(),
             db: None,
+            followup: None,
         };
         (core, registry, emitter)
     }

@@ -13,6 +13,7 @@ pub(crate) fn resolve_claude_channel_model(
     claude_channel::resolve_model(selected, Some(provider), env)
 }
 pub mod codex;
+pub mod codebuddy;
 mod codex_app;
 mod codex_provider_env;
 mod codex_read_only;
@@ -288,6 +289,7 @@ pub fn engine_by_id(id: &str) -> Option<Box<dyn Engine>> {
         "claude" => Some(Box::new(claude::ClaudeEngine::new())),
         "kimi" => Some(Box::new(kimi::KimiEngine)),
         "minimax" => Some(Box::new(minimax::MiniMaxEngine)),
+        "codebuddy" => Some(Box::new(codebuddy::CodeBuddyEngine::new())),
         "grok" => Some(Box::new(grok::GrokEngine)),
         "codex" => Some(Box::new(codex::CodexEngine)),
         "pi" => Some(Box::new(pi_family::pi())),
@@ -654,6 +656,12 @@ fn prepare_launch(
         ("claude", Some(provider)) => {
             claude_channel::apply(&mut built, provider, &channel_env, &req)
         }
+        ("codebuddy", Some(_)) => codebuddy::apply_channel(
+            &mut built,
+            &channel_env,
+            req.model.as_deref(),
+            &crate::paths::app_home().join("codebuddy-staging"),
+        ),
         ("kimi", Some(_)) => kimi::apply_channel(&mut built.command, &channel_env, &req),
         ("codex", Some(provider)) => {
             codex::apply_channel(&mut built.command, provider, &channel_env, &req)
@@ -892,6 +900,38 @@ async fn send_message_inner_with_sink(
     memory_bot: Option<String>,
     allowed_tools: Option<Vec<String>>,
 ) -> Result<SendResult, String> {
+    // A claude process may still be alive for a background task's follow-up
+    // turn on this very session. A new process would stop that task, so the
+    // prompt goes into the live one instead and its events keep their run id.
+    // Chat sends only: plugin and mission turns report on their own event
+    // streams, and the idle process reports on the chat one. Computer-use
+    // sends must launch fresh — the driver is mounted via launch flags.
+    if engine == "claude" && Arc::ptr_eq(&sink, &state.sink) && computer_use != Some(true) {
+        let workspace = PathBuf::from(&workspace_path);
+        let images = image_paths.clone().unwrap_or_default();
+        let effective = effective_prompt(&prompt, prompt_contributions.clone());
+        let prefs = registry::FollowupPrefs {
+            model: model.clone(),
+            effort: effort.clone(),
+            permission: permission.clone(),
+            provider_id: provider_id.clone(),
+            memory_bot: memory_bot.clone(),
+            allowed_tools: allowed_tools.clone(),
+        };
+        if let Some(live_run) = deliver_to_idle_followup(
+            &state.processes,
+            session_id.as_deref(),
+            &prefs,
+            || images::claude_stdin_message(&effective, &images, &workspace),
+        )
+        .await?
+        {
+            return Ok(SendResult {
+                run_id: live_run,
+                session_id,
+            });
+        }
+    }
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if run_id.is_empty()
         || run_id.len() > 128
@@ -962,6 +1002,40 @@ async fn send_message_inner_with_sink(
         state.processes.remove_reservation(&reserved);
     }
     result
+}
+/// Write a new prompt into the process that settled its turn but stays alive
+/// for a background task's follow-up turn on `session_id`. Returns that run's
+/// id, or None when no such process exists, its launch settings no longer
+/// match this send (a live process cannot take new launch flags), or it can
+/// no longer take input — a mismatched or unwritable one is killed so the
+/// caller's normal `--resume` launch cannot race it on the same session.
+async fn deliver_to_idle_followup(
+    registry: &Arc<ProcessRegistry>,
+    session_id: Option<&str>,
+    prefs: &registry::FollowupPrefs,
+    message: impl FnOnce() -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let Some(awaiting) = session_id.and_then(|id| registry.take_awaiting_followup(id)) else {
+        return Ok(None);
+    };
+    let idle_run = awaiting.run_id;
+    let kill_idle = |registry: &Arc<ProcessRegistry>, run: &str| {
+        let registry = Arc::clone(registry);
+        let run = run.to_string();
+        async move {
+            let _ = tauri::async_runtime::spawn_blocking(move || registry.kill(&run)).await;
+        }
+    };
+    if &awaiting.prefs != prefs {
+        kill_idle(registry, &idle_run).await;
+        return Ok(None);
+    }
+    let line = message()?;
+    if registry.write_line(&idle_run, line).await.is_ok() {
+        return Ok(Some(idle_run));
+    }
+    kill_idle(registry, &idle_run).await;
+    Ok(None)
 }
 /// Body of [`send_message_inner`] once the run id is reserved: the caller id
 /// is used as-is (never regenerated — the frontend pre-routes events by it),
@@ -1208,6 +1282,18 @@ async fn send_reserved(
             engine_id: engine.clone(),
             run_id: run_id.clone(),
             db: Some(Arc::clone(&state.db)),
+            // Only chat claude runs park for a background follow-up turn;
+            // snapshot the launch settings so a later send can detect drift.
+            followup: (engine == "claude" && Arc::ptr_eq(&sink, &state.sink)).then(|| {
+                registry::FollowupPrefs {
+                    model: launch.req.model.clone(),
+                    effort: launch.req.effort.clone(),
+                    permission: launch.req.permission.clone(),
+                    provider_id: launch.req.provider_id.clone(),
+                    memory_bot: launch.req.memory_bot.clone(),
+                    allowed_tools: launch.req.allowed_tools.clone(),
+                }
+            }),
         },
         engine_impl: launch.engine_impl,
         pid,
@@ -1271,6 +1357,8 @@ async fn send_host_stream(
         engine_id: engine.clone(),
         run_id: run_id.clone(),
         db: Some(Arc::clone(&state.db)),
+        // Host-stream engines never emit BackgroundTasks; no follow-up parking.
+        followup: None,
     };
     let resume_session_id = launch.req.session_id.clone();
     let task = match engine.as_str() {
@@ -1843,6 +1931,100 @@ mod prompt_contribution_tests {
             prompt,
             "visible\n\n[CCGUI internal system-tail]\nsystem context\n\n[CCGUI internal request-tail]\nrequest context"
         );
+    }
+}
+
+#[cfg(test)]
+mod codebuddy_launch_tests {
+    use super::*;
+
+    struct ScratchHome {
+        dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_profile: Option<std::ffi::OsString>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new() -> Self {
+            let lock = crate::paths::HOME_ENV_LOCK.lock();
+            let dir = std::env::temp_dir().join(format!(
+                "ccgui-codebuddy-launch-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("USERPROFILE", &dir);
+            Self {
+                dir,
+                previous_home,
+                previous_profile,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_profile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn channel_model_reaches_overlay_when_request_has_no_model() {
+        let home = ScratchHome::new();
+        let mut config = crate::config::CliConfig::default();
+        let section = config.section_mut("codebuddy").unwrap();
+        section.providers.insert(
+            "channel".into(),
+            serde_json::json!({"model":"channel-model"}),
+        );
+        section.current = Some("channel".into());
+        crate::paths::ensure_dirs().unwrap();
+        crate::settings::atomic_write(
+            &crate::paths::config_path(),
+            &serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let launch = prepare_launch(
+            "codebuddy",
+            home.dir.join("workspace").to_str().unwrap(),
+            None,
+            "hello".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(launch.req.model, None);
+        assert_eq!(launch.built.cleanup_files.len(), 1);
+        let overlay: Value = serde_json::from_slice(
+            &std::fs::read(&launch.built.cleanup_files[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overlay["model"], "channel-model");
+        assert_eq!(overlay["env"]["CODEBUDDY_MODEL"], "channel-model");
+        cleanup_staged_files(&launch.built.cleanup_files);
     }
 }
 
@@ -2571,6 +2753,64 @@ mod retry_lifecycle_tests {
         }
     }
 
+    fn test_followup_prefs() -> registry::FollowupPrefs {
+        registry::FollowupPrefs {
+            model: None,
+            effort: None,
+            permission: None,
+            provider_id: None,
+            memory_bot: None,
+            allowed_tools: None,
+        }
+    }
+
+    /// Done with a background task pending settles the turn but parks the run
+    /// as idle-for-follow-up; the follow-up's first content reopens it, and a
+    /// done with nothing pending closes it for good.
+    #[tokio::test]
+    async fn done_with_pending_background_task_parks_and_resumes_the_run() {
+        let emitter = Arc::new(CollectingEmitter::default());
+        let registry = Arc::new(ProcessRegistry::default());
+        let core = TurnCore {
+            sink: event_sink::EventSink::new(emitter.clone()),
+            registry: Arc::clone(&registry),
+            engine_id: "claude".to_string(),
+            run_id: "bg-run".to_string(),
+            db: None,
+            followup: Some(test_followup_prefs()),
+        };
+        let mut state = TurnState::new(Some("s-1".to_string()));
+        let done = || EngineEvent::Done {
+            session_id: None,
+            usage: None,
+        };
+
+        core.dispatch_event(&mut state, EngineEvent::BackgroundTasks { pending: 1 });
+        core.dispatch_event(&mut state, done());
+        assert!(!state.saw_done, "the run must stay open for the follow-up turn");
+        assert_eq!(
+            registry.take_awaiting_followup("s-1").map(|a| a.run_id).as_deref(),
+            Some("bg-run")
+        );
+        registry.set_awaiting_followup("s-1", "bg-run", test_followup_prefs());
+
+        core.dispatch_event(&mut state, EngineEvent::BackgroundTasks { pending: 0 });
+        core.dispatch_event(&mut state, EngineEvent::Delta("later".to_string()));
+        assert!(registry.take_awaiting_followup("s-1").is_none(), "resumed run is no longer idle");
+
+        core.dispatch_event(&mut state, done());
+        assert!(state.saw_done);
+        core.sink.flush();
+        let kinds: Vec<_> = emitter
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, ["done", "turn_resumed", "delta", "done"]);
+    }
+
     #[tokio::test]
     async fn terminal_error_cannot_be_followed_by_live_retry_events() {
         let emitter = Arc::new(CollectingEmitter::default());
@@ -2580,6 +2820,7 @@ mod retry_lifecycle_tests {
             engine_id: "omp".to_string(),
             run_id: "settled-run".to_string(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(Some("session".to_string()));
         for event in [
@@ -2607,6 +2848,14 @@ mod retry_lifecycle_tests {
     }
 
     async fn replay_cli_output(lines: &[Value]) -> Vec<Value> {
+        replay_engine_output("omp", Box::new(pi_family::omp()), lines).await
+    }
+
+    async fn replay_engine_output(
+        engine_id: &str,
+        engine_impl: Box<dyn Engine>,
+        lines: &[Value],
+    ) -> Vec<Value> {
         let path = std::env::temp_dir().join(format!("ccgui-retry-{}.jsonl", uuid::Uuid::new_v4()));
         let mut text = lines
             .iter()
@@ -2631,11 +2880,13 @@ mod retry_lifecycle_tests {
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::new(ProcessRegistry::default()),
-                engine_id: "omp".to_string(),
+                engine_id: engine_id.to_string(),
                 run_id: "pipe-retry-run".to_string(),
                 db: None,
+                // Chat-eligible so claude replays exercise follow-up parking.
+                followup: Some(test_followup_prefs()),
             },
-            engine_impl: Box::new(pi_family::omp()),
+            engine_impl,
             pid: child.id().unwrap(),
             preassigned_session_id: Some("session".to_string()),
             initial_model: None,
@@ -2684,6 +2935,7 @@ mod retry_lifecycle_tests {
                 engine_id: "codex".to_string(),
                 run_id: "plain-stdout-run".to_string(),
                 db: None,
+                followup: None,
             },
             engine_impl: Box::new(codex::CodexEngine),
             pid: child.id().unwrap(),
@@ -2708,6 +2960,355 @@ mod retry_lifecycle_tests {
         let data = last["data"].as_str().unwrap();
         assert!(data.contains("codex exited with status"), "{data}");
         assert!(data.contains("unrecognized arguments"), "{data}");
+    }
+
+    fn claude_text_delta(text: &str) -> Value {
+        serde_json::json!({"type":"stream_event","event":{
+            "type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":text}}})
+    }
+
+    fn claude_result() -> Value {
+        serde_json::json!({"type":"result","subtype":"success","is_error":false,
+            "usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11}})
+    }
+
+    fn claude_tasks_changed(task_ids: &[&str]) -> Value {
+        let tasks: Vec<Value> = task_ids
+            .iter()
+            .map(|id| serde_json::json!({"task_id":id,"task_type":"local_bash"}))
+            .collect();
+        serde_json::json!({"type":"system","subtype":"background_tasks_changed","tasks":tasks})
+    }
+
+    /// Event order captured from the real CLI (`run_in_background` Bash):
+    /// result #1 lands while the task still runs, the CLI then starts a
+    /// second turn on its own when the task completes and reports there.
+    #[tokio::test]
+    async fn claude_background_task_followup_turn_is_not_dropped() {
+        let events = replay_engine_output(
+            "claude",
+            Box::new(claude::ClaudeEngine::new()),
+            &[
+                serde_json::json!({"type":"system","subtype":"init"}),
+                claude_tasks_changed(&["bg1"]),
+                serde_json::json!({"type":"system","subtype":"task_started","task_id":"bg1"}),
+                claude_text_delta("started"),
+                claude_result(),
+                serde_json::json!({"type":"system","subtype":"task_notification","task_id":"bg1","status":"completed"}),
+                claude_tasks_changed(&[]),
+                serde_json::json!({"type":"system","subtype":"init"}),
+                claude_text_delta("background task finished"),
+                claude_result(),
+            ],
+        )
+        .await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["delta", "done", "turn_resumed", "delta", "done"],
+            "{events:?}"
+        );
+        assert_eq!(events[3]["data"], "background task finished");
+    }
+
+    /// Raw stream captured from the real CLI (`run_in_background` Bash,
+    /// `sleep 8`): the first result fires while the task runs, the follow-up
+    /// turn arrives after `task_notification` and must reach the user.
+    #[tokio::test]
+    async fn claude_real_cli_background_capture_delivers_followup_text() {
+        let lines: Vec<Value> = include_str!("testdata/claude_background_task.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let events =
+            replay_engine_output("claude", Box::new(claude::ClaudeEngine::new()), &lines).await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "done").count(),
+            2,
+            "{events:?}"
+        );
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "turn_resumed").count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(kinds.last(), Some(&"done"), "{events:?}");
+        let first_done = kinds.iter().position(|kind| *kind == "done").unwrap();
+        let resumed = kinds
+            .iter()
+            .position(|kind| *kind == "turn_resumed")
+            .unwrap();
+        assert!(first_done < resumed, "{events:?}");
+        let text: String = events
+            .iter()
+            .filter(|event| event["kind"] == "delta")
+            .filter_map(|event| event["data"].as_str())
+            .collect();
+        assert!(
+            text.contains("BGFINISHED"),
+            "follow-up turn text lost: {text:?}"
+        );
+    }
+
+    /// Raw stream captured from a real `--resume` process started while a
+    /// background task of the previous process was still pending: the CLI
+    /// stops that task and emits an empty `num_turns: 0` result before it
+    /// answers the new message. That result is not the end of the user's turn.
+    #[tokio::test]
+    async fn claude_resume_after_background_task_keeps_the_reply() {
+        let lines: Vec<Value> = include_str!("testdata/claude_resume_after_background.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let events =
+            replay_engine_output("claude", Box::new(claude::ClaudeEngine::new()), &lines).await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        let text: String = events
+            .iter()
+            .filter(|event| event["kind"] == "delta")
+            .filter_map(|event| event["data"].as_str())
+            .collect();
+        assert_eq!(text, "PONG2", "{events:?}");
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "done").count(),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(kinds.last(), Some(&"done"), "{events:?}");
+    }
+
+    /// Raw stream captured from one real process that got a second user
+    /// message while its background task was still running: both replies
+    /// arrive in order, the task is never stopped, and the run is reopened for
+    /// each turn that follows a settled one.
+    #[tokio::test]
+    async fn claude_message_during_background_task_gets_its_own_reply() {
+        let lines: Vec<Value> = include_str!("testdata/claude_message_during_background.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let events =
+            replay_engine_output("claude", Box::new(claude::ClaudeEngine::new()), &lines).await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        let replies: Vec<String> = events
+            .iter()
+            .fold(vec![String::new()], |mut replies, event| {
+                match event["kind"].as_str().unwrap() {
+                    "delta" => replies
+                        .last_mut()
+                        .unwrap()
+                        .push_str(event["data"].as_str().unwrap()),
+                    "done" => replies.push(String::new()),
+                    _ => {}
+                }
+                replies
+            })
+            .into_iter()
+            .filter(|reply| !reply.is_empty())
+            .collect();
+        assert_eq!(replies, ["started", "PONG2", "BGFINISHED"], "{events:?}");
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "done").count(),
+            3,
+            "{events:?}"
+        );
+        assert_eq!(
+            kinds.iter().filter(|kind| **kind == "turn_resumed").count(),
+            2,
+            "{events:?}"
+        );
+        assert_eq!(kinds.last(), Some(&"done"), "{events:?}");
+    }
+
+    async fn idle_followup_child(
+        registry: &Arc<ProcessRegistry>,
+        run_id: &str,
+        session_id: &str,
+    ) -> tokio::process::Child {
+        let mut command = if cfg!(windows) {
+            tokio::process::Command::new("sort")
+        } else {
+            tokio::process::Command::new("cat")
+        };
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = Arc::new(TokioMutex::new(child.stdin.take()));
+        registry.insert(
+            run_id.to_string(),
+            ChildEntry {
+                child: None,
+                pid: child.id().unwrap(),
+                run_id: run_id.to_string(),
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                reader_abort: Arc::new(std::sync::OnceLock::new()),
+                stdin: Some(stdin),
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        registry.set_awaiting_followup(session_id, run_id, test_followup_prefs());
+        child
+    }
+
+    /// A send on a session whose process idles for a background follow-up goes
+    /// into that live process under its own run id, so the task keeps running.
+    #[tokio::test]
+    async fn send_during_idle_followup_is_written_to_the_live_process() {
+        use tokio::io::AsyncReadExt;
+        let registry = Arc::new(ProcessRegistry::default());
+        let mut child = idle_followup_child(&registry, "idle-run", "s-1").await;
+
+        let delivered =
+            deliver_to_idle_followup(&registry, Some("s-1"), &test_followup_prefs(), || {
+                Ok("{\"type\":\"user\"}".to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(delivered.as_deref(), Some("idle-run"));
+
+        // EOF the process's stdin so it flushes what it received.
+        registry
+            .get("idle-run")
+            .and_then(|entry| entry.stdin)
+            .unwrap()
+            .lock()
+            .await
+            .take();
+        let mut echoed = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            child.stdout.take().unwrap().read_to_string(&mut echoed),
+        )
+        .await;
+        let _ = child.kill().await;
+        read.expect("process echoed its stdin before the timeout")
+            .unwrap();
+        assert_eq!(echoed.trim(), "{\"type\":\"user\"}");
+    }
+
+    /// No idle process, or one that can no longer take input, falls back to
+    /// the normal launch; the unwritable one is left unregistered as idle.
+    #[tokio::test]
+    async fn send_without_a_writable_idle_process_falls_back_to_launch() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let make = || Ok("{}".to_string());
+        assert_eq!(
+            deliver_to_idle_followup(&registry, Some("s-1"), &test_followup_prefs(), make)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            deliver_to_idle_followup(&registry, None, &test_followup_prefs(), make)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let mut child = idle_followup_child(&registry, "idle-run", "s-2").await;
+        registry
+            .get("idle-run")
+            .and_then(|entry| entry.stdin)
+            .unwrap()
+            .lock()
+            .await
+            .take();
+        assert_eq!(
+            deliver_to_idle_followup(&registry, Some("s-2"), &test_followup_prefs(), make)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(registry.take_awaiting_followup("s-2").is_none());
+        let _ = child.kill().await;
+    }
+
+    /// A live process cannot take new launch flags: a send whose model (or
+    /// any launch setting) drifted from the parked run's falls back to a
+    /// fresh process, and the idle one is killed so the resume cannot race
+    /// it on the same session. The message closure must not even run.
+    #[tokio::test]
+    async fn send_with_drifted_settings_kills_the_idle_process_and_falls_back() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let mut child = idle_followup_child(&registry, "idle-run", "s-3").await;
+        let drifted = registry::FollowupPrefs {
+            model: Some("opus".to_string()),
+            ..test_followup_prefs()
+        };
+        let delivered = deliver_to_idle_followup(&registry, Some("s-3"), &drifted, || {
+            panic!("the prompt must not be built for a mismatched process")
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, None);
+        assert!(registry.take_awaiting_followup("s-3").is_none());
+        // kill() goes through spawn_blocking; the run's killed flag is how a
+        // child-less entry records it (the real path start_kills the child).
+        let killed = registry.get("idle-run").unwrap().killed;
+        for _ in 0..100 {
+            if killed.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = child.kill().await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("idle run was not killed after settings drift");
+    }
+
+    /// The first turn settles at its own result even with a task pending, so
+    /// the UI is idle; a CLI that then dies without a follow-up adds nothing.
+    #[tokio::test]
+    async fn claude_pending_background_task_still_settles_on_eof() {
+        let events = replay_engine_output(
+            "claude",
+            Box::new(claude::ClaudeEngine::new()),
+            &[
+                claude_tasks_changed(&["bg1"]),
+                claude_text_delta("started"),
+                claude_result(),
+            ],
+        )
+        .await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["delta", "done"], "{events:?}");
+    }
+
+    /// No background task: the first result is the end of the turn, exactly
+    /// as before.
+    #[tokio::test]
+    async fn claude_plain_turn_still_settles_on_first_result() {
+        let events = replay_engine_output(
+            "claude",
+            Box::new(claude::ClaudeEngine::new()),
+            &[claude_text_delta("hi"), claude_result()],
+        )
+        .await;
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["delta", "done"], "{events:?}");
     }
 
     #[tokio::test]
@@ -2806,6 +3407,7 @@ mod retry_lifecycle_tests {
                 engine_id: "omp".to_string(),
                 run_id: "pipe-held-run".to_string(),
                 db: None,
+                followup: None,
             },
             engine_impl: Box::new(pi_family::omp()),
             pid,
@@ -2997,7 +3599,25 @@ mod plan_respond_tests {
         );
     }
 
-    /// cat 子进程把收到的帧落进文件,返回 (child, stdin, 输出路径)。
+    /// 一个把 stdin 原样转到 stdout 的子进程；stdout 落进文件，返回
+    /// (child, stdin, 输出路径)。Unix 用 `cat`；Windows 没有 `cat`，而 `more`
+    /// 会分页并把制表符展开——这三个用例断言的是应用写进原生进程的帧，任何改写
+    /// 都会让断言失去意义，所以让 PowerShell 逐字节复制标准流。
+    fn frame_sink_command() -> tokio::process::Command {
+        if cfg!(windows) {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())",
+            ]);
+            command
+        } else {
+            tokio::process::Command::new("cat")
+        }
+    }
+
     fn spawn_frame_sink(
         tag: &str,
     ) -> (
@@ -3010,7 +3630,7 @@ mod plan_respond_tests {
             std::process::id()
         ));
         let out_file = std::fs::File::create(&out_path).unwrap();
-        let mut child = tokio::process::Command::new("cat")
+        let mut child = frame_sink_command()
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::from(out_file))
             .spawn()

@@ -1,13 +1,13 @@
 use super::discovery::{
-    codex_candidates, discover_agy, discover_claude, discover_grok, discover_kimi,
-    discover_minimax, discover_opencode, discover_qoder, dsh_candidates, identify_head,
-    is_codex_subagent_file, is_dsh_subagent_file, opencode_db_visible_sessions, path_is_under,
-    pi_family_candidates,
+    codebuddy_transcripts, codex_candidates, discover_agy, discover_claude, discover_codebuddy_in,
+    discover_grok, discover_kimi, discover_minimax, discover_opencode, discover_qoder,
+    dsh_candidates, identify_head, is_codex_subagent_file, is_dsh_subagent_file,
+    opencode_db_visible_sessions, path_is_under, pi_family_candidates,
 };
 use super::{same_or_child, scan_summary_file, split_opencode_db_path, stat_signature, ScanSummary};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -77,10 +77,14 @@ pub(super) fn scan_with_guard(
 
 // ---------- phase helpers (each stage is lock-free except where noted) ----------
 
-/// Enumerate every candidate session file (readdir/index only, no content).
+/// Enumerate every candidate session file (filename/index engines use no content).
 fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // CodeBuddy project dirs are CLI-private, so attribution needs each
+    // transcript's recorded cwd. Its bounded cache reads only new/changed heads,
+    // once per file rather than once per workspace.
+    let codebuddy = codebuddy_transcripts();
     for workspace_path in workspaces {
         let workspace = PathBuf::from(workspace_path);
         // Filename/index-keyed engines identify cheaply per workspace.
@@ -99,6 +103,7 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
                 crate::engine::qoder::QoderDistribution::Cn,
             ))
             .chain(discover_opencode(&workspace))
+            .chain(discover_codebuddy_in(&codebuddy, &workspace))
         {
             if seen_paths.insert(file.file_path.clone()) {
                 candidates.push(Candidate {
@@ -498,6 +503,163 @@ fn prune_opencode_hidden_sessions(db: &crate::db::Db) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Conservative existence check: only NotFound counts as gone, and only on
+/// storage that is attached right now. Permission errors, device-not-ready,
+/// offline SMB roots and similar failures must never wipe indexed history.
+/// Storage is probed first so a detached drive costs one probe per pass
+/// rather than one per row.
+fn definitely_missing(path: &Path, attached: &mut HashMap<PathBuf, bool>) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    storage_attached(dir, attached)
+        && std::fs::symlink_metadata(path)
+            .err()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A detached volume answers NotFound too: Rust maps Windows
+/// ERROR_INVALID_DRIVE / ERROR_BAD_NETPATH / ERROR_BAD_NET_NAME to NotFound,
+/// and an unmounted macOS volume leaves `/Volumes/<name>` absent. Dropping
+/// those rows would lose their pin, custom title and plan reviews, which a
+/// rescan after re-attaching cannot restore. So a NotFound counts only when
+/// the nearest existing ancestor is a real directory: one must exist at all
+/// (a gone Windows drive has none, not even its root), it must not be a
+/// dangling symlink (an engine home linked onto a detached disk), and it must
+/// not be a bare mount container. Verdicts are memoized per directory for one
+/// GC pass.
+fn storage_attached(dir: &Path, verdicts: &mut HashMap<PathBuf, bool>) -> bool {
+    // Settle the volume root first: a gone drive fails here once per pass.
+    if let Some(root) = dir.ancestors().last().filter(|root| *root != dir) {
+        if !storage_attached(root, verdicts) {
+            return false;
+        }
+    }
+    let mut visited: Vec<&Path> = Vec::new();
+    let mut verdict = false;
+    for ancestor in dir.ancestors() {
+        if let Some(&known) = verdicts.get(ancestor) {
+            verdict = known;
+            break;
+        }
+        visited.push(ancestor);
+        // A relative path's walk ends at "", the working directory.
+        let probe = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        match std::fs::symlink_metadata(probe) {
+            Ok(meta) => {
+                let dangling = meta.file_type().is_symlink() && std::fs::metadata(probe).is_err();
+                verdict = !dangling && !is_mount_container(ancestor);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Unreadable ancestor: existence below it is unknowable.
+            Err(_) => break,
+        }
+    }
+    for path in visited {
+        verdicts.insert(path.to_path_buf(), verdict);
+    }
+    verdict
+}
+
+/// Directories that only hold mount points (macOS `/Volumes`, Linux `/mnt`,
+/// `/media`, `/run/media`) and their direct children (the per-volume or
+/// per-user level). As the nearest existing ancestor they mean the volume
+/// beneath unmounted, not that the transcript was deleted.
+fn is_mount_container(dir: &Path) -> bool {
+    ["/Volumes", "/mnt", "/media", "/run/media"]
+        .iter()
+        .map(Path::new)
+        .any(|container| dir == container || dir.parent() == Some(container))
+}
+
+/// UNC roots (`\\server\share`, `\\wsl.localhost\...`) have unreliable
+/// existence semantics from the host. `\\?\C:\...` is a local extended-length
+/// path and must NOT be treated as remote; `\\?\UNC\...` is UNC again.
+fn is_remote_path(path: &str) -> bool {
+    if path.starts_with("\\\\?\\UNC\\") {
+        return true;
+    }
+    if path.starts_with("\\\\?\\") {
+        return false;
+    }
+    path.starts_with("\\\\")
+}
+
+/// Phase B follow-up: drop rows whose transcript file is definitely gone.
+/// Files deleted outside the app (CLI-side cleanup, engine-home migration,
+/// leftovers from older versions) used to stay in `sessions` forever, listed
+/// as unopenable ghost sessions (upstream #1083 / #1086 / #1103 / #1104).
+///
+/// Deletion is conservative on purpose:
+/// - only rows whose file_path is not in this scan's FULL candidate set
+///   (reused/unchanged candidates must not be dropped: the reparsed rows are
+///   only a subset);
+/// - the file must be NotFound, never another error, and its storage must be
+///   attached (see [`storage_attached`]);
+/// - remote UNC paths are skipped, and OpenCode's synthetic
+///   `opencode.db#session-id` addresses are skipped too — they are not real
+///   files, so metadata on them is always NotFound (their row-level lifecycle
+///   is handled by explicit opencode deletion, not file GC).
+fn prune_missing_file_sessions(
+    db: &crate::db::Db,
+    candidates: &[Candidate],
+) -> Result<bool, String> {
+    let live: HashSet<PathBuf> = candidates.iter().map(|c| c.path.clone()).collect();
+    // Short lock for the row read; all file probing happens outside the lock
+    // so metadata I/O cannot stretch the write-side critical section.
+    let rows: Vec<(String, String, String)> = {
+        let conn = db.0.lock();
+        let mut stmt = conn
+            .prepare("SELECT engine, session_id, file_path FROM sessions WHERE file_path <> ''")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            match row {
+                Ok(row) => out.push(row),
+                Err(e) => eprintln!("[scanner] skipping undecodable session row in file GC: {e}"),
+            }
+        }
+        out
+    };
+    let mut attached: HashMap<PathBuf, bool> = HashMap::new();
+    let mut dead: Vec<(String, String)> = Vec::new();
+    for (engine, session_id, file_path) in rows {
+        let path = PathBuf::from(&file_path);
+        if live.contains(&path)
+            || is_remote_path(&file_path)
+            || super::split_opencode_db_path(&path).is_some()
+        {
+            continue;
+        }
+        if definitely_missing(&path, &mut attached) {
+            dead.push((engine, session_id));
+        }
+    }
+    if dead.is_empty() {
+        return Ok(false);
+    }
+    let conn = db.0.lock();
+    for (engine, id) in &dead {
+        conn.execute(
+            "DELETE FROM sessions WHERE engine=?1 AND session_id=?2",
+            rusqlite::params![engine, id],
+        )
+        .map_err(|e| e.to_string())?;
+        crate::engine::plan_review::delete_reviews_for_session(&conn, engine, id)?;
+    }
+    Ok(true)
+}
+
 fn prune_stale_sessions(db: &crate::db::Db) -> Result<bool, String> {
     let outside = prune_codex_sessions_outside_home(db)?;
     let subagent = prune_hidden_subagent_sessions(db)?;
@@ -582,8 +744,13 @@ fn scan_inner(
     let (accepted, accepted_signature) = db.accepted_internal_frame_index()?;
     let (stats, signature) = stat_all(&workspaces, &candidates, &accepted_signature);
     let Some(tier1) = tier1_gate(db, signature)? else {
+        // An unchanged signature only says no candidate moved. A row whose
+        // file vanished before this build ever indexed it (older versions
+        // never reclaimed one) is invisible to the signature, so the file GC
+        // runs here too; rows still in the candidate set cost no I/O.
+        let missing = prune_missing_file_sessions(db, &candidates)?;
         let pruned = prune_stale_sessions(db)?;
-        if super::codex_titles::sync(db)? || pruned {
+        if super::codex_titles::sync(db)? || pruned || missing {
             on_changed();
         }
         return Ok(ScanReport {
@@ -648,6 +815,7 @@ fn scan_inner(
         &tier1,
         !tier1.retitle_pending || retitle_complete,
     )?;
+    prune_missing_file_sessions(db, &candidates)?;
     prune_stale_sessions(db)?;
     super::codex_titles::sync(db)?;
     on_changed();
@@ -704,9 +872,26 @@ pub(super) mod tests {
     /// Point HOME at a scratch dir for the duration of a test.
     /// Serialized: two tests mutating HOME in parallel would clobber each other.
     pub(crate) use crate::paths::HOME_ENV_LOCK as HOME_LOCK;
+
+    /// 引擎自己的 home 变量：`engine_home()` / `codex_home()` **优先**读它们，
+    /// 读不到才回落到 HOME / USERPROFILE。
+    ///
+    /// 测试要的是"整个引擎都指向临时 home"，只改 HOME 做不到：机器上设过
+    /// `DSH_HOME` / `CODEX_HOME` 这类变量时，扫描会落到 scratch 之外的目录，看不到
+    /// 测试布置的会话文件，于是同一套测试随环境变红、且只红在设过变量的机器上。
+    /// 所以这些变量在 `set` 时一并摘掉、`drop` 时按原样恢复。
+    const ENGINE_HOME_KEYS: [&str; 5] = [
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "KIMI_HOME",
+        "DSH_HOME",
+        "MINIMAX_DATA_DIR",
+    ];
+
     pub struct HomeGuard {
         _lock: parking_lot::MutexGuard<'static, ()>,
         prev: HomeEnvPair,
+        engine_homes: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
     impl HomeGuard {
         pub fn set(home: &Path) -> Self {
@@ -719,9 +904,19 @@ pub(super) mod tests {
             // typical Windows case).
             let prev_profile = std::env::var_os("USERPROFILE");
             std::env::set_var("USERPROFILE", home);
+            // 摘掉引擎级变量：它们排在 HOME / USERPROFILE 之前生效。
+            let engine_homes = ENGINE_HOME_KEYS
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    std::env::remove_var(key);
+                    (key, previous)
+                })
+                .collect();
             Self {
                 _lock: lock,
                 prev: HomeEnvPair(prev, prev_profile),
+                engine_homes,
             }
         }
     }
@@ -738,6 +933,13 @@ pub(super) mod tests {
             match profile {
                 Some(value) => std::env::set_var("USERPROFILE", value),
                 None => std::env::remove_var("USERPROFILE"),
+            }
+            // 引擎级变量按原样恢复：原本没设的保持"没设"。
+            for (key, value) in &self.engine_homes {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }
@@ -931,6 +1133,108 @@ pub(super) mod tests {
             assert_eq!(preview, "answer");
         }
         assert_eq!(scan_with(&db, || {})?.reparsed, 0);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn scan_codebuddy_reads_only_new_or_changed_identity_heads() -> Result<(), String> {
+        let home = scratch_dir(&format!("scan-codebuddy-cache-{}", uuid::Uuid::new_v4()));
+        let workspace_a = home.join("ws-a");
+        let workspace_b = home.join("ws-b");
+        let config_dir = home.join("codebuddy-config");
+        let project_dir = config_dir.join("projects").join("private-project-name");
+        std::fs::create_dir_all(&workspace_a).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&workspace_b).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&project_dir).map_err(|e| e.to_string())?;
+        let first = project_dir.join("first.jsonl");
+        let second = project_dir.join("second.jsonl");
+        let write_transcript = |path: &Path, id: &str, cwd: &Path, title: &str| {
+            let line = serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": title}],
+                "sessionId": id,
+                "cwd": cwd.to_string_lossy(),
+            });
+            std::fs::write(path, format!("{line}\n")).map_err(|e| e.to_string())
+        };
+        write_transcript(&first, "first", &workspace_a, "first title")?;
+
+        let _home_guard = HomeGuard::set(&home);
+        struct ConfigGuard(Option<std::ffi::OsString>);
+        impl Drop for ConfigGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CODEBUDDY_CONFIG_DIR", value),
+                    None => std::env::remove_var("CODEBUDDY_CONFIG_DIR"),
+                }
+            }
+        }
+        let previous_config = std::env::var_os("CODEBUDDY_CONFIG_DIR");
+        std::env::set_var("CODEBUDDY_CONFIG_DIR", &config_dir);
+        let _config_guard = ConfigGuard(previous_config);
+
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        {
+            let conn = db.0.lock();
+            for (id, workspace) in [("wa", &workspace_a), ("wb", &workspace_b)] {
+                conn.execute(
+                    "INSERT INTO workspaces(id, path, name) VALUES(?1, ?2, ?2)",
+                    rusqlite::params![id, workspace.to_string_lossy()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        let workspace_for = |id: &str| {
+            db.0.lock()
+                .query_row(
+                    "SELECT workspace_path FROM sessions WHERE engine='codebuddy' AND session_id=?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())
+        };
+
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("first")?, workspace_a.to_string_lossy().as_ref());
+
+        // The tier-1 no-op path still enumerates CodeBuddy before its gate, but
+        // the unchanged transcript's content must not be opened again.
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 0);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 0);
+
+        // A newly appearing file changes the tier-1 signature. Identify only
+        // that file; the existing head remains cached.
+        write_transcript(&second, "second", &workspace_b, "second title")?;
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("second")?, workspace_b.to_string_lossy().as_ref());
+
+        // Changing size and recorded cwd invalidates just this head and updates
+        // the complete history row through the normal scan pipeline.
+        write_transcript(&second, "second", &workspace_a, "updated second title")?;
+        super::super::discovery::reset_codebuddy_head_read_count();
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        assert_eq!(super::super::discovery::codebuddy_head_read_count(), 1);
+        assert_eq!(workspace_for("second")?, workspace_a.to_string_lossy().as_ref());
+        let title: String = db
+            .0
+            .lock()
+            .query_row(
+                "SELECT title FROM sessions WHERE engine='codebuddy' AND session_id='second'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        assert_eq!(title, "updated second title");
+
+        drop(workspace_for);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())
@@ -1538,6 +1842,10 @@ pub(super) mod tests {
             .join("sessions")
             .join("rollout-keep.jsonl");
         std::fs::create_dir_all(rollout.parent().unwrap()).map_err(|e| e.to_string())?;
+        // The transcript must actually exist: this test verifies the default
+        // home is not pruned by path prefix, and a real session has a real
+        // file (missing files are now reclaimed by the file-existence GC).
+        std::fs::write(&rollout, "{}\n").map_err(|e| e.to_string())?;
         let _guard = HomeGuard::set(&home);
         let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
         {
@@ -1606,5 +1914,319 @@ pub(super) mod tests {
         drop(db);
         std::fs::remove_dir_all(&home).ok();
         Ok(())
+    }
+
+    fn session_count(db: &crate::db::Db, engine: &str, session_id: &str) -> i64 {
+        db.0.lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE engine=?1 AND session_id=?2",
+                rusqlite::params![engine, session_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn scan_prunes_transcripts_deleted_outside_the_app() -> Result<(), String> {
+        // A transcript deleted outside the app (CLI cleanup, home migration)
+        // must not stay listed forever (upstream #1083 / #1086 / #1103).
+        let home = scratch_dir(&format!("gc-external-{}", uuid::Uuid::new_v4()));
+        let _guard = HomeGuard::set(&home);
+        struct HomeEnv(Option<std::ffi::OsString>);
+        impl Drop for HomeEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CODEX_HOME", value),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+        let _env = HomeEnv(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", home.join(".codex"));
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [workspace.to_string_lossy().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        let rollout = |id: &str| -> Result<PathBuf, String> {
+            let path = home
+                .join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("10")
+                .join("26")
+                .join(format!("rollout-2026-10-26T00-00-00-{id}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            let text = serde_json::json!({"type": "session_meta", "payload": {
+                "id": id, "cwd": workspace.to_string_lossy()
+            }})
+            .to_string()
+                + "\n";
+            std::fs::write(&path, text).map_err(|e| e.to_string())?;
+            Ok(path)
+        };
+        let keep = rollout("keep")?;
+        let gone = rollout("gone")?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        assert_eq!(session_count(&db, "codex", "gone"), 1);
+        // Delete outside the app: the next scan drops the dead row and keeps
+        // the unchanged (reused) one.
+        std::fs::remove_file(&gone).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "gone"), 0);
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        // Deleting again (already gone) is harmless.
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn file_gc_skips_remote_and_synthetic_paths() -> Result<(), String> {
+        let home = scratch_dir(&format!("gc-shapes-{}", uuid::Uuid::new_v4()));
+        let _guard = HomeGuard::set(&home);
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        let live_file = home.join("live.jsonl");
+        std::fs::write(&live_file, "{}\n").map_err(|e| e.to_string())?;
+        let ghost_file = home.join("ghost.jsonl"); // never created
+        let synthetic = super::super::opencode_db_session_path(
+            &home.join("opencode.db"),
+            "abc123",
+        );
+        {
+            let conn = db.0.lock();
+            for (engine, id, path) in [
+                ("claude", "live", live_file.to_string_lossy().into_owned()),
+                ("claude", "ghost", ghost_file.to_string_lossy().into_owned()),
+                ("claude", "unc", "\\\\server\\share\\ghost.jsonl".to_string()),
+                ("claude", "extended", "\\\\?\\UNC\\server\\share\\x.jsonl".to_string()),
+                ("claude", "extended-local", format!("\\\\?\\{}", ghost_file.to_string_lossy())),
+                ("opencode", "synthetic", synthetic.to_string_lossy().into_owned()),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title) VALUES(?1, ?2, ?3, ?4, 1, 1, 't')",
+                    rusqlite::params![engine, id, workspace.to_string_lossy(), path],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        let candidates = vec![Candidate {
+            engine: "claude",
+            path: live_file.clone(),
+            known_id: Some("live".into()),
+            known_workspace: Some(workspace.to_string_lossy().into_owned()),
+        }];
+        assert!(prune_missing_file_sessions(&db, &candidates)?);
+        // Local ghost row removed; live, UNC, extended-UNC and OpenCode's
+        // synthetic db#session-id address must survive.
+        assert_eq!(session_count(&db, "claude", "ghost"), 0);
+        assert_eq!(session_count(&db, "claude", "live"), 1);
+        assert_eq!(session_count(&db, "claude", "unc"), 1);
+        assert_eq!(session_count(&db, "claude", "extended"), 1);
+        // `\\?\C:\...` is a LOCAL extended-length path: still GC-eligible.
+        assert_eq!(session_count(&db, "claude", "extended-local"), 0);
+        assert_eq!(session_count(&db, "opencode", "synthetic"), 1);
+        // Idempotent: nothing left to prune.
+        assert!(!prune_missing_file_sessions(&db, &candidates)?);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    /// Restores CODEX_HOME on drop (HomeGuard only covers HOME/USERPROFILE).
+    struct CodexHomeEnv(Option<std::ffi::OsString>);
+    impl Drop for CodexHomeEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
+    /// A db with one registered workspace and CODEX_HOME at `codex_home`.
+    fn codex_gc_fixture(
+        home: &Path,
+        codex_home: &Path,
+    ) -> Result<(HomeGuard, CodexHomeEnv, PathBuf, crate::db::Db), String> {
+        let guard = HomeGuard::set(home);
+        let env = CodexHomeEnv(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", codex_home);
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let db = crate::db::Db::open_at(&home.join("app.db")).map_err(|e| e.to_string())?;
+        db.0.lock()
+            .execute(
+                "INSERT INTO workspaces(id, path, name) VALUES('w1', ?1, 'ws')",
+                [workspace.to_string_lossy().to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok((guard, env, workspace, db))
+    }
+
+    fn write_codex_rollout(
+        codex_home: &Path,
+        workspace: &Path,
+        id: &str,
+    ) -> Result<PathBuf, String> {
+        let path = codex_home
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("26")
+            .join(format!("rollout-2026-10-26T00-00-00-{id}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+        let text = serde_json::json!({"type": "session_meta", "payload": {
+            "id": id, "cwd": workspace.to_string_lossy()
+        }})
+        .to_string()
+            + "\n";
+        std::fs::write(&path, text).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
+    #[test]
+    fn file_gc_runs_even_when_disk_is_unchanged() -> Result<(), String> {
+        // A dead row left by an older version: its file vanished before this
+        // build ever scanned, so no stat signature change will announce it.
+        let home = scratch_dir(&format!("gc-unchanged-{}", uuid::Uuid::new_v4()));
+        let codex_home = home.join(".codex");
+        let (_guard, _env, workspace, db) = codex_gc_fixture(&home, &codex_home)?;
+        let keep = write_codex_rollout(&codex_home, &workspace, "keep")?;
+        scan_with(&db, || {})?;
+        let ghost = keep.with_file_name("rollout-2026-10-26T00-00-00-old.jsonl");
+        db.0.lock()
+            .execute(
+                "INSERT INTO sessions(engine, session_id, workspace_path, file_path, file_size, file_mtime_ms, title) VALUES('codex', 'old', ?1, ?2, 1, 1, 'ghost')",
+                rusqlite::params![workspace.to_string_lossy(), ghost.to_string_lossy()],
+            )
+            .map_err(|e| e.to_string())?;
+        let changed = std::cell::Cell::new(false);
+        let report = scan_with(&db, || changed.set(true))?;
+        assert_eq!(
+            report.reparsed, 0,
+            "the disk did not change: tier-1 short-circuit"
+        );
+        assert_eq!(session_count(&db, "codex", "old"), 0);
+        assert_eq!(session_count(&db, "codex", "keep"), 1);
+        assert!(changed.get(), "the sidebar must refresh after the GC");
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_gc_keeps_rows_on_detached_storage() -> Result<(), String> {
+        // The codex home is a symlink onto a disk that later detaches: every
+        // transcript reads NotFound, yet nothing was deleted. The rows, with
+        // the user's pin and title, must outlive the outage.
+        let home = scratch_dir(&format!("gc-detached-{}", uuid::Uuid::new_v4()));
+        let disk = home.join("disk");
+        std::fs::create_dir_all(disk.join("codex")).map_err(|e| e.to_string())?;
+        let codex_home = home.join(".codex");
+        std::os::unix::fs::symlink(disk.join("codex"), &codex_home).map_err(|e| e.to_string())?;
+        let (_guard, _env, workspace, db) = codex_gc_fixture(&home, &codex_home)?;
+        let rollout = write_codex_rollout(&codex_home, &workspace, "pinned")?;
+        scan_with(&db, || {})?;
+        db.0.lock()
+            .execute(
+                "UPDATE sessions SET pinned=1, custom_title='my name' WHERE engine='codex' AND session_id='pinned'",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        let user_fields = |db: &crate::db::Db| -> Result<(i64, Option<String>), String> {
+            db.0.lock()
+                .query_row(
+                    "SELECT pinned, custom_title FROM sessions WHERE engine='codex' AND session_id='pinned'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| e.to_string())
+        };
+        let parked = home.join("disk-parked");
+        std::fs::rename(&disk, &parked).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(
+            session_count(&db, "codex", "pinned"),
+            1,
+            "detached is not deleted"
+        );
+        std::fs::rename(&parked, &disk).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(user_fields(&db)?, (1, Some("my name".to_string())));
+        // Re-attached, a real deletion through the same link is reclaimed.
+        std::fs::remove_file(&rollout).map_err(|e| e.to_string())?;
+        scan_with(&db, || {})?;
+        assert_eq!(session_count(&db, "codex", "pinned"), 0);
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn storage_probe_separates_deleted_from_detached() {
+        for dir in [
+            "/Volumes",
+            "/Volumes/Backup",
+            "/mnt",
+            "/mnt/nas",
+            "/media/alice",
+            "/run/media",
+            "/run/media/alice",
+        ] {
+            assert!(is_mount_container(Path::new(dir)), "{dir}");
+        }
+        for dir in [
+            "/",
+            "/Users/alice",
+            "/Volumes/Backup/.codex",
+            "/mnt/nas/codex",
+            "/home/alice/.claude",
+        ] {
+            assert!(!is_mount_container(Path::new(dir)), "{dir}");
+        }
+        let home = scratch_dir(&format!("gc-probe-{}", uuid::Uuid::new_v4()));
+        let mut verdicts = HashMap::new();
+        // Missing directories under an existing one: attached storage, so a
+        // NotFound there is a real deletion (a whole kimi/grok session dir).
+        assert!(storage_attached(
+            &home.join("gone").join("deeper"),
+            &mut verdicts
+        ));
+        assert!(storage_attached(&home, &mut verdicts));
+        #[cfg(unix)]
+        {
+            let link = home.join("linked-home");
+            std::os::unix::fs::symlink(home.join("detached-disk"), &link).unwrap();
+            assert!(!storage_attached(&link.join("sessions"), &mut verdicts));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // An unmounted volume leaves only /Volumes behind.
+            let volume = format!("/Volumes/ccgui-missing-{}", uuid::Uuid::new_v4());
+            let sessions = Path::new(&volume).join(".codex").join("sessions");
+            assert!(!storage_attached(&sessions, &mut verdicts));
+        }
+        #[cfg(windows)]
+        {
+            // A drive letter that is not attached fails at its root.
+            if let Some(letter) =
+                ('D'..='Z').find(|c| std::fs::metadata(format!("{c}:\\")).is_err())
+            {
+                let sessions = PathBuf::from(format!("{letter}:\\ccgui\\sessions"));
+                assert!(!storage_attached(&sessions, &mut verdicts));
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

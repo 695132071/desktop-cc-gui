@@ -51,10 +51,32 @@ pub struct ChildEntry {
     pub plans: Arc<Mutex<HashMap<String, Value>>>,
 }
 
+/// Launch-time settings of a run parked for a background follow-up turn.
+/// A live process cannot accept new launch flags, so a send whose settings
+/// differ must not be written into it — it falls back to a fresh process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FollowupPrefs {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permission: Option<String>,
+    pub provider_id: Option<String>,
+    pub memory_bot: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+}
+/// A settled run kept alive for the CLI's self-started follow-up turn.
+#[derive(Debug, Clone)]
+pub(crate) struct AwaitingFollowup {
+    pub run_id: String,
+    pub prefs: FollowupPrefs,
+}
+
 #[derive(Default)]
 pub struct ProcessRegistry(
     pub Mutex<HashMap<String, ChildEntry>>,
     Mutex<HashMap<(String, String), oneshot::Sender<Result<Value, String>>>>,
+    /// native session id -> settled-but-parked run waiting for a background
+    /// task's self-started follow-up turn.
+    Mutex<HashMap<String, AwaitingFollowup>>,
 );
 /// Count in-flight runs, not map entries: one run is keyed twice (run id +
 /// session alias), so `map.len()` would halve the real concurrency limit.
@@ -237,6 +259,41 @@ impl ProcessRegistry {
                 (plan_id, revision, context)
             })
             .collect()
+    }
+
+    /// Record that `run_id` settled its turn but still waits for the CLI's
+    /// follow-up turn on `session_id`, snapshotting its launch settings so a
+    /// later send can tell whether the live process still matches them.
+    pub(crate) fn set_awaiting_followup(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        prefs: FollowupPrefs,
+    ) {
+        if let Ok(mut map) = self.2.lock() {
+            map.insert(
+                session_id.to_string(),
+                AwaitingFollowup {
+                    run_id: run_id.to_string(),
+                    prefs,
+                },
+            );
+        }
+    }
+
+    /// The run no longer waits (follow-up arrived, run settled or exited).
+    pub(crate) fn clear_awaiting_followup(&self, run_id: &str) {
+        if let Ok(mut map) = self.2.lock() {
+            map.retain(|_, waiting| waiting.run_id != run_id);
+        }
+    }
+
+    /// Take the run idling on `session_id` for a follow-up turn, if any. The
+    /// caller either writes the new prompt into that live process or — when
+    /// its settings no longer match or it is unwritable — kills it and falls
+    /// back to a fresh `--resume` launch, which must not race the idle one.
+    pub(crate) fn take_awaiting_followup(&self, session_id: &str) -> Option<AwaitingFollowup> {
+        self.2.lock().ok().and_then(|mut map| map.remove(session_id))
     }
 
     pub(crate) fn insert(&self, key: String, entry: ChildEntry) {
@@ -537,6 +594,34 @@ pub(crate) fn next_virtual_pid() -> u32 {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    /// A send on a session whose process idles for a background follow-up
+    /// retires that process exactly once; any other session is untouched, and
+    /// a run that settled or resumed no longer counts as idle.
+    #[test]
+    fn awaiting_followup_is_taken_once_per_session_and_cleared_by_run() {
+        let registry = ProcessRegistry::default();
+        let prefs = || FollowupPrefs {
+            model: None,
+            effort: None,
+            permission: None,
+            provider_id: None,
+            memory_bot: None,
+            allowed_tools: None,
+        };
+        registry.set_awaiting_followup("s-1", "run-1", prefs());
+        registry.set_awaiting_followup("s-2", "run-2", prefs());
+
+        assert_eq!(
+            registry.take_awaiting_followup("s-1").map(|a| a.run_id).as_deref(),
+            Some("run-1")
+        );
+        assert!(registry.take_awaiting_followup("s-1").is_none());
+        assert!(registry.take_awaiting_followup("unknown").is_none());
+
+        registry.clear_awaiting_followup("run-2");
+        assert!(registry.take_awaiting_followup("s-2").is_none());
+    }
 
     /// rekey must COPY (not move) so both the session-id and run-id keys
     /// route an interrupt to the same process. A resume whose

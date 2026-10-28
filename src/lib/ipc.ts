@@ -3,6 +3,34 @@ import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
 
+// Async Tauri commands can start out of call order. Preserve the caller's
+// order only where an older write would otherwise overwrite a newer choice.
+// Other resources and read commands remain independent.
+const persistenceTails = new Map<string, Promise<unknown>>();
+
+function invokePersisted<T>(
+  key: string,
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  const previous = persistenceTails.get(key) ?? Promise.resolve();
+  const result = previous.then(
+    () => invoke<T>(command, args),
+    () => invoke<T>(command, args),
+  );
+  // A failed request rejects its own caller, not every later write. Remove
+  // the tail once idle so session/plugin keys do not accumulate indefinitely.
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  persistenceTails.set(key, settled);
+  void settled.then(() => {
+    if (persistenceTails.get(key) === settled) persistenceTails.delete(key);
+  });
+  return result;
+}
+
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
 export interface SessionMeta {
@@ -46,10 +74,15 @@ export interface TodoItem {
   detail?: string | null;
 }
 
+/** One entry of a todo payload. A patch entry may leave `status` out: the
+ *  update did not set one (a TaskUpdate that only renames), so the item
+ *  keeps its current status. */
+export type TodoPayloadItem = Omit<TodoItem, "status"> & { status?: TodoStatus };
+
 /** Todo-list payload on todo-class tool rows: replace = full snapshot,
- * otherwise a patch matched by content (status "dropped" removes). */
+ * otherwise a patch matched by id, then content (status "dropped" removes). */
 export interface TodosPayload {
-  items: TodoItem[];
+  items: TodoPayloadItem[];
   replace: boolean;
 }
 
@@ -72,6 +105,11 @@ export interface Message {
   args?: unknown;
   /** Tool execution result/output; shown in the tool panel. */
   result?: unknown;
+  /** The engine's id for this tool call, when it reported one. Runtime-only:
+   *  a live result patch pairs to its call on this, so parallel calls of one
+   *  tool (four `TaskCreate` in a batch) each settle their own row. History
+   *  rows do not carry it — the backend pairs results by id while folding. */
+  toolCallId?: string;
   todos?: TodosPayload;
   ts: string | null;
   usage?: unknown;
@@ -198,6 +236,7 @@ export type WorktreeCreateStage =
 
 export type WorktreeErrorKind =
   | "not_a_repo"
+  | "repo_open_failed"
   | "invalid_branch"
   | "branch_not_found"
   | "branch_exists"
@@ -407,6 +446,13 @@ export interface ProviderModelList {
   models: string[];
   endpoint: string;
 }
+export interface CodeBuddyAccountStatus {
+  loggedIn: boolean;
+  /** "found" = credential store probe hit; "unknown" = the guessed service
+   *  names missed, which is not proof of being logged out. */
+  detection: "found" | "unknown";
+}
+
 
 export interface WorkspaceGroup {
   id: string;
@@ -429,6 +475,7 @@ export interface CliConfig {
   qoder: ProviderSection;
   "qoder-cn": ProviderSection;
   minimax: ProviderSection;
+  codebuddy: ProviderSection;
 }
 
 export interface AppSettings {
@@ -456,6 +503,7 @@ export interface AppSettings {
   qoderBin: string | null;
   qoderCnBin: string | null;
   minimaxBin: string | null;
+  codebuddyBin: string | null;
   defaultModels: Record<string, string>;
   /** Per-engine user-added custom model ids (设置 → CLI → 自定义模型). */
   customModels: Record<string, string[]>;
@@ -507,6 +555,9 @@ export interface AppSettings {
   /** 宽幕布 (设置 → 通用 → 外观): true = the chat content column fills its
    *  pane instead of the default centered column (750px / `max-w-3xl`). */
   chatWideLayout?: boolean | null;
+  /** File tree entries Git ignores (设置 → 通用 → 行为): absent/false = listed
+   *  and drawn faded, true = hidden from the tree. */
+  fileTreeHideIgnored?: boolean | null;
   /** Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
    *  Missing/false = the entry stays hidden (default off). */
   betaFeatures?: Record<string, boolean> | null;
@@ -555,6 +606,10 @@ export interface DirEntry {
   isDir: boolean;
   size: number;
   mtimeMs: number;
+  /** Git ignores this entry (`.gitignore` / info/exclude / global excludes,
+   *  and `.git` itself; tracked content never is). Only set when `listDir`
+   *  was asked with `gitIgnoreRoot`; absent = not ignored / not asked. */
+  ignored?: boolean;
 }
 
 export interface FileContent {
@@ -945,6 +1000,13 @@ export interface RepositorySummary {
   untracked: number;
 }
 
+/** GitHub account behind a workspace's `origin` remote; non-github.com and
+ *  non-git workspaces are omitted. */
+export interface WorkspaceOwner {
+  path: string;
+  login: string;
+}
+
 /** Per-entry git state for one loaded tree level. `repository` marks an
  *  exact repo-root directory (blue name); plain folders never carry color. */
 export type FileTreeColor = "modified" | "untracked" | "repository";
@@ -1314,6 +1376,13 @@ export interface PetPackage extends PetSummary {
   frameCounts?: number[];
 }
 
+/** Native host and resolved shell behind a terminal PTY. Web-access clients
+ * must use this rather than their browser platform when quoting input. */
+export interface TerminalHostInfo {
+  platform: string;
+  shellPath: string;
+}
+
 export const ipc = {
   // config
   getCliConfig: () => invoke<CliConfig>("get_cli_config"),
@@ -1350,6 +1419,9 @@ export const ipc = {
     invoke<PiFamilyModelsConfigReadResult>("pi_family_models_config_read", { engine }),
   piFamilyModelsConfigWrite: (engine: string, text: string) =>
     invoke<void>("pi_family_models_config_write", { engine, text }),
+  // codebuddy account status
+  codebuddyAccountStatus: (force = false) =>
+    invoke<CodeBuddyAccountStatus>("codebuddy_account_status", { force }),
   // cc-switch interop
   checkCcSwitch: () => invoke<CcSwitchStatus>("check_cc_switch"),
   dismissCcSwitch: (hash: string) => invoke<void>("dismiss_cc_switch", { hash }),
@@ -1569,7 +1641,11 @@ export const ipc = {
   /** Remember the reasoning level a session ran, so reopening it — here, in
    *  another window, or on the phone — keeps that level. */
   rememberSessionEffort: (engine: string, sessionId: string, effort: string) =>
-    invoke<void>("remember_session_effort", { engine, sessionId, effort }),
+    invokePersisted<void>(`session-effort:${engine}\0${sessionId}`, "remember_session_effort", {
+      engine,
+      sessionId,
+      effort,
+    }),
   /** Remember the in-app channel a session ran, so reopening it keeps that
    *  channel without rewriting the CLI's own config file. */
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
@@ -1598,6 +1674,7 @@ export const ipc = {
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
   // terminal
+  terminalHostInfo: () => invoke<TerminalHostInfo>("terminal_host_info"),
   /** Idempotent: re-opening a live session id is a no-op on the backend. */
   terminalOpen: (args: { id: string; cwd: string; cols: number; rows: number }) =>
     invoke<void>("terminal_open", args),
@@ -1609,7 +1686,12 @@ export const ipc = {
   terminalClose: (id: string) => invoke<void>("terminal_close", { id }),
   // files — every command goes through withGrantRetry so an outside-roots
   // rejection becomes a one-click grant prompt + retry (see lib/grant.ts).
-  listDir: (path: string) => withGrantRetry(() => invoke<DirEntry[]>("list_dir", { path })),
+  /** `gitIgnoreRoot` (the file tree's root) opts into per-entry `ignored`
+   *  flags; callers that only need names leave it out and skip the Git work. */
+  listDir: (path: string, opts?: { gitIgnoreRoot?: string }) =>
+    withGrantRetry(() =>
+      invoke<DirEntry[]>("list_dir", { path, gitIgnoreRoot: opts?.gitIgnoreRoot }),
+    ),
   readFile: (path: string) => withGrantRetry(() => invoke<FileContent>("read_file", { path })),
   writeFile: (path: string, content: string) =>
     withGrantRetry(() => invoke<void>("write_file", { path, content })),
@@ -1754,6 +1836,9 @@ export const ipc = {
   gitStatus: (path: string) => invoke<GitStatus>("git_status", { path }),
   gitRepositorySummaries: (paths: string[]) =>
     invoke<RepositorySummary[]>("git_repository_summaries", { paths }),
+  /** Owner avatars for sidebar rows (GitHub `origin` remote → login). */
+  gitWorkspaceOwners: (paths: string[]) =>
+    invoke<WorkspaceOwner[]>("git_workspace_owners", { paths }),
   gitFileColors: (path: string, files: string[]) =>
     invoke<Record<string, FileTreeColor>>("git_file_colors", { path, files }),
   gitTreeStatus: (levels: GitTreeLevel[]) =>
@@ -1774,6 +1859,7 @@ export const ipc = {
     invoke<void>("git_checkout", { path, branch }),
   gitCreateBranch: (path: string, name: string) =>
     invoke<void>("git_create_branch", { path, name }),
+  gitInit: (path: string) => invoke<void>("git_init", { path }),
   // git worktree (子工作区)
   gitWorktreeList: (repoPath: string) =>
     invoke<WorktreeInfo[]>("git_worktree_list", { repoPath }),
@@ -1822,6 +1908,9 @@ export const ipc = {
     invoke<string | null>("get_program_icon", { executablePath }),
   revealInFileManager: (path: string) =>
     invoke<void>("reveal_in_file_manager", { path }),
+  /** Local .html/.htm/.xhtml in the default web browser (desktop only: the
+   *  remote web bridge would open it on the host, not for the remote user). */
+  openInBrowser: (path: string) => invoke<void>("open_in_browser", { path }),
   // metrics
   appMetrics: () => invoke<AppMetrics>("app_metrics"),
   performanceDiagnostics: () => invoke<NativePerformanceDiagnostics>("performance_diagnostics"),
@@ -1847,9 +1936,9 @@ export const ipc = {
   pluginStorageGet: (id: string, key: string) =>
     invoke<unknown>("plugin_storage_get", { id, key }),
   pluginStorageSet: (id: string, key: string, value: unknown) =>
-    invoke<void>("plugin_storage_set", { id, key, value }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_set", { id, key, value }),
   pluginStorageDelete: (id: string, key: string) =>
-    invoke<void>("plugin_storage_delete", { id, key }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_delete", { id, key }),
   pluginWorkspaceMetadata: (pluginId: string, workspacePath: string) =>
     invoke<PluginWorkspaceMetadata>("workspace_metadata", { pluginId, workspacePath }),
   pluginDocumentStorageGetLocation: (pluginId: string) =>
@@ -1951,10 +2040,10 @@ export const ipc = {
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
   // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invoke<void>("usage_record", { entry }),
+  usageRecord: (entry: UsageEntryInput) => invokePersisted<void>("usage-ledger", "usage_record", { entry }),
   usageSummary: (days: number, tzOffsetMinutes: number) =>
     invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invoke<void>("usage_clear"),
+  usageClear: () => invokePersisted<void>("usage-ledger", "usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

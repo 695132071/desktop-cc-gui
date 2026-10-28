@@ -136,3 +136,74 @@ it("marks a tab with a pending notice as unread, with its own accessible name", 
   expect(dot?.getAttribute("title")).toBe("新版本");
   expect(dot?.className).toContain("bg-accent-500");
 });
+it("renders batch close and split options on session tab right-click", async () => {
+  const onCloseInactive = vi.fn();
+  const onCloseLeft = vi.fn();
+  const onCloseRight = vi.fn();
+  const onCloseAll = vi.fn();
+
+  await render({
+    tabs: [
+      { key: "s1", label: "Session 1", streaming: false, session: { engine: "claude", sessionId: "1", workspacePath: "/w" } },
+      { key: "s2", label: "Session 2", streaming: false, session: { engine: "claude", sessionId: "2", workspacePath: "/w" } },
+      { key: "s3", label: "Session 3", streaming: false, session: { engine: "claude", sessionId: "3", workspacePath: "/w" } },
+    ],
+    onCloseInactive,
+    onCloseLeft,
+    onCloseRight,
+    onCloseAll,
+  });
+
+  // Right-click middle session tab s2
+  const tab = node.querySelector<HTMLElement>('[data-tab-key="s2"]');
+  if (!tab) throw new Error("tab s2 not found");
+
+  await act(async () => {
+    tab.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, clientX: 100, clientY: 12 }),
+    );
+  });
+
+  expect(menuItems()).toEqual([
+    "chat.closeInactiveTabs",
+    "chat.closeLeftTabs",
+    "chat.closeRightTabs",
+    "chat.closeAllTabs",
+    "chat.splitRight",
+    "chat.splitDown",
+  ]);
+
+  const items = [...document.body.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
+  // Click close left
+  await act(async () => items[1].click());
+  expect(onCloseLeft).toHaveBeenCalledWith("s2");
+});
+
+it("renders file actions when right clicking a file tab", async () => {
+  const onCloseAll = vi.fn();
+
+  await render({
+    tabs: [
+      { key: "s1", label: "Session 1", streaming: false },
+      { key: "file:/src/app.tsx", label: "app.tsx", title: "/src/app.tsx", streaming: false },
+    ],
+    onCloseAll,
+    onCloseInactive: vi.fn(),
+    onCloseLeft: vi.fn(),
+    onCloseRight: vi.fn(),
+  });
+
+  const tab = node.querySelector<HTMLElement>('[data-tab-key="file:/src/app.tsx"]');
+  if (!tab) throw new Error("file tab not found");
+
+  await act(async () => {
+    tab.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, clientX: 120, clientY: 12 }),
+    );
+  });
+
+  const items = menuItems();
+  expect(items).toContain("files.copyPath");
+  expect(items).toContain("files.sendPathToComposer");
+  expect(items.some((label) => label.startsWith("files.revealIn"))).toBe(true);
+});

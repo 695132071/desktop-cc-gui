@@ -14,7 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isWeb } from "./transport";
 
-const BAIDU_TONGJI_SITE_ID = "daa60bcc45c658ee35054b93be3cf2e4";
+const BAIDU_TONGJI_SITE_ID = "b18f7c7bbeab70682b0a359e6b7b058d";
 const BAIDU_TONGJI_HOST = "hm.baidu.com";
 const BAIDU_TONGJI_BEACON_PATH = "/hm.gif";
 const IMAGE_BRIDGE_MARKER = Symbol("ccgui.baiduTongjiImageBridge");

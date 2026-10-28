@@ -8,7 +8,7 @@ use super::grok;
 #[cfg(windows)]
 use super::job;
 use super::plan_review;
-use super::registry::{kill_process_group, ProcessRegistry};
+use super::registry::{kill_process_group, FollowupPrefs, ProcessRegistry};
 use super::Engine;
 use crate::event_sink;
 use serde_json::Value;
@@ -154,6 +154,11 @@ pub(crate) struct TurnState {
     gen_explicit: bool,
     /// Generation milliseconds closed but not yet attached to a usage report.
     gen_ms: u64,
+    /// Background tasks the CLI reported as still running.
+    pending_background_tasks: usize,
+    /// `done` went out while a background task was still running and the CLI
+    /// is kept alive: its self-started follow-up turn is still to come.
+    awaiting_followup: bool,
 }
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
@@ -169,6 +174,8 @@ impl TurnState {
             gen_open_since: None,
             gen_explicit: false,
             gen_ms: 0,
+            pending_background_tasks: 0,
+            awaiting_followup: false,
         }
     }
 
@@ -284,6 +291,11 @@ pub(crate) struct TurnCore {
     /// 审批事实源:计划事件到达即落盘(engine/plan_review.rs)。驱动内部与
     /// 测试构造点没有 db 句柄时为 None——那些路径不产生计划事件。
     pub(crate) db: Option<Arc<crate::db::Db>>,
+    /// Launch settings of a chat run eligible for background-follow-up
+    /// parking (`Some` only for chat-sink claude runs). `None` — plugin and
+    /// mission turns, other engines, tests — keeps the old settle behavior:
+    /// stdin closes at `done` and the process exits instead of idling.
+    pub(crate) followup: Option<FollowupPrefs>,
 }
 /// 停住的计划审批随运行消亡:原生请求不再有效,记录过期并推送
 /// PlanReviewSettled,历史 UI 不得假装还能批准(PRD §8 防线 3)。
@@ -339,6 +351,24 @@ impl TurnCore {
         // the conversation strands under its provisional key.
         if (state.saw_done || state.saw_error) && !matches!(event, EngineEvent::SessionId(_)) {
             return;
+        }
+        // The CLI's follow-up turn (after a background task) streams under a
+        // run the UI already settled: tell it to reopen the run first.
+        if state.awaiting_followup
+            && matches!(
+                event,
+                EngineEvent::Delta(_) | EngineEvent::Thinking(_) | EngineEvent::Message { .. }
+            )
+        {
+            state.awaiting_followup = false;
+            self.registry.clear_awaiting_followup(&self.run_id);
+            state.push(
+                &self.sink,
+                &self.run_id,
+                &self.engine_id,
+                "turn_resumed",
+                Value::Null,
+            );
         }
         match event {
             EngineEvent::Delta(text) => {
@@ -742,16 +772,39 @@ impl TurnCore {
                     tools,
                 );
             }
+            EngineEvent::BackgroundTasks { pending } => {
+                state.pending_background_tasks = pending;
+            }
             EngineEvent::Done { session_id, usage } => {
                 let gen_ms = state.take_gen_ms();
-                state.saw_done = true;
-                crate::mcp::mark_run_ended(&self.run_id);
                 if let Some(id) = session_id {
                     self.adopt_session_id(state, &id, false);
                 }
-                // The turn is over: EOF the interactive stdin so the CLI
-                // exits instead of waiting for a next message forever.
-                self.registry.close_stdin(&self.run_id);
+                let park_prefs = if state.pending_background_tasks > 0 {
+                    self.followup.clone()
+                } else {
+                    None
+                };
+                if let Some(prefs) = park_prefs {
+                    // A background task is still running: the CLI opens a
+                    // follow-up turn by itself when it finishes. Settle the
+                    // visible turn now so the UI is usable, but keep stdin and
+                    // the reader alive (saw_done stays false) so that turn is
+                    // still received; `turn_resumed` reopens the run for it.
+                    state.awaiting_followup = true;
+                    if let Some(id) = state.native_session_id.as_deref() {
+                        self.registry
+                            .set_awaiting_followup(id, &self.run_id, prefs);
+                    }
+                } else {
+                    state.saw_done = true;
+                    state.awaiting_followup = false;
+                    self.registry.clear_awaiting_followup(&self.run_id);
+                    crate::mcp::mark_run_ended(&self.run_id);
+                    // The turn is over: EOF the interactive stdin so the CLI
+                    // exits instead of waiting for a next message forever.
+                    self.registry.close_stdin(&self.run_id);
+                }
                 state.push_with_gen_ms(
                     &self.sink,
                     &self.run_id,
@@ -844,13 +897,19 @@ impl Drop for VirtualRunGuard {
     }
 }
 
-/// Remove leftover channel staging dirs (`claude-staging`/`grok-staging`
-/// under app_home) from a crashed run: they hold per-send credentials and
-/// must not linger on disk. Live runs recreate them per send, so sweeping
-/// at startup is safe. Only these two known names are touched.
+/// Remove leftover staging dirs (`claude-staging`/`grok-staging`/
+/// `codex-plan-staging`/`codebuddy-staging` under app_home) from a crashed
+/// run: they hold per-send credentials and must not linger on disk. Live runs
+/// recreate them per send, so sweeping at startup is safe. Only these known
+/// names are touched.
 pub fn sweep_staging_dirs() {
     let home = crate::paths::app_home();
-    for name in ["claude-staging", "grok-staging", "codex-plan-staging"] {
+    for name in [
+        "claude-staging",
+        "grok-staging",
+        "codex-plan-staging",
+        "codebuddy-staging",
+    ] {
         let dir = home.join(name);
         if dir.exists() {
             if let Err(error) = std::fs::remove_dir_all(&dir) {
@@ -1113,6 +1172,10 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     for path in &ctx.cleanup_files {
         let _ = std::fs::remove_file(path);
     }
+    ctx.core.registry.clear_awaiting_followup(&ctx.core.run_id);
+    if state.awaiting_followup {
+        crate::mcp::mark_run_ended(&ctx.core.run_id);
+    }
     // Pending questions die with the run: settle their cards so the UI never
     // leaves an answerable question pointing at a dead process.
     for key in [
@@ -1161,7 +1224,7 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         );
     }
 
-    if !state.saw_done && !state.saw_error {
+    if !state.saw_done && !state.saw_error && !state.awaiting_followup {
         let killed = ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
         if killed {
             // User-initiated stop: commit whatever streamed so far as a
@@ -1277,6 +1340,7 @@ mod staging_tests {
             engine_id: "claude".into(),
             run_id: "test".into(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(None);
         for model in [Some("claude-opus-5-5".to_string()), None] {
@@ -1332,6 +1396,7 @@ mod staging_tests {
                     engine_id: "grok".into(),
                     run_id: "test".into(),
                     db: None,
+                    followup: None,
                 },
                 engine_impl: Box::new(grok::GrokEngine),
                 pid: 0,
@@ -1400,6 +1465,7 @@ mod staging_tests {
                 engine_id: "grok".into(),
                 run_id: "run-abort".into(),
                 db: None,
+                followup: None,
             },
             engine_impl: Box::new(grok::GrokEngine),
             pid: 4242,
@@ -1507,6 +1573,7 @@ mod terminal_event_tests {
                     engine_id: engine.into(),
                     run_id: "pa-relay-test".into(),
                     db: None,
+                    followup: None,
                 };
                 let mut state = TurnState::new(None);
                 core.dispatch_event(
@@ -1541,6 +1608,7 @@ mod terminal_event_tests {
             engine_id: "pi".into(),
             run_id: "gen-ms-test".into(),
             db: None,
+            followup: None,
         };
         let mut state = TurnState::new(Some("session".into()));
         let tool_start = || EngineEvent::Message {
@@ -1599,6 +1667,7 @@ mod terminal_event_tests {
                 engine_id: "codex".into(),
                 run_id: "terminal-test".into(),
                 db: None,
+                followup: None,
             };
             let mut state = TurnState::new(Some("session".into()));
             core.dispatch_event(&mut state, EngineEvent::Delta("完成中文与 emoji 🐎".into()));
@@ -1696,6 +1765,7 @@ mod terminal_event_tests {
                     engine_id: "pi".into(),
                     run_id: run_id.into(),
                     db: None,
+                    followup: None,
                 },
                 engine_impl: Box::new(crate::engine::pi_family::pi()),
                 pid,
@@ -1792,6 +1862,7 @@ mod plan_dispatch_tests {
             engine_id: "dsh".into(),
             run_id: "run-plan".into(),
             db: Some(Arc::clone(&db)),
+            followup: None,
         };
         core.registry.insert(
             "run-plan".into(),
