@@ -142,6 +142,9 @@ pub enum EngineEvent {
         comparison_model: Option<Option<String>>,
         model: Option<String>,
         effort: Option<String>,
+        /// The stream can report a `Served` side for this run; a run that
+        /// never can keeps the check hidden until evidence arrives.
+        reports_served: bool,
     },
     /// What the response itself reported as running: the model named by the
     /// upstream message (claude's `assistant.message.model`), the serving

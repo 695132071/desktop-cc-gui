@@ -126,6 +126,7 @@ export interface Message {
       comparisonModel?: string | null;
     };
     served: { model: string | null; effort: string | null };
+    reportsServed?: boolean;
   } | null;
   /** Turn duration in milliseconds (measured from prompt send to turn completion) */
   durationMs?: number | null;

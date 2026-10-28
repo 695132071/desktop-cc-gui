@@ -15,6 +15,7 @@ import {
   pageRegistry,
   panelTabRegistry,
   sessionMenuRegistry,
+  fileLinkMenuRegistry,
   settingsRegistry,
   statusBarRegistry,
   composerStatusRegistry,
@@ -884,6 +885,12 @@ describe("createPluginContext", () => {
       (ctx: PluginContext) =>
         ctx.ui.registerSessionMenuItem({ label: () => "S", run: () => {} }),
       sessionMenuRegistry,
+    ],
+    [
+      "ui:file-link-menu",
+      (ctx: PluginContext) =>
+        ctx.ui.registerFileLinkMenuItem({ label: () => "Open in Obsidian", run: () => {} }),
+      fileLinkMenuRegistry,
     ],
   ])(
     "%s gates and registers under plugin:<id>, disposer removes (phase-2 ui points)",

@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.22
+ * @ccgui/plugin-sdk v0.3.25
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -14,6 +14,13 @@ export declare const SDK_VERSION: string;
 
 /** 每次注册的撤销句柄；卸载时逆序执行。 */
 export type Disposer = () => void;
+
+/** The clicked file link. run is dispatched only with a resolvedPath. */
+export interface FileLinkMenuTarget {
+  readonly path: string;
+  readonly resolvedPath: string | null;
+  readonly workspacePath: string;
+}
 
 export type PluginConversationProps = {
   conversationId: string;
@@ -163,7 +170,7 @@ export interface PluginModelCatalogError {
   message: string;
 }
 
-/** 用量统计（权限 `usage.read`，0.3.23 起）：宿主从本机各 CLI 自己的会话日志
+/** 用量统计（权限 `usage.read`，0.3.25 起）：宿主从本机各 CLI 自己的会话日志
  *  增量计算，只读、不联网（`updatePrices` 除外，它只下载公开价格表）。
  *  日期均为宿主本地日期 `YYYY-MM-DD`，时区由宿主运行时代填。 */
 export type UsageStatsBucket = "day" | "hour";
@@ -241,7 +248,7 @@ export interface UsagePriceInfo {
   models: number;
 }
 
-/** 订阅限额（权限 `limits.read`，0.3.23 起）：宿主只读本机 CLI 的登录状态，
+/** 订阅限额（权限 `limits.read`，0.3.25 起）：宿主只读本机 CLI 的登录状态，
  *  只请求厂商官方接口，不刷新、不改写任何凭据；插件拿不到凭据。 */
 export type UsageLimitProviderId = "claude" | "codex";
 export type UsageLimitStatus = "ok" | "signedOut" | "expired" | "rateLimited" | "offline" | "error";
@@ -694,6 +701,15 @@ export interface PluginContext {
       keywords?: () => string[];
       run: () => void;
     }): Disposer;
+    /** Chat file-link actions before the external editor (ui:file-link-menu, 0.3.23). */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentLike<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
+    }): Disposer;
     /** 侧栏会话右键菜单追加行（权限 ui:session-menu，0.3.5 起）；
      *  run 收到打开菜单的会话。 */
     registerSessionMenuItem(def: {
@@ -809,8 +825,15 @@ export interface PluginContext {
      *  `usage://done`（0.3.8 起，引擎 done 事件透传，data.usage 携带
      *  该轮最终用量——claude/grok 等只经 Done 上报用量的引擎由此对插件
      *  可见）；`session://activated`（0.3.8 起，活动会话切换，payload
-     *  `{ engine, sessionId }`，pending 标签 sessionId 为 null，无活动
-     *  标签时两者皆 null）；`composer://draft`（payload { text }，草稿
+     *  `{ engine, sessionId, provider, model }`——provider/model 自 0.3.24 起：
+     *  provider 为会话所用渠道 id，引擎使用自身配置时为 null；model 为输入框
+     *  显示的模型（picker 选择器如 `deepseek/deepseek-flash`，或引擎回报的
+     *  实际模型），CLI 默认且无记录时为 null；pending 标签 sessionId 为
+     *  null，无活动标签时全为 null）；`session://selection-changed`（0.3.24
+     *  起，当前会话的 provider/model 变化时发出，无论来自输入框选择、设置页
+     *  改默认渠道、历史加载、其他窗口还是引擎回报；同值不重发，切换会话只发
+     *  activated；payload 同上，activated 的保留值同步更新）；
+     *  `composer://draft`（payload { text }，草稿
      *  变化/清空/会话切换均发射）。
      *
      *  `genMs`（0.3.15 起，仅 `usage`/`done` 携带）：该报告对应的宿主实测
@@ -968,7 +991,7 @@ export interface PluginContext {
       refreshProviders?: boolean;
     }): Promise<PluginModelCatalogResult>;
   };
-  /** 本机用量统计（权限 `usage.read`，0.3.23 起）。数据由宿主从各 CLI 的会话
+  /** 本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话
    *  日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志
    *  （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢，
    *  60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在
@@ -984,7 +1007,7 @@ export interface PluginContext {
     onChange(cb: (event: { scannedAt: number }) => void): Disposer;
     onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
   };
-  /** 订阅限额（权限 `limits.read`，0.3.23 起）。缺省查询全部平台；宿主缓存
+  /** 订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存
    *  60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429
    *  退避。 */
   limits: {

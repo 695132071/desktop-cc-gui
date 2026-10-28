@@ -381,7 +381,9 @@ export const zh = {
     checkUnknownAria: "响应校验：无法确认",
     checkUnreported: "未上报",
     checkMismatch: "不一致",
+    checkSnapshot: "构建版本不同",
     checkOkAria: "响应校验：与响应一致",
+    checkSnapshotAria: "响应校验：构建版本不同",
     checkMismatchAria: "响应校验：与响应不一致",
   },
   settings: {
@@ -1632,6 +1634,7 @@ export const zh = {
         uiPage: "打开独立页面",
         uiTimelineRow: "自定义消息行",
         uiSessionMenu: "会话右键菜单",
+        uiFileLinkMenu: "文件链接右键菜单操作（可读取被右键的文件路径）",
         uiSidebarEntry: "侧栏入口",
         uiCenterTab: "中央页签",
         uiConversationMode: "当前聊天内的会话模式",

@@ -1,7 +1,7 @@
 import type { ComponentType } from "react";
 import type * as React from "react";
 import type { Disposer } from "./manifest";
-import type { ComposerSlotId, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
+import type { ComposerSlotId, FileLinkMenuTarget, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
 export interface WorkspaceMetadata {
   id: string;
   path: string;
@@ -440,7 +440,7 @@ export interface PluginModelCatalogResult {
   errors: PluginModelCatalogError[];
   refreshedAt: number;
 }
-/** 用量统计（权限 `usage.read`，0.3.23 起）：宿主从本机各 CLI 自己的会话日志
+/** 用量统计（权限 `usage.read`，0.3.25 起）：宿主从本机各 CLI 自己的会话日志
  *  增量计算，只读、不联网（`updatePrices` 除外，它只下载公开价格表）。
  *  日期均为宿主本地日期 `YYYY-MM-DD`，时区由宿主运行时代填。 */
 export type UsageStatsBucket = "day" | "hour";
@@ -518,7 +518,7 @@ export interface UsagePriceInfo {
   models: number;
 }
 
-/** 订阅限额（权限 `limits.read`，0.3.23 起）：宿主只读本机 CLI 的登录状态，
+/** 订阅限额（权限 `limits.read`，0.3.25 起）：宿主只读本机 CLI 的登录状态，
  *  只请求厂商官方接口，不刷新、不改写任何凭据；插件拿不到凭据。 */
 export type UsageLimitProviderId = "claude" | "codex";
 export type UsageLimitStatus = "ok" | "signedOut" | "expired" | "rateLimited" | "offline" | "error";
@@ -672,6 +672,18 @@ export interface PluginContext {
       title: () => string;
       keywords?: () => string[];
       run: () => void;
+    }): Disposer;
+    /** Chat file-link actions before the external editor (0.3.23).
+     * Permission: ui:file-link-menu. run receives a non-null resolvedPath
+     * for the clicked link, never the currently active editor's file.
+     * label/visible run on every menu open and see the clicked path. */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentType<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
     }): Disposer;
     /** Sidebar session right-click menu row (permission `ui:session-menu`,
      *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 */
@@ -934,7 +946,7 @@ export interface PluginContext {
       refreshProviders?: boolean;
     }): Promise<PluginModelCatalogResult>;
   };
-  /** 本机用量统计（权限 `usage.read`，0.3.23 起）。数据由宿主从各 CLI 的会话
+  /** 本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话
    *  日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志
    *  （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢，
    *  60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在
@@ -950,7 +962,7 @@ export interface PluginContext {
     onChange(cb: (event: { scannedAt: number }) => void): Disposer;
     onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
   };
-  /** 订阅限额（权限 `limits.read`，0.3.23 起）。缺省查询全部平台；宿主缓存
+  /** 订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存
    *  60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429
    *  退避。 */
   limits: {

@@ -14,7 +14,7 @@ import { invoke, listen } from "@/lib/transport";
 import { runAsPlugin, withAuthorizedHostInvoke } from "./hardening";
 
 /**
- * ctx.usage / ctx.limits (SDK 0.3.23). Numbers come from the host's read-only
+ * ctx.usage / ctx.limits (SDK 0.3.25). Numbers come from the host's read-only
  * usage data layer (src-tauri/src/usage_stats) and limit lookup
  * (src-tauri/src/usage_limits); the plugin only displays them. Every call is
  * gated twice: here by the manifest permission, and again in Rust by

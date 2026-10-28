@@ -396,7 +396,9 @@ export const en: Messages = {
     checkUnknownAria: "Response verification: unable to verify",
     checkUnreported: "Not reported",
     checkMismatch: "Mismatch",
+    checkSnapshot: "Different build",
     checkOkAria: "Response check: matches the response",
+    checkSnapshotAria: "Response check: different build version",
     checkMismatchAria: "Response check: differs from the response",
   },
   settings: {
@@ -1692,6 +1694,7 @@ export const en: Messages = {
         uiPage: "Open a standalone page",
         uiTimelineRow: "Custom message rows",
         uiSessionMenu: "Session context menu",
+        uiFileLinkMenu: "File-link context menu actions (sees right-clicked file paths)",
         uiSidebarEntry: "Sidebar entry",
         uiCenterTab: "Center tab",
         uiConversationMode: "Chat-local conversation mode",

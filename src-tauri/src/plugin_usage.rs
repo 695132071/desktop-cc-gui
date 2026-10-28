@@ -1,4 +1,4 @@
-//! Plugin-facing commands behind `ctx.usage` / `ctx.limits` (SDK 0.3.23).
+//! Plugin-facing commands behind `ctx.usage` / `ctx.limits` (SDK 0.3.25).
 //!
 //! The data itself lives in `usage_stats` (read-only statistics built from
 //! each CLI's own session logs) and `usage_limits` (read-only Claude / Codex

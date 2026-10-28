@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.23）
+# CC GUI 插件 SDK 参考（SDK 0.3.25）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -72,6 +72,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerComposerStatusItem` | `ui:composer-status` | Composer status-row chip (permission `ui:composer-status`, 0.3.9): renders in the composer's status row (branch/context meter row), left group after the branch switcher. |
 | `ctx.ui.registerOverlay` | `ui:overlay` | Persistent viewport mount; requires ui:overlay. The plugin controls placement and opts interactive children into pointer-events: auto. |
 | `ctx.ui.registerCommand` | `ui:command` | Command palette entry (plan §4.2 #9). |
+| `ctx.ui.registerFileLinkMenuItem` | `ui:file-link-menu` | Chat file-link actions before the external editor (0.3.23). Permission: ui:file-link-menu. run receives a non-null resolvedPath for the clicked link, never the currently active editor's file. label/visible run on every menu open and see the clicked path. |
 | `ctx.ui.registerSessionMenuItem` | `ui:session-menu` | Sidebar session right-click menu row (permission `ui:session-menu`, 0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 |
 | `ctx.ui.openSettings` | `ui:settings-section` | 跳转到本插件的设置页（权限 `ui:settings-section`，0.3.6 起）。 `key` 对应 registerSettingsSection 的子 key，省略时打开主 section； 供状态栏 chip、面板按钮等做深链入口。 |
 | `ctx.ui.registerMarkdownRenderer` | `ui:markdown` | Markdown pipeline additions, merged over host defaults (plan §4.2 #5). |
@@ -247,6 +248,8 @@ ui: {
   registerOverlay(def: { key?: string; component: ComponentType; order?: number }): Disposer;
   /** 权限：ui:command */
   registerCommand(def: { key: string; title(): string; keywords?(): string[]; run(): void }): Disposer;
+  /** 权限：ui:file-link-menu */
+  registerFileLinkMenuItem(def: { key?: string; label(target: FileLinkMenuTarget): string; icon?: ComponentType<{ className?: string }>; visible?(target: FileLinkMenuTarget): boolean; run(target: FileLinkMenuTarget): void | Promise<void>; order?: number }): Disposer;
   /** 权限：ui:session-menu */
   registerSessionMenuItem(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; danger?: boolean; run(target: SessionMenuTarget): void }): Disposer;
   /** 权限：ui:settings-section */
@@ -403,7 +406,7 @@ models: {
 
 ### ctx.usage
 
-本机用量统计（权限 `usage.read`，0.3.23 起）。数据由宿主从各 CLI 的会话 日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志 （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢， 60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在 用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。 宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。
+本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话 日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志 （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢， 60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在 用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。 宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。
 
 ```ts
 usage: {
@@ -420,7 +423,7 @@ usage: {
 
 ### ctx.limits
 
-订阅限额（权限 `limits.read`，0.3.23 起）。缺省查询全部平台；宿主缓存 60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429 退避。
+订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存 60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429 退避。
 
 ```ts
 limits: {
@@ -491,6 +494,7 @@ ctx.react: typeof React; // Shared host React instance: external bundles can't r
 | `ui:timeline-row` | `ctx.ui.registerTimelineRowRenderer` |
 | `ui:workspace-menu` | `ctx.ui.registerWorkspaceMenuItem` |
 | `ui:session-menu` | `ctx.ui.registerSessionMenuItem` |
+| `ui:file-link-menu` | `ctx.ui.registerFileLinkMenuItem` |
 | `ui:sidebar-entry` | `ctx.ui.registerSidebarNav` |
 | `ui:center-tab` | `ctx.ui.registerCenterTab`、`ctx.ui.openCenterTab` |
 | `ui:conversation-mode` | `ctx.ui.registerConversationMode` |

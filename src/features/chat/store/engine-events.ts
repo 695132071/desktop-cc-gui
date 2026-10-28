@@ -57,6 +57,8 @@ import {
 } from "@/features/plugins/runtime/hooks";
 import { normalizeEngineEvent, type EngineTerminalFact } from "../normalized-runtime-events";
 import { workspaceMetadata } from "./lifecycle";
+import { emitSessionActivated } from "@/features/plugins/runtime/events";
+import { sessionSelection } from "./selection";
 import type { AfterTurnEvent, InternalMessageCapture, WorkspaceMetadata } from "@ccgui/plugin-sdk";
 import { migrateSelectedBot } from "@/features/bots/selected-bot";
 interface RunLifecycle {
@@ -646,11 +648,17 @@ function selectionFields(event: ChatEngineEvent): {
 function onLaunch(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   const { model, effort } = selectionFields(event);
   if (!model && !effort) return;
-  const data = event.data as { comparisonModel?: string | null };
+  const data = event.data as {
+    comparisonModel?: string | null;
+    reportsServed?: unknown;
+  };
   const comparison =
     data.comparisonModel === undefined
       ? {}
       : { comparisonModel: data.comparisonModel };
+  // Only an explicit true: older hosts never send the flag, and their
+  // request-only check stays hidden as it always was.
+  const reportsServed = data.reportsServed === true ? { reportsServed: true } : {};
   if (model) applyModelDisplay(model, key, deps);
   if (effort) applyEffortDisplay(effort, key, deps);
   deps.set((s) => {
@@ -664,6 +672,7 @@ function onLaunch(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
           responseCheck: {
             requested: { model, effort, ...comparison },
             served: { model: null, effort: null },
+            ...reportsServed,
           },
         },
       },
@@ -693,7 +702,7 @@ function onServed(
         [key]: {
           ...cur,
           responseCheck: {
-            requested: prev.requested,
+            ...prev,
             served: {
               model: model ?? prev.served.model,
               effort: effort ?? prev.served.effort,
@@ -884,6 +893,14 @@ function onSession(
     deps.get().active?.workspacePath ||
     "";
   const newKey = sessionKey(event.engine, nativeId, workspacePath);
+  // The active tab may be the pending tab about to adopt this native id: its
+  // retained activation (sessionId:null) can never be repaired afterwards —
+  // emitSessionSelectionChanged matches the retained payload on
+  // engine+sessionId — so it needs a fresh activation emit below.
+  const activeAdoptsPending =
+    state.active?.engine === event.engine &&
+    state.active.sessionId === null &&
+    state.active.workspacePath === workspacePath;
   // The event can resolve straight to the native key when it beat the send
   // response (the run had no routing entry yet). The turn rows and streaming
   // flag still sit under the pending key then; migrate from there instead of
@@ -1019,6 +1036,13 @@ function onSession(
     persistTabs(openTabs, s.active);
     return { openTabs };
   });
+  if (activeAdoptsPending && deps.get().active?.sessionId === nativeId) {
+    emitSessionActivated(
+      event.engine,
+      nativeId,
+      sessionSelection(deps.get(), event.engine, nativeId, workspacePath),
+    );
+  }
   const createdKey = sessionKey(event.engine, nativeId, workspacePath);
   if (!deps.get().createdSessionKeys[createdKey]) {
     deps.set((s) => ({

@@ -14,6 +14,7 @@ import {
   panelTabRegistry,
   scopedPluginId,
   sessionMenuRegistry,
+  fileLinkMenuRegistry,
   settingsRegistry,
   statusBarRegistry,
   composerStatusRegistry,
@@ -474,6 +475,19 @@ export function createPluginContext(
             run: () => runAsPlugin(def.run),
           }),
         );
+      },
+      registerFileLinkMenuItem(def) {
+        requirePermission("ui:file-link-menu");
+        return track(fileLinkMenuRegistry.register({
+          id: scopedPluginId(id, def.key),
+          label: (target) => runAsPlugin(() => def.label(target)),
+          icon: def.icon,
+          visible: def.visible
+            ? (target) => runAsPlugin(() => def.visible!(target))
+            : undefined,
+          run: (target) => runAsPlugin(() => def.run(target)),
+          order: def.order,
+        }));
       },
       registerSessionMenuItem(def) {
         requirePermission("ui:session-menu");
