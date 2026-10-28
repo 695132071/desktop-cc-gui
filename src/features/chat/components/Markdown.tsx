@@ -32,6 +32,13 @@ import Check from "lucide-react/dist/esm/icons/check";
 import { useCopied } from "@/hooks/use-copied";
 import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
+import {
+  imageCacheKey,
+  isDirectImageSource,
+  loadMarkdownImage,
+  markdownImageCache,
+} from "./markdown-image-source";
+import { transformMarkdownUrl } from "./markdown-url";
 import { openChatFilePath } from "@/features/chat/open-chat-file";
 import {
   decodeFileLink,
@@ -54,20 +61,6 @@ type PluginListProp = NonNullable<
  *  mount their chunks progressively across frames. */
 const PROGRESSIVE_MARKDOWN_FROM = 16_000;
 
-function transformMarkdownUrl(url: string): string {
-  // file: is deliberately excluded: model output must not smuggle in
-  // local-file URLs. Real file paths are handled via FileLink above.
-  return isFileLinkUrl(url) ||
-    /^(https?|mailto):/i.test(url) ||
-    url.startsWith("#") ||
-    url.startsWith("/") ||
-    url.startsWith("./") ||
-    url.startsWith("../") ||
-    /^[A-Za-z]:[\\/]/.test(url)
-    ? url
-    : "";
-}
-
 /** Let the plain snapshot paint before the transition starts parsing. */
 function afterPaint(callback: () => void): () => void {
   if (typeof requestAnimationFrame === "function") {
@@ -80,6 +73,47 @@ function afterPaint(callback: () => void): () => void {
 
 function openExternalUrl(url: string) {
   openExternal(url);
+}
+
+function MarkdownImage({
+  src,
+  alt = "",
+  title,
+  workspacePath,
+}: {
+  src?: string;
+  alt?: string;
+  title?: string;
+  workspacePath: string;
+}) {
+  const source = src ?? "";
+  const direct = isDirectImageSource(source);
+  const key = imageCacheKey(source, workspacePath);
+  // Keyed by source so a changed src never shows the previous image.
+  const [loaded, setLoaded] = useState<{ key: string; url: string | null } | null>(null);
+
+  useEffect(() => {
+    if (!source || direct) return;
+    let cancelled = false;
+    void loadMarkdownImage(source, workspacePath).then((image) => {
+      if (!cancelled) setLoaded({ key, url: image?.dataUrl ?? null });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, workspacePath, direct, key]);
+
+  // A remount (virtualizer scroll back) paints the cached copy at once while
+  // the effect checks the file is unchanged.
+  const imageUrl = direct
+    ? source
+    : loaded?.key === key
+      ? loaded.url
+      : markdownImageCache.peek(key)?.dataUrl ?? null;
+  if (!imageUrl) {
+    return alt ? <span className="md-image-fallback">{alt}</span> : null;
+  }
+  return <img src={imageUrl} alt={alt} title={title} className="md-image" loading="lazy" />;
 }
 
 /** Green dotted-underline file link (parity with desktop-cc-gui). */
@@ -310,6 +344,9 @@ export default memo(function Markdown({
           ? <RevealText controller={controller} start={start}>{children}</RevealText>
           : <span className={className} {...rest}>{children}</span>;
       },
+      img: ({ src, alt, title }) => (
+        <MarkdownImage src={src} alt={alt} title={title} workspacePath={workspacePath} />
+      ),
       a: ({ href, children }) => {
         const url = href ?? "";
         if (isFileLinkUrl(url)) {
