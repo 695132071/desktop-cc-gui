@@ -83,6 +83,38 @@ pub(crate) fn os_file_snapshot() -> Result<ClipboardFileSnapshot, String> {
     platform::file_snapshot()
 }
 
+/// [`os_file_snapshot`] for async commands: the read itself runs on the main
+/// thread (what the AppKit pasteboard wants), so the caller's file work can
+/// stay off it.
+pub(crate) async fn os_file_snapshot_on_main_thread(
+    app: &tauri::AppHandle,
+) -> Result<ClipboardFileSnapshot, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(os_file_snapshot());
+    })
+    .map_err(|e| format!("cannot reach the main thread: {e}"))?;
+    receiver
+        .await
+        .map_err(|_| "the clipboard read was dropped".to_string())?
+}
+
+/// The path list of a `DROPFILES` block: each path as UTF-16 plus its NUL,
+/// then the empty name that ends the list. File-tree paths join children
+/// with `/` (`C:\ws/src/a.md`); Win32 file APIs accept that, but the
+/// clipboard's readers (Explorer's paste among them) get native separators.
+#[cfg(any(windows, test))]
+fn hdrop_path_list(paths: &[String]) -> Vec<u16> {
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths {
+        names.extend(path.replace('/', "\\").encode_utf16());
+        names.push(0);
+    }
+    // Empty list terminator; also keeps the block non-empty for no paths.
+    names.push(0);
+    names
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use objc2::rc::Retained;
@@ -248,13 +280,7 @@ mod platform {
 
     /// `DROPFILES` header plus the double-NUL-terminated UTF-16 path list.
     pub(super) fn hdrop_bytes(paths: &[String]) -> Vec<u8> {
-        let mut names: Vec<u16> = Vec::new();
-        for path in paths {
-            names.extend(path.encode_utf16());
-            names.push(0);
-        }
-        // Empty list terminator; also keeps the block non-empty for no paths.
-        names.push(0);
+        let names = super::hdrop_path_list(paths);
 
         let header = DROPFILES {
             pFiles: std::mem::size_of::<DROPFILES>() as u32,
@@ -328,6 +354,20 @@ mod platform {
 }
 #[cfg(test)]
 mod path_tests {
+    /// Explorer reads the list back as shell paths: the tree's `/` joins
+    /// become `\`, spaces and the double-NUL end stay intact.
+    #[test]
+    fn hdrop_path_list_uses_windows_separators() {
+        let wide = super::hdrop_path_list(&[
+            r"C:\ws/src/notes with space.md".to_string(),
+            r"D:\top.txt".to_string(),
+        ]);
+        let expected: Vec<u16> = "C:\\ws\\src\\notes with space.md\0D:\\top.txt\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(wide, expected);
+    }
+
     #[cfg(unix)]
     #[test]
     fn trailing_space_is_part_of_the_existing_path_not_input_to_trim() {

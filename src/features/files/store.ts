@@ -659,7 +659,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       loadingDirs: remap(s.loadingDirs),
       dirErrors: remap(s.dirErrors),
       selectedPath: s.selectedPath ? mapPath(s.selectedPath) : s.selectedPath,
-      clipboard: s.clipboard ? { ...s.clipboard, path: mapPath(s.clipboard.path) } : s.clipboard,
+      // Keep the object unless its own path moved: a Copy whose OS write is
+      // still in flight records its generation onto that same object.
+      clipboard:
+        s.clipboard && mapPath(s.clipboard.path) !== s.clipboard.path
+          ? { ...s.clipboard, path: mapPath(s.clipboard.path) }
+          : s.clipboard,
       repositories: remap(s.repositories),
       fileColors: remap(s.fileColors),
     }));

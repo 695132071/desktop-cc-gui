@@ -800,17 +800,30 @@ fn copy_clipboard_items_into(sources: &[String], target_dir: &Path) -> PasteClip
 /// Paste whatever file list the OS clipboard holds (a Finder / Explorer
 /// copy). Empty `created` + empty `failed` means the clipboard carried no
 /// file at all; the frontend then falls back to its own tree clipboard.
+///
+/// Only the clipboard read runs on the main thread. The copy, which can be a
+/// whole folder from another volume, runs on a blocking worker like
+/// `paste_item`, so the window keeps responding while it lasts.
 #[tauri::command]
-pub fn paste_clipboard_items(
+pub async fn paste_clipboard_items(
+    app: tauri::AppHandle,
     db: tauri::State<'_, Arc<crate::db::Db>>,
     target_dir: String,
 ) -> Result<PasteClipboardResult, String> {
-    let dir = ensure_allowed(&target_dir, &db)?;
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
-    }
-    let snapshot = crate::clipboard::os_file_snapshot()?;
-    Ok(copy_clipboard_items_into(&snapshot.paths, &dir))
+    let db = Arc::clone(db.inner());
+    let dir = tauri::async_runtime::spawn_blocking(move || {
+        let dir = ensure_allowed(&target_dir, &db)?;
+        if !dir.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        Ok(dir)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let snapshot = crate::clipboard::os_file_snapshot_on_main_thread(&app).await?;
+    tauri::async_runtime::spawn_blocking(move || copy_clipboard_items_into(&snapshot.paths, &dir))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an

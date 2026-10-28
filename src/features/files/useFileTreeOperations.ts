@@ -4,7 +4,7 @@ import { copyText } from "@/lib/clipboard";
 import { ipc, type ClipboardFileSnapshot } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
 import { joinPath, parentPath, useFilesStore, type TreeClipboard } from "./store";
-import { choosePasteSource } from "./paste-source";
+import { choosePasteSource, type PasteSource } from "./paste-source";
 import type { FileTreeMenuState } from "./FileTreeContextMenu";
 import type { VisibleNode } from "./FileTreeRow";
 import { useChatStore } from "@/features/chat/store";
@@ -23,8 +23,10 @@ interface TrashTarget {
 
 export interface FileTreeOperations {
   clipboard: TreeClipboard | null;
-  /** Paste has a source: the in-app tree clipboard, or a file list the OS
-   *  clipboard currently holds (Finder / Explorer copy). */
+  /** Paste has a source, decided like Paste itself (`choosePasteSource`)
+   *  from the snapshot read when the menu opened: the tree item while it is
+   *  the newest copy, else the OS clipboard's files. Before that read lands,
+   *  or when it fails, the tree item alone enables it. */
   canPaste: boolean;
   menu: FileTreeMenuState | null;
   prompt: PromptState | null;
@@ -50,6 +52,22 @@ export interface FileTreeOperations {
   dismissNotice: () => void;
 }
 
+/** Which clipboard Paste copies from, given the tree item as it stands. */
+async function readPasteSource(item: TreeClipboard | null): Promise<PasteSource> {
+  try {
+    return choosePasteSource(await ipc.clipboardFileSnapshot(), item);
+  } catch (error) {
+    // Another program holds the clipboard open (Windows). The generation
+    // needs no open: if it still equals what this item's Copy recorded,
+    // nothing newer was copied anywhere and the tree item is the source.
+    if (item?.osChangeCount != null) {
+      const generation = await ipc.clipboardChangeCount().catch(() => null);
+      if (generation === item.osChangeCount) return "tree";
+    }
+    throw error;
+  }
+}
+
 /**
  * Context-menu and file-operation state for the tree: menu/prompt/trash
  * dialog targets, the auto-dismissing failure notice, and every action the
@@ -71,10 +89,11 @@ export function useFileTreeOperations(): FileTreeOperations {
   const [prompt, setPrompt] = useState<PromptState | null>(null);
   const [trashTarget, setTrashTarget] = useState<TrashTarget | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  /** File list the OS clipboard held when the menu opened; `null` until the
-   *  first probe resolves. Only gates Paste's enabled state — the paste
-   *  itself re-reads the clipboard, which can change while the menu is up. */
-  const [systemClipboard, setSystemClipboard] = useState<string[] | null>(null);
+  /** OS clipboard snapshot read when the menu opened; `null` until that
+   *  probe resolves, or when it failed. Only gates Paste's enabled state —
+   *  the paste itself re-reads the clipboard, which can change while the
+   *  menu is up. */
+  const [menuSnapshot, setMenuSnapshot] = useState<ClipboardFileSnapshot | null>(null);
 
   useEffect(() => {
     if (!notice) return;
@@ -105,19 +124,19 @@ export function useFileTreeOperations(): FileTreeOperations {
       setMenu({ x: event.clientX, y: event.clientY, path: node.path, isDir: node.isDir });
       // Only the latest open may update Paste; closing invalidates the probe.
       const probeId = ++clipboardProbeRef.current;
-      setSystemClipboard(null);
-      void ipc
-        .clipboardFileSnapshot()
+      setMenuSnapshot(null);
+      // Like Paste, read only after the latest Copy's write settled: an
+      // earlier snapshot would not match the generation that Copy records.
+      void clipboardWriteRef.current
+        .then(() => ipc.clipboardFileSnapshot())
         .then((snapshot) => {
           if (mountedRef.current && clipboardProbeRef.current === probeId) {
-            setSystemClipboard(snapshot.paths);
+            setMenuSnapshot(snapshot);
           }
         })
-        .catch(() => {
-          if (mountedRef.current && clipboardProbeRef.current === probeId) {
-            setSystemClipboard([]);
-          }
-        });
+        // A failed probe leaves the snapshot unknown; the tree item alone
+        // then enables Paste, which re-reads the clipboard when clicked.
+        .catch(() => {});
     },
     [selectPath],
   );
@@ -191,7 +210,7 @@ export function useFileTreeOperations(): FileTreeOperations {
   const handlePaste = useCallback(
     async (targetDir: string) => {
       try {
-        let snapshot: ClipboardFileSnapshot;
+        let source: PasteSource;
         for (;;) {
           const copyId = copyIdRef.current;
           // The latest Copy's write must settle and record its generation
@@ -199,13 +218,12 @@ export function useFileTreeOperations(): FileTreeOperations {
           await clipboardWriteRef.current;
           // The host reads its own snapshot inside pasteClipboardItems;
           // renderer-supplied source paths never enter the paste command.
-          snapshot = await ipc.clipboardFileSnapshot();
+          source = await readPasteSource(useFilesStore.getState().clipboard);
           // A Copy that arrived meanwhile changes both clipboards: decide again.
           if (copyIdRef.current === copyId) break;
         }
         if (!mountedRef.current) return;
         const item = useFilesStore.getState().clipboard;
-        const source = choosePasteSource(snapshot, item);
         if (source === "tree" && item) {
           const result = await ipc.pasteItem(item.path, targetDir);
           await revealInTree(targetDir, result.path, result.isDir);
@@ -290,7 +308,9 @@ export function useFileTreeOperations(): FileTreeOperations {
 
   return {
     clipboard,
-    canPaste: clipboard !== null || (systemClipboard?.length ?? 0) > 0,
+    canPaste: menuSnapshot
+      ? choosePasteSource(menuSnapshot, clipboard) !== "none"
+      : clipboard !== null,
     menu,
     prompt,
     trashTarget,
