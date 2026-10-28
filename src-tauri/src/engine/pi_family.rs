@@ -44,18 +44,71 @@ pub struct PiFamilyEngine {
     pub home_dir_name: &'static str, // ".pi" | ".omp"
     /// omp rpc-ui v2 大帧的重组缓冲:chunkId → 分片。pi 的 json 模式用不到。
     rpc_chunks: std::sync::Mutex<std::collections::HashMap<String, RpcChunkAcc>>,
-    /// Current run id, set before the reader starts. The injected extension
-    /// writes the provider-reported model to `served-models/<run_id>.tsv`;
-    /// `message_end` consults that sidecar when the runtime did not set
-    /// `upstreamModel` itself.
-    run_id: std::sync::Mutex<Option<String>>,
+    /// This run's served-model sidecar, set before the reader starts and only
+    /// when the injected extension was told to write it. `message_end`
+    /// consults it when the runtime did not set `upstreamModel` itself.
+    served_models_file: std::sync::OnceLock<std::path::PathBuf>,
+}
+
+/// A sidecar untouched this long belongs to no live run: the extension
+/// appends on every provider response, and the reader removes the file when
+/// the run settles. Leftovers come from runs the reader never settled (app
+/// quit mid-turn, crash).
+const SERVED_MODELS_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+fn served_models_dir() -> std::path::PathBuf {
+    crate::paths::app_home().join("served-models")
 }
 
 /// Sidecar path for one run's provider-reported served models.
 pub(crate) fn served_models_path(run_id: &str) -> std::path::PathBuf {
-    let dir = crate::paths::app_home().join("served-models");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{run_id}.tsv"))
+    served_models_dir().join(format!("{run_id}.tsv"))
+}
+
+/// Whether this launch loads the ask bridge extension, which is what writes
+/// the served-model sidecar. Read-only pi runs pass `--no-extensions`, and an
+/// omp plan request runs over ACP without it.
+pub(crate) fn loads_served_model_bridge(engine: &str, req: &SendRequest) -> bool {
+    match engine {
+        "omp" => !acp_plan_requested(req),
+        "pi" => req.allowed_tools.is_none(),
+        _ => false,
+    }
+}
+
+/// Fresh sidecar path for a run: the directory exists, no stale file sits at
+/// the path, and leftovers from unsettled runs are swept once per process.
+/// `None` when the directory cannot be created — the run then reports no
+/// served model instead of pointing the extension at an unwritable path.
+pub(crate) fn prepare_served_models_file(run_id: &str) -> Option<std::path::PathBuf> {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    let dir = served_models_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    SWEEP.call_once(|| sweep_stale_served_models(&dir, SERVED_MODELS_STALE_AFTER));
+    let path = served_models_path(run_id);
+    let _ = std::fs::remove_file(&path);
+    Some(path)
+}
+
+fn sweep_stale_served_models(dir: &std::path::Path, stale_after: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("tsv") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= stale_after);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Last `responseId<TAB>model` row for `response_id`. The extension may append
@@ -67,29 +120,17 @@ fn parse_served_model_sidecar(text: &str, response_id: &str) -> Option<String> {
     })
 }
 
+/// Only a row keyed by this message's own response id is evidence. A message
+/// without one (user, tool result, a failed call) adopts nothing: omp's
+/// background calls (session title and the like) go through the same
+/// observed `fetch`, so a lone row need not belong to this turn.
 fn served_model_from_sidecar(
-    run_id: Option<&str>,
+    sidecar: Option<&std::path::Path>,
     response_id: Option<&str>,
 ) -> Option<String> {
-    let path = served_models_path(run_id?);
-    let text = std::fs::read_to_string(path).ok()?;
-    match response_id {
-        Some(id) => parse_served_model_sidecar(&text, id),
-        // The runtime did not name the response id. When the sidecar holds
-        // exactly one observed row, this was a single-request turn and that
-        // row can only belong to it.
-        None => {
-            let rows: Vec<&str> = text
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect();
-            if rows.len() != 1 {
-                return None;
-            }
-            let (_, model) = rows[0].split_once('\t')?;
-            (!model.trim().is_empty()).then(|| model.trim().to_string())
-        }
-    }
+    let (sidecar, response_id) = (sidecar?, response_id?);
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    parse_served_model_sidecar(&text, response_id)
 }
 
 /// v2 `rpc_chunk` 分片序列的重组中间态。
@@ -346,7 +387,7 @@ pub fn pi() -> PiFamilyEngine {
         id: "pi",
         home_dir_name: ".pi",
         rpc_chunks: std::sync::Mutex::new(std::collections::HashMap::new()),
-        run_id: std::sync::Mutex::new(None),
+        served_models_file: std::sync::OnceLock::new(),
     }
 }
 
@@ -355,7 +396,7 @@ pub fn omp() -> PiFamilyEngine {
         id: "omp",
         home_dir_name: ".omp",
         rpc_chunks: std::sync::Mutex::new(std::collections::HashMap::new()),
-        run_id: std::sync::Mutex::new(None),
+        served_models_file: std::sync::OnceLock::new(),
     }
 }
 
@@ -695,33 +736,36 @@ impl Engine for PiFamilyEngine {
         })
     }
 
-    fn set_run_id(&self, run_id: &str) {
-        if let Ok(mut slot) = self.run_id.lock() {
-            *slot = Some(run_id.to_string());
-        }
+    fn set_served_models_file(&self, path: &std::path::Path) {
+        let _ = self.served_models_file.set(path.to_path_buf());
+    }
+
+    /// Only a run whose extension writes the sidecar can report what served
+    /// it; WSL, read-only and ACP plan runs have no observer.
+    fn reports_served(&self) -> bool {
+        self.served_models_file.get().is_some()
     }
 
     fn parse_line(&self, line: &str, out: &mut Vec<EngineEvent>) {
-        let run_id = self
-            .run_id
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().cloned());
+        let sidecar = self
+            .served_models_file
+            .get()
+            .map(std::path::PathBuf::as_path);
         // v2 分片重组:完整帧递归走正常解析,分片中途不产生事件。廉价前置
         // 判断避免给每一行付出锁的代价。
         if line.contains("\"rpc_chunk\"") {
             if let Some(frame) = self.reassemble_chunk(line) {
-                parse_pi_family_line_for_engine(self.id, run_id.as_deref(), &frame, out);
+                parse_pi_family_line_for_engine(self.id, sidecar, &frame, out);
             }
             return;
         }
-        parse_pi_family_line_for_engine(self.id, run_id.as_deref(), line, out);
+        parse_pi_family_line_for_engine(self.id, sidecar, line, out);
     }
 }
 
 fn parse_pi_family_line_for_engine(
     id: &str,
-    run_id: Option<&str>,
+    sidecar: Option<&std::path::Path>,
     line: &str,
     out: &mut Vec<EngineEvent>,
 ) {
@@ -734,7 +778,7 @@ fn parse_pi_family_line_for_engine(
     {
         return;
     }
-    parse_pi_family_line_with_run(line, out, run_id);
+    parse_pi_family_line_with_sidecar(line, out, sidecar);
 }
 
 fn parse_omp_compact_response(line: &str, out: &mut Vec<EngineEvent>) -> bool {
@@ -853,13 +897,13 @@ pub(crate) fn extension_ui_answer_frame(
 
 /// Shared NDJSON parser for pi and omp (`--mode json`).
 fn parse_pi_family_line(line: &str, out: &mut Vec<EngineEvent>) {
-    parse_pi_family_line_with_run(line, out, None);
+    parse_pi_family_line_with_sidecar(line, out, None);
 }
 
-fn parse_pi_family_line_with_run(
+fn parse_pi_family_line_with_sidecar(
     line: &str,
     out: &mut Vec<EngineEvent>,
-    run_id: Option<&str>,
+    sidecar: Option<&std::path::Path>,
 ) {
     // Stream updates can include the entire growing message twice (message
     // and assistantMessageEvent.partial). Skip those snapshots without
@@ -1050,7 +1094,7 @@ fn parse_pi_family_line_with_run(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
-                .or_else(|| served_model_from_sidecar(run_id, response_id));
+                .or_else(|| served_model_from_sidecar(sidecar, response_id));
             if served_model.is_some() || reported_effort.is_some() {
                 out.push(EngineEvent::Served {
                     model: served_model,
@@ -1524,35 +1568,49 @@ mod tests {
         assert_eq!(parse_served_model_sidecar("malformed-line\n", "x"), None);
     }
 
+    /// A sidecar under the system temp dir, never the real app home.
+    fn temp_sidecar(tag: &str, rows: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ccgui-served-models-{tag}-{}.tsv",
+            std::process::id()
+        ));
+        std::fs::write(&path, rows).unwrap();
+        path
+    }
+
+    fn message_end_with_sidecar(
+        message: serde_json::Value,
+        sidecar: &std::path::Path,
+    ) -> Vec<EngineEvent> {
+        let mut out = Vec::new();
+        parse_pi_family_line_with_sidecar(
+            &serde_json::json!({ "type": "message_end", "message": message }).to_string(),
+            &mut out,
+            Some(sidecar),
+        );
+        out
+    }
+
+    fn served_model_of(out: &[EngineEvent]) -> Option<&str> {
+        out.iter().find_map(|e| match e {
+            EngineEvent::Served {
+                model: Some(model), ..
+            } => Some(model.as_str()),
+            _ => None,
+        })
+    }
+
     #[test]
     fn message_end_uses_the_run_sidecar_when_upstream_model_is_absent() {
-        let run_id = format!("test-sidecar-{}", std::process::id());
-        let path = served_models_path(&run_id);
-        std::fs::write(
+        let path = temp_sidecar("hit", "gen-sidecar\tdeepseek/deepseek-v4.1-flash-1017\n");
+        let out = message_end_with_sidecar(
+            serde_json::json!({ "model": "deepseek-v4.1-flash", "responseId": "gen-sidecar" }),
             &path,
-            "gen-sidecar\tdeepseek/deepseek-v4.1-flash-1017\n",
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        parse_pi_family_line_with_run(
-            &serde_json::json!({
-                "type": "message_end",
-                "message": {
-                    "model": "deepseek-v4.1-flash",
-                    "responseId": "gen-sidecar"
-                }
-            })
-            .to_string(),
-            &mut out,
-            Some(run_id.as_str()),
         );
         let _ = std::fs::remove_file(&path);
-        assert!(
-            out.iter().any(|e| matches!(
-                e,
-                EngineEvent::Served { model: Some(model), effort: None }
-                    if model == "deepseek/deepseek-v4.1-flash-1017"
-            )),
+        assert_eq!(
+            served_model_of(&out),
+            Some("deepseek/deepseek-v4.1-flash-1017"),
             "the provider-reported model must be used as served evidence: {out:?}"
         );
     }
@@ -1563,77 +1621,100 @@ mod tests {
         // the sidecar key is the provider's response id regardless of which
         // spelling the runtime used on the assistant message.
         for field in ["response_id", "id"] {
-            let run_id = format!("test-sidecar-{field}-{}", std::process::id());
-            let path = served_models_path(&run_id);
-            std::fs::write(&path, "chatcmpl-1\tserved/model\n").unwrap();
-            let mut out = Vec::new();
-            parse_pi_family_line_with_run(
-                &serde_json::json!({
-                    "type": "message_end",
-                    "message": {
-                        "model": "requested-model",
-                        field: "chatcmpl-1"
-                    }
-                })
-                .to_string(),
-                &mut out,
-                Some(run_id.as_str()),
+            let path = temp_sidecar(field, "chatcmpl-1\tserved/model\n");
+            let out = message_end_with_sidecar(
+                serde_json::json!({ "model": "requested-model", field: "chatcmpl-1" }),
+                &path,
             );
             let _ = std::fs::remove_file(&path);
-            assert!(
-                out.iter().any(|e| matches!(
-                    e,
-                    EngineEvent::Served { model: Some(model), effort: None }
-                        if model == "served/model"
-                )),
+            assert_eq!(
+                served_model_of(&out),
+                Some("served/model"),
                 "message.{field} must key the sidecar lookup: {out:?}"
             );
         }
     }
 
     #[test]
-    fn message_end_adopts_a_lone_sidecar_row_without_a_response_id() {
-        // A single-request turn may never name its response id; one observed
-        // row can only belong to that turn. Two or more rows stay ambiguous.
-        let run_id = format!("test-sidecar-lone-{}", std::process::id());
-        let path = served_models_path(&run_id);
-        std::fs::write(&path, "gen-x\tserved/model\n").unwrap();
-        let mut out = Vec::new();
-        parse_pi_family_line_with_run(
-            &serde_json::json!({
-                "type": "message_end",
-                "message": { "model": "requested-model" }
-            })
-            .to_string(),
-            &mut out,
-            Some(run_id.as_str()),
+    fn message_end_without_a_response_id_adopts_no_sidecar_row() {
+        // omp's background calls (session title and the like) go through the
+        // same observed fetch: a lone row can be one of them, e.g. when the
+        // turn's own request failed before any response. A message that does
+        // not name its response id — a failed call, a user or tool-result
+        // message — therefore adopts nothing.
+        let path = temp_sidecar("lone", "gen-title\tvendor/smol-upstream\n");
+        let failed = message_end_with_sidecar(
+            serde_json::json!({ "role": "assistant", "model": "main-model", "stopReason": "error" }),
+            &path,
         );
-        assert!(
-            out.iter().any(|e| matches!(
-                e,
-                EngineEvent::Served { model: Some(model), effort: None }
-                    if model == "served/model"
-            )),
-            "a lone sidecar row must serve a single-request turn: {out:?}"
-        );
-
-        std::fs::write(&path, "gen-x\tserved/model\ngen-y\tother/model\n").unwrap();
-        let mut out = Vec::new();
-        parse_pi_family_line_with_run(
-            &serde_json::json!({
-                "type": "message_end",
-                "message": { "model": "requested-model" }
-            })
-            .to_string(),
-            &mut out,
-            Some(run_id.as_str()),
+        let tool_result = message_end_with_sidecar(
+            serde_json::json!({ "role": "toolResult", "toolCallId": "call-1" }),
+            &path,
         );
         let _ = std::fs::remove_file(&path);
-        assert!(
-            !out.iter()
-                .any(|e| matches!(e, EngineEvent::Served { model: Some(_), .. })),
-            "multiple rows without a response id stay ambiguous: {out:?}"
+        assert_eq!(served_model_of(&failed), None, "{failed:?}");
+        assert_eq!(served_model_of(&tool_result), None, "{tool_result:?}");
+    }
+
+    #[test]
+    fn message_end_without_a_sidecar_reports_no_served_model() {
+        let mut out = Vec::new();
+        parse_pi_family_line_with_sidecar(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": { "model": "requested-model", "responseId": "gen-1" }
+            })
+            .to_string(),
+            &mut out,
+            None,
         );
+        assert_eq!(served_model_of(&out), None, "{out:?}");
+    }
+
+    #[test]
+    fn only_runs_that_load_the_bridge_get_a_sidecar() {
+        let plain = plan_req(None);
+        assert!(loads_served_model_bridge("omp", &plain));
+        assert!(loads_served_model_bridge("pi", &plain));
+        // omp plan requests run over ACP without the extension.
+        assert!(!loads_served_model_bridge("omp", &plan_req(Some("plan"))));
+        // Read-only pi passes --no-extensions.
+        let read_only = SendRequest {
+            allowed_tools: Some(vec!["read".to_string()]),
+            ..plan_req(None)
+        };
+        assert!(!loads_served_model_bridge("pi", &read_only));
+        assert!(!loads_served_model_bridge("claude", &plain));
+    }
+
+    #[test]
+    fn reports_served_only_once_a_sidecar_is_attached() {
+        let engine = omp();
+        assert!(!engine.reports_served(), "no observer, nothing to report");
+        engine.set_served_models_file(std::path::Path::new("/tmp/ccgui-served.tsv"));
+        assert!(engine.reports_served());
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_sidecars() {
+        let dir =
+            std::env::temp_dir().join(format!("ccgui-served-models-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("run-1.tsv");
+        let other = dir.join("notes.txt");
+        std::fs::write(&sidecar, "gen-1\tmodel\n").unwrap();
+        std::fs::write(&other, "keep").unwrap();
+
+        sweep_stale_served_models(&dir, std::time::Duration::from_secs(3600));
+        assert!(sidecar.exists(), "a fresh sidecar may belong to a live run");
+
+        sweep_stale_served_models(&dir, std::time::Duration::ZERO);
+        let swept = !sidecar.exists();
+        let kept = other.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(swept, "a sidecar past the threshold is a leftover");
+        assert!(kept, "only .tsv sidecars are swept");
     }
 
     #[test]

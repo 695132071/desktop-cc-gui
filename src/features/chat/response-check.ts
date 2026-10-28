@@ -33,6 +33,9 @@ export interface SelectionSide {
 export interface ResponseCheckState {
   requested: SelectionSide;
   served: SelectionSide;
+  /** The run's stream can report a served side (launch `reportsServed`).
+   *  Absent for engines that never report one and for older records. */
+  reportsServed?: boolean;
 }
 
 export type SelectionVerdict = "match" | "snapshot" | "mismatch" | "unknown";
@@ -44,7 +47,8 @@ export interface ResponseCheckView {
    *  build/date revision differs; "unknown" when a request alias is
    *  unresolved or nothing is comparable; otherwise "match". */
   verdict: "match" | "snapshot" | "mismatch" | "unknown";
-  /** Visible when the run reported a request side or evidence can be compared. */
+  /** Visible when evidence can be compared, an alias needs clarification, or
+   *  a run that can report its served side has not reported it yet. */
   visible: boolean;
 }
 
@@ -65,8 +69,9 @@ function family(id: string): string {
     .replace(/-latest$/, "")
     .replace(/-\d{8}$/, "")
     .replace(/-\d{4}-\d{2}-\d{2}$/, "")
-    // Cohere-style monthly snapshots: `command-r-plus-08-2024`.
-    .replace(/-\d{2}-\d{4}$/, "")
+    // Cohere-style monthly snapshots: `command-r-plus-08-2024`. Only a real
+    // month and a recent year, so `qwen-14-2048` keeps its size and length.
+    .replace(/-(?:0[1-9]|1[0-2])-20[23]\d$/, "")
     // Aggregators also stamp daily builds as `-MMDD` (`ds4.1-1017`); it is a
     // date revision of the same family, not a substituted model. Only strip
     // it when the digits are a plausible month/day — otherwise a trailing
@@ -132,15 +137,20 @@ export function checkResponseSelection(
             : model !== "unknown" || effort !== "unknown"
               ? "match"
               : "unknown";
-  // A reported request with no response evidence still has something to say:
-  // the card shows the requested side and marks the missing side unreported.
-  // Hiding it made an engine that never reports a served id look verified.
+  // A reported request with no response evidence still has something to say
+  // when the response side could have answered: the card shows the request
+  // and marks the missing side unreported, instead of the check vanishing as
+  // if nothing were wrong. An engine that never reports a served side stays
+  // hidden — an "unreported" badge on every one of its turns is noise.
   const requestedReported =
     requested.model !== null || requested.effort !== null;
+  const servedReported = served.model !== null || served.effort !== null;
+  const pendingEvidence =
+    requestedReported && (servedReported || check?.reportsServed === true);
   return {
     model,
     effort,
     verdict,
-    visible: requestedReported || verdict !== "unknown" || unresolvedAlias,
+    visible: verdict !== "unknown" || unresolvedAlias || pendingEvidence,
   };
 }

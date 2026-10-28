@@ -32,6 +32,13 @@ describe("compareModel", () => {
     expect(compareModel("command-r-plus", "command-r-plus-08-2024")).toBe(
       "snapshot",
     );
+    expect(compareModel("command-r7b", "command-r7b-12-2024")).toBe("snapshot");
+  });
+
+  it("does not read a size/length pair as a monthly snapshot", () => {
+    // `-14-2048` is no month and no year: these are different models.
+    expect(compareModel("qwen-14-2048", "qwen-72-2048")).toBe("mismatch");
+    expect(compareModel("qwen-12", "qwen-12-2048")).toBe("mismatch");
   });
 
   it("does not eat a context-length suffix as a date", () => {
@@ -119,6 +126,7 @@ describe("checkResponseSelection", () => {
       checkResponseSelection({
         requested,
         served: { model: null, effort: null },
+        reportsServed: true,
       }).visible,
     ).toBe(true);
     expect(
@@ -173,10 +181,11 @@ describe("checkResponseSelection", () => {
     ).toBe("mismatch");
   });
 
-  it("still shows the card when the response side never reported", () => {
+  it("still shows the card when a reporting engine's response never reported", () => {
     const view = checkResponseSelection({
       requested: { model: "claude-opus-5-5", effort: "xhigh" },
       served: { model: null, effort: null },
+      reportsServed: true,
     });
     expect(view.visible).toBe(true);
     expect(view.verdict).toBe("unknown");
@@ -185,8 +194,34 @@ describe("checkResponseSelection", () => {
       checkResponseSelection({
         requested: { model: null, effort: null },
         served: { model: null, effort: null },
+        reportsServed: true,
       }).visible,
     ).toBe(false);
+  });
+
+  it("stays hidden for an engine that never reports a served side", () => {
+    // kimi/grok/opencode/… only report the launch: a permanent "unreported"
+    // badge on every turn would be noise, not a finding.
+    const requestOnly = {
+      requested: { model: "kimi-k2", effort: "high" },
+      served: { model: null, effort: null },
+    };
+    expect(checkResponseSelection(requestOnly).visible).toBe(false);
+    expect(
+      checkResponseSelection({ ...requestOnly, reportsServed: false }).visible,
+    ).toBe(false);
+    // Any response evidence still opens the card, flag or not.
+    expect(
+      checkResponseSelection({
+        ...requestOnly,
+        served: { model: null, effort: "high" },
+      }),
+    ).toEqual({
+      model: "unknown",
+      effort: "match",
+      verdict: "unknown",
+      visible: true,
+    });
   });
 
   it("never reads an unreported side as a match", () => {

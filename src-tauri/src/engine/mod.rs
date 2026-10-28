@@ -217,9 +217,17 @@ pub trait Engine: Send + Sync {
     }
     /// Parse one NDJSON stdout line into zero or more events.
     fn parse_line(&self, line: &str, out: &mut Vec<EngineEvent>);
-    /// Attach the current run id before the reader starts. Engines that read
-    /// per-run provider sidecars use it; the default is a no-op.
-    fn set_run_id(&self, _run_id: &str) {}
+    /// Attach this run's served-model sidecar before the reader starts.
+    /// Engines whose injected extension records the provider's own `model`
+    /// read it back; the default is a no-op.
+    fn set_served_models_file(&self, _path: &std::path::Path) {}
+    /// True when this run's stream can report what served it (`Served`).
+    /// The response check keeps its badge while that report is pending;
+    /// a run that can never report shows nothing until evidence arrives,
+    /// instead of an "unreported" badge on every turn.
+    fn reports_served(&self) -> bool {
+        false
+    }
     /// True when the engine drives its own transport (e.g. a host WS session)
     /// instead of spawning a child process. send_message routes these to a
     /// virtual run: no spawn, no pid — the registry entry carries only the
@@ -1092,15 +1100,16 @@ async fn send_reserved(
     // pi/omp: the injected extension observes the provider response's own
     // `model` field and appends it to a per-run sidecar. The reader consults
     // that file when `message_end` has no `upstreamModel`. Remote workspaces
-    // run the CLI inside WSL, which cannot write this host-side path.
-    if wsl_tp.is_none() && matches!(engine.as_str(), "omp" | "pi") {
-        launch.engine_impl.set_run_id(&run_id);
-        let path = pi_family::served_models_path(&run_id);
-        let _ = std::fs::remove_file(&path);
-        launch
-            .built
-            .command
-            .env("CCGUI_SERVED_MODEL_FILE", path.as_os_str());
+    // run the CLI inside WSL, which cannot write this host-side path; runs
+    // without the extension have nothing to write it.
+    if wsl_tp.is_none() && pi_family::loads_served_model_bridge(&engine, &launch.req) {
+        if let Some(path) = pi_family::prepare_served_models_file(&run_id) {
+            launch.engine_impl.set_served_models_file(&path);
+            launch
+                .built
+                .command
+                .env("CCGUI_SERVED_MODEL_FILE", path.as_os_str());
+        }
     }
     // Host-stream engines drive their own transport: no child process — the
     // registry entry only routes interrupts to the transport task. Their

@@ -59,6 +59,7 @@ describe("ResponseCheckBadge", () => {
       render({
         requested: { model: "claude-opus-5-5", effort: "xhigh" },
         served: { model: null, effort: null },
+        reportsServed: true,
       });
       expect(trigger()!.getAttribute("aria-label")).toBe("响应校验：无法确认");
       await act(async () => {
@@ -72,6 +73,14 @@ describe("ResponseCheckBadge", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("renders nothing for an engine that never reports the response", () => {
+    render({
+      requested: { model: "kimi-k2", effort: "high" },
+      served: { model: null, effort: null },
+    });
+    expect(trigger()).toBeNull();
   });
 
   it("renders nothing when the run has no request side", () => {

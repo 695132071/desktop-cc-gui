@@ -52,6 +52,11 @@ impl Engine for ClaudeEngine {
         "claude"
     }
 
+    /// Every assistant snapshot names the model that produced it.
+    fn reports_served(&self) -> bool {
+        true
+    }
+
     fn supports_images(&self) -> bool {
         true
     }
