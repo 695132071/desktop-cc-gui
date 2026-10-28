@@ -42,7 +42,7 @@
 - 常用验证入口按需选用：
   - `pnpm build`：前端类型检查和构建。
   - `pnpm exec vitest run <相关测试路径>`：Vitest 测试；核对实际发现及执行的用例。
-  - `node --experimental-strip-types --test tests/*.test.ts`：流式调度、Markdown 与缓存回归，需使用支持该参数的 Node。
+  - `pnpm test:node`（`pnpm test` 会先跑它）：`tests/*.test.ts` 下的流式调度、Markdown 与缓存回归，需 Node 22.13+。
   - 在 `src-tauri` 下执行 `cargo test <相关过滤条件>`；发送与中断链路可用 `cargo test --test send_path`。
   - 真实 React 提交与定时器交错验证见 `tests/browser/README.md`。
 - 报告实际通过、失败、跳过和未覆盖项；不能仅凭退出码为零或构建通过，就声称用户问题已经解决。
