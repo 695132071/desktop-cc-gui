@@ -382,6 +382,10 @@ it("分组内置顶与普通工作区分段排序且仅置顶行显示图钉", a
   ]);
   expect(rowFor("p1").querySelector(".lucide-pin")).not.toBeNull();
   expect(rowFor("r1").querySelector(".lucide-pin")).toBeNull();
+  // The glyph is aria-hidden; the pinned state reaches screen readers as
+  // visually hidden text inside the row button.
+  expect(rowFor("p1").querySelector(".sr-only")?.textContent).toBe("chat.workspacePinned");
+  expect(rowFor("r1").querySelector(".sr-only")).toBeNull();
 });
 
 it("draft 新对话右键只提供删除,不暴露重命名/复制 ID/插件项", async () => {

@@ -280,6 +280,8 @@ export const en: Messages = {
     unarchiveWorkspace: "Unarchive",
     pinWorkspace: "Pin workspace",
     unpinWorkspace: "Unpin workspace",
+    workspacePinned: "Pinned",
+    pinWorkspaceFailed: "Couldn't save the pin state: {{message}}",
     archivedWorkspaces: "Archived ({{count}})",
     selectSession: "Select or start a session",
     thinking: "Responding",

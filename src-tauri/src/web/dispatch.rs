@@ -974,8 +974,11 @@ pub(super) async fn dispatch(
         "set_workspace_pinned" => {
             let a: SetWorkspacePinnedArgs = parse_args(&raw)?;
             ser(crate::history::reader::set_workspace_pinned(
-                app.state(), a.id, a.pinned,
-            ))
+                app.state(),
+                a.id,
+                a.pinned,
+            )
+            .await)
         }
         "remove_workspace" => {
             let a: IdArgs = parse_args(&raw)?;

@@ -1,5 +1,6 @@
 import { ipc, type WorkspaceGroup } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import i18n from "@/lib/i18n";
 import { newId } from "@/lib/id";
 import { pruneMentionIndex } from "@/components/application/ai-chat/mention-files";
 import { pruneSlashCommands } from "@/components/application/ai-chat/slash-commands";
@@ -102,7 +103,7 @@ export function createWorkspaceActions(
           workspaces: s.workspaces.map((w) => w.id === id ? { ...w, pinned: previous } : w),
         }));
         await get().refreshWorkspaces();
-        set({ actionError: errorText(error) });
+        set({ actionError: i18n.t("chat.pinWorkspaceFailed", { message: errorText(error) }) });
       }
     },
 

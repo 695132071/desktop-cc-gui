@@ -265,6 +265,8 @@ export const zh = {
     unarchiveWorkspace: "取消归档",
     pinWorkspace: "置顶工作区",
     unpinWorkspace: "取消置顶",
+    workspacePinned: "已置顶",
+    pinWorkspaceFailed: "置顶状态保存失败：{{message}}",
     archivedWorkspaces: "已归档 ({{count}})",
     selectSession: "选择或新建一个会话开始",
     thinking: "响应中",

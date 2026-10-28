@@ -265,6 +265,8 @@ export const ko: Messages = {
     unarchiveWorkspace: "보관 해제",
     pinWorkspace: "워크스페이스 상단 고정",
     unpinWorkspace: "워크스페이스 상단 고정 해제",
+    workspacePinned: "상단 고정됨",
+    pinWorkspaceFailed: "상단 고정 상태를 저장하지 못했습니다: {{message}}",
     archivedWorkspaces: "보관됨 ({{count}})",
     selectSession: "세션을 선택하거나 시작하세요",
     thinking: "응답 중",

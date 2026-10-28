@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "@/lib/i18n";
+import i18n from "@/lib/i18n";
 import type { AiChatRepo } from "@/components/application/ai-chat/ai-chat-sidebar";
 import { ipc, type SessionMeta, type Workspace } from "@/lib/ipc";
 import { useBrowserStore } from "@/features/browser/store";
@@ -164,7 +164,9 @@ describe("useChatSidebar repo mapping", () => {
       await useChatStore.getState().setWorkspacePinned(WS.id, true);
     });
     expect(useChatStore.getState().workspaces[0]?.pinned).toBe(false);
-    expect(useChatStore.getState().actionError).toContain("写入失败");
+    expect(useChatStore.getState().actionError).toBe(
+      i18n.t("chat.pinWorkspaceFailed", { message: "写入失败" }),
+    );
   });
 
   it("pending 新对话出现在对应工作区线程列表顶部", async () => {

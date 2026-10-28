@@ -1531,13 +1531,10 @@ pub async fn reorder_workspaces(
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn set_workspace_pinned(
-    state: tauri::State<'_, crate::AppState>,
-    id: String,
-    pinned: bool,
-) -> Result<(), String> {
-    let conn = state.db.0.lock();
+/// Worktree children follow their parent row, so only top-level workspaces
+/// (parent_id IS NULL) can be pinned.
+fn set_workspace_pinned_blocking(db: &crate::db::Db, id: &str, pinned: bool) -> Result<(), String> {
+    let conn = db.0.lock();
     let changed = conn
         .execute(
             "UPDATE workspaces SET pinned=?2 WHERE id=?1 AND parent_id IS NULL",
@@ -1548,6 +1545,21 @@ pub fn set_workspace_pinned(
         return Err("workspace not found or is a worktree child".into());
     }
     Ok(())
+}
+
+/// Async + spawn_blocking like the other workspace writes: a sync command
+/// runs on the main thread and would freeze the window while a background
+/// index pass holds the writer lock.
+#[tauri::command]
+pub async fn set_workspace_pinned(
+    state: tauri::State<'_, crate::AppState>,
+    id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || set_workspace_pinned_blocking(&db, &id, pinned))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Sync body of `remove_workspace`. Split out so the identity reclamation
@@ -2009,6 +2021,35 @@ mod tests {
             1
         );
 
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn workspace_pin_only_applies_to_top_level_rows() {
+        let home = scratch_dir("workspace-pin");
+        let db = crate::db::Db::open_at(&home.join("app.db")).unwrap();
+        {
+            let conn = db.0.lock();
+            conn.execute_batch(
+                "INSERT INTO workspaces(id, path, name) VALUES('p', '/ws/p', 'p');
+                 INSERT INTO workspaces(id, path, name, kind, parent_id)
+                   VALUES('c', '/ws/p-wt', 'c', 'worktree', 'p');",
+            )
+            .unwrap();
+        }
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        // Writing the same value again still matches the row.
+        set_workspace_pinned_blocking(&db, "p", true).unwrap();
+        assert!(set_workspace_pinned_blocking(&db, "c", true).is_err());
+        assert!(set_workspace_pinned_blocking(&db, "missing", true).is_err());
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(rows.iter().find(|w| w.id == "p").unwrap().pinned);
+        assert!(!rows.iter().find(|w| w.id == "c").unwrap().pinned);
+
+        set_workspace_pinned_blocking(&db, "p", false).unwrap();
+        let rows = list_workspaces_from(&db).unwrap();
+        assert!(!rows.iter().find(|w| w.id == "p").unwrap().pinned);
         drop(db);
         std::fs::remove_dir_all(&home).ok();
     }
