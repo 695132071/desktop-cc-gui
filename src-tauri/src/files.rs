@@ -17,6 +17,10 @@ pub struct DirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub mtime_ms: i64,
+    /// Git ignores this entry (`.gitignore` / info/exclude / global excludes,
+    /// and `.git` itself); see `git_ignore.rs`. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
 }
 
 #[derive(Serialize)]
@@ -162,8 +166,14 @@ pub fn grant_scope(path: String) -> Result<String, String> {
 /// the filesystem boundary from a remote client, so web.rs has no route
 /// for this command.
 #[tauri::command]
-pub fn grant_root(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    grant_root_in(&db, &path)
+pub async fn grant_root(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || grant_root_in(&db, &path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 fn grant_root_in(db: &crate::db::Db, path: &str) -> Result<(), String> {
@@ -182,34 +192,76 @@ pub fn list_granted_roots(db: tauri::State<'_, Arc<crate::db::Db>>) -> Result<Ve
 }
 
 #[tauri::command]
-pub fn revoke_granted_root(
+pub async fn revoke_granted_root(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<(), String> {
-    db.remove_granted_root(path.trim())
+    let db = Arc::clone(&db);
+    tauri::async_runtime::spawn_blocking(move || db.remove_granted_root(path.trim()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-pub fn list_dir(
-    db: tauri::State<'_, Arc<crate::db::Db>>,
-    path: String,
+/// Sync body of `list_dir`; the command wrapper runs it off the main thread
+/// because the ignore check opens the enclosing Git repository.
+///
+/// `git_ignore_root` opts into the per-entry `ignored` flag: the file tree
+/// passes its root, which bounds how far ignore state is inherited (see
+/// `git_ignore.rs`). Other callers only need names and skip the Git work.
+fn list_dir_blocking(
+    db: &crate::db::Db,
+    path: &str,
+    git_ignore_root: Option<&str>,
 ) -> Result<Vec<DirEntry>, String> {
-    let dir = ensure_allowed(&path, &db)?;
+    let dir = ensure_allowed(path, db)?;
+    let ignore_root = git_ignore_root
+        .map(|root| ensure_allowed(root, db))
+        .transpose()?;
     let entries = std::fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
-    let mut out: Vec<DirEntry> = entries
+    let raw: Vec<(String, Option<std::fs::Metadata>)> = entries
         .flatten()
         .map(|entry| {
-            let meta = entry.metadata().ok();
-            DirEntry {
-                name: entry.file_name().to_string_lossy().to_string(),
-                is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                mtime_ms: meta.as_ref().map(mtime_ms).unwrap_or(0),
-            }
+            (
+                entry.file_name().to_string_lossy().to_string(),
+                entry.metadata().ok(),
+            )
+        })
+        .collect();
+    let is_dir = |meta: &Option<std::fs::Metadata>| meta.as_ref().is_some_and(|m| m.is_dir());
+    let ignored = match &ignore_root {
+        Some(root) => crate::git_ignore::ignored_names(
+            &dir,
+            root,
+            raw.iter().map(|(name, meta)| (name.as_str(), is_dir(meta))),
+        ),
+        None => Default::default(),
+    };
+    let mut out: Vec<DirEntry> = raw
+        .into_iter()
+        .map(|(name, meta)| DirEntry {
+            is_dir: is_dir(&meta),
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            mtime_ms: meta.as_ref().map(mtime_ms).unwrap_or(0),
+            ignored: ignored.contains(&name),
+            name,
         })
         .collect();
     out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
     Ok(out)
+}
+
+#[tauri::command]
+pub async fn list_dir(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+    git_ignore_root: Option<String>,
+) -> Result<Vec<DirEntry>, String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        list_dir_blocking(&db, &path, git_ignore_root.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 fn is_image(path: &Path) -> bool {
@@ -305,49 +357,83 @@ pub async fn read_file(
 }
 
 #[tauri::command]
-pub fn write_file(
+pub async fn write_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
     content: String,
 ) -> Result<(), String> {
-    let file = ensure_allowed(&path, &db)?;
-    std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = ensure_allowed(&path, &db)?;
+        std::fs::write(&file, content).map_err(|e| format!("write {}: {e}", file.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn create_dir(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let dir = ensure_allowed(&path, &db)?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))
+pub async fn create_dir(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = ensure_allowed(&path, &db)?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 /// "New file" from the tree context menu: `create_new` fails instead of
 /// clobbering when the name is taken (write_file overwrites by design).
 #[tauri::command]
-pub fn create_file(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let file = ensure_allowed(&path, &db)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file)
-        .map(|_| ())
-        .map_err(|e| format!("create {}: {e}", file.display()))
+pub async fn create_file(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = ensure_allowed(&path, &db)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .map(|_| ())
+            .map_err(|e| format!("create {}: {e}", file.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn rename_item(
+pub async fn rename_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     from: String,
     to: String,
 ) -> Result<(), String> {
-    let src = ensure_allowed(&from, &db)?;
-    let dst = ensure_allowed(&to, &db)?;
-    std::fs::rename(&src, &dst)
-        .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dst.display()))
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = ensure_allowed(&from, &db)?;
+        let dst = ensure_allowed(&to, &db)?;
+        std::fs::rename(&src, &dst)
+            .map_err(|e| format!("rename {} -> {}: {e}", src.display(), dst.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn trash_item(db: tauri::State<'_, Arc<crate::db::Db>>, path: String) -> Result<(), String> {
-    let target = ensure_allowed(&path, &db)?;
-    trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
+pub async fn trash_item(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<(), String> {
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = ensure_allowed(&path, &db)?;
+        trash::delete(&target).map_err(|e| format!("trash {}: {e}", target.display()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -435,47 +521,57 @@ fn copy_item_into_dir(
 }
 
 #[tauri::command]
-pub fn duplicate_item(
+pub async fn duplicate_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     path: String,
 ) -> Result<FileOpResult, String> {
-    let source = ensure_allowed(&path, &db)?;
-    let meta = std::fs::symlink_metadata(&source)
-        .map_err(|e| format!("stat {}: {e}", source.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("cannot copy symlink {}", source.display()));
-    }
-    let parent = source
-        .parent()
-        .ok_or_else(|| format!("invalid path {}", source.display()))?;
-    let destination = copy_item_into_dir(&source, meta.is_dir(), parent, false)?;
-    Ok(FileOpResult {
-        path: destination.to_string_lossy().into_owned(),
-        is_dir: meta.is_dir(),
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = ensure_allowed(&path, &db)?;
+        let meta = std::fs::symlink_metadata(&source)
+            .map_err(|e| format!("stat {}: {e}", source.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("cannot copy symlink {}", source.display()));
+        }
+        let parent = source
+            .parent()
+            .ok_or_else(|| format!("invalid path {}", source.display()))?;
+        let destination = copy_item_into_dir(&source, meta.is_dir(), parent, false)?;
+        Ok(FileOpResult {
+            path: destination.to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn paste_item(
+pub async fn paste_item(
     db: tauri::State<'_, Arc<crate::db::Db>>,
     source: String,
     target_dir: String,
 ) -> Result<FileOpResult, String> {
-    let source = ensure_allowed(&source, &db)?;
-    let dir = ensure_allowed(&target_dir, &db)?;
-    if !dir.is_dir() {
-        return Err(format!("{} is not a directory", dir.display()));
-    }
-    let meta = std::fs::symlink_metadata(&source)
-        .map_err(|e| format!("stat {}: {e}", source.display()))?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("cannot copy symlink {}", source.display()));
-    }
-    let destination = copy_item_into_dir(&source, meta.is_dir(), &dir, true)?;
-    Ok(FileOpResult {
-        path: destination.to_string_lossy().into_owned(),
-        is_dir: meta.is_dir(),
+    let db = Arc::clone(db.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = ensure_allowed(&source, &db)?;
+        let dir = ensure_allowed(&target_dir, &db)?;
+        if !dir.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        let meta = std::fs::symlink_metadata(&source)
+            .map_err(|e| format!("stat {}: {e}", source.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("cannot copy symlink {}", source.display()));
+        }
+        let destination = copy_item_into_dir(&source, meta.is_dir(), &dir, true)?;
+        Ok(FileOpResult {
+            path: destination.to_string_lossy().into_owned(),
+            is_dir: meta.is_dir(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Case-insensitive substring check. ASCII haystack+needle take an
@@ -655,6 +751,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn list_dir_flags_git_ignored_entries_and_omits_false() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        let workspace = Scratch::new();
+        git2::Repository::init(&workspace.0).unwrap();
+        std::fs::write(workspace.0.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(workspace.0.join("debug.log"), "").unwrap();
+        std::fs::write(workspace.0.join("main.rs"), "").unwrap();
+        let path = workspace.0.to_string_lossy().to_string();
+        grant_root_in(&db, &path).unwrap();
+
+        // Callers that only need names skip the Git work entirely.
+        let plain = list_dir_blocking(&db, &path, None).unwrap();
+        assert!(plain.iter().all(|e| !e.ignored));
+
+        let entries = list_dir_blocking(&db, &path, Some(&path)).unwrap();
+        let flag = |name: &str| entries.iter().find(|e| e.name == name).unwrap().ignored;
+        assert!(flag(".git"));
+        assert!(flag("debug.log"));
+        assert!(!flag("main.rs"));
+        assert!(!flag(".gitignore"));
+        // Dirs still sort first; the flag does not reorder the listing.
+        assert_eq!(entries[0].name, ".git");
+
+        let json = serde_json::to_value(&entries).unwrap();
+        let by_name = |name: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("debug.log")["ignored"], true);
+        assert!(by_name("main.rs").get("ignored").is_none());
     }
 
     #[test]

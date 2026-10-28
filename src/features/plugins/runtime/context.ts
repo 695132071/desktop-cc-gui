@@ -14,6 +14,7 @@ import {
   panelTabRegistry,
   scopedPluginId,
   sessionMenuRegistry,
+  fileLinkMenuRegistry,
   settingsRegistry,
   statusBarRegistry,
   composerStatusRegistry,
@@ -48,12 +49,14 @@ import { assertPluginEmitTopic, pluginBus } from "./events";
 import { setActiveComposerDraft } from "./composer-draft";
 import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { addPluginWorkspace, listPluginWorkspaces, openPluginSession } from "./workspace-bridge";
+import { createWorktreeBadgeHandle } from "./worktree-badges";
 import { createPluginWorktree, removePluginWorktree } from "./worktree-bridge";
 import { interruptPluginChatRun, startPluginChatRun } from "./session-run-bridge";
 import { registerSessionSource } from "./session-source";
 import { directoryAssetUrl, fileAssetUrl, remoteAssetUrl } from "./asset-url";
 import { usePluginTabsStore } from "./center-tabs";
 import { runAsPlugin, withAuthorizedHostInvoke } from "./hardening";
+import { createUsageCaps, type UsageBackend } from "./usage-bridge";
 
 /** Storage transport the context talks to; the loader binds the IPC-backed
  *  implementation, tests bind fakes. */
@@ -79,7 +82,7 @@ export type DocumentStorageRemoveResponse =
 
 /** Full backend seam the context needs. Every method accepts pluginId first;
  * the loader binds these calls to IPC and tests bind minimal fakes. */
-export interface PluginContextBackend extends PluginStorageBackend {
+export interface PluginContextBackend extends PluginStorageBackend, UsageBackend {
   agentCatalog?(workspacePath: string): Promise<PluginAgentCatalogEntry[]>;
   windowGetState?(id: string): Promise<PluginWindowSnapshot>;
   windowSetNormalBounds?(id: string, bounds: PluginWindowBounds): Promise<PluginWindowSnapshot>;
@@ -473,6 +476,19 @@ export function createPluginContext(
           }),
         );
       },
+      registerFileLinkMenuItem(def) {
+        requirePermission("ui:file-link-menu");
+        return track(fileLinkMenuRegistry.register({
+          id: scopedPluginId(id, def.key),
+          label: (target) => runAsPlugin(() => def.label(target)),
+          icon: def.icon,
+          visible: def.visible
+            ? (target) => runAsPlugin(() => def.visible!(target))
+            : undefined,
+          run: (target) => runAsPlugin(() => def.run(target)),
+          order: def.order,
+        }));
+      },
       registerSessionMenuItem(def) {
         requirePermission("ui:session-menu");
         return track(
@@ -539,15 +555,38 @@ export function createPluginContext(
       },
       registerSidebarNav(def) {
         requirePermission("ui:sidebar-entry");
+        const badge = def.badge;
         return track(
           sidebarNavRegistry.register({
             id: scopedPluginId(id, def.key),
             label: def.label,
             icon: def.icon,
             order: def.order,
+            // 徽标 getter 在每次渲染时求值；插件抛错只让它的计数消失，
+            // 不能连带整条侧栏（同 ui:worktree-badge 的隔离策略）。
+            badge:
+              badge &&
+              (() => {
+                try {
+                  return runAsPlugin(badge);
+                } catch {
+                  return null;
+                }
+              }),
             onOpen: () => runAsPlugin(def.onOpen),
           }),
         );
+      },
+      registerWorktreeBadges(def) {
+        requirePermission("ui:worktree-badge");
+        return createWorktreeBadgeHandle({
+          pluginId: id,
+          sourceKey: scopedPluginId(id, def.key),
+          canReadWorkspaces: manifest.permissions.includes("host:workspace"),
+          order: def.order,
+          onClick: def.onClick,
+          track,
+        });
       },
       registerCenterTab(def) {
         requirePermission("ui:center-tab");
@@ -794,6 +833,7 @@ export function createPluginContext(
         return backend.modelCatalog(id, options);
       },
     },
+    ...createUsageCaps(id, backend, requirePermission, track),
     agent: {
       async catalog(workspacePath) {
         requirePermission("agent");

@@ -601,7 +601,13 @@ pub(crate) async fn plugin_add_workspace(
     require_workspace_grants(&grants, &plugin_id, meta.as_ref())?;
     // Plugins register ordinary (or remote-meta) workspaces only; the
     // worktree kind is host-UI territory and needs no plugin grant.
-    crate::history::reader::add_workspace_inner(&state, &path, meta, None, None)
+    let db = std::sync::Arc::clone(&state.db);
+    let sink = std::sync::Arc::clone(&state.sink);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::history::reader::add_workspace_inner(&db, &sink, &path, meta, None, None)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Run a granted binary to completion, capturing stdout/stderr (64KB each).

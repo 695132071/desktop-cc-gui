@@ -1,7 +1,7 @@
 import type { ComponentType } from "react";
 import type * as React from "react";
 import type { Disposer } from "./manifest";
-import type { ComposerSlotId, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
+import type { ComposerSlotId, FileLinkMenuTarget, SessionMenuTarget, WorkspaceMenuLabelValue } from "./registry";
 export interface WorkspaceMetadata {
   id: string;
   path: string;
@@ -339,6 +339,53 @@ export interface PluginWorkspaceRow {
   worktree?: { branch: string; prNumber?: number };
 }
 
+/** Worktree badge accent（0.3.22）。宿主把它映射到 status token；不在
+ *  白名单里的值按 "neutral" 处理，不会透传到 CSS。 */
+export type WorktreeBadgeTone =
+  | "neutral"
+  | "blue"
+  | "cyan"
+  | "green"
+  | "lime"
+  | "yellow"
+  | "rose"
+  | "purple";
+
+/** 侧栏 worktree 子行（`host:workspace` 投影，0.3.22）：徽标接口与列表
+ *  回调收到的目标。`prNumber` 缺失为 null（不是 undefined）。 */
+export interface WorktreeBadgeTarget {
+  workspaceId: string;
+  parentWorkspaceId: string;
+  path: string;
+  branch: string;
+  prNumber: number | null;
+}
+
+/** 一行 worktree 子行上的一块徽标（0.3.22）。`label` 去掉首尾空白后按
+ *  码点截到 6；`tooltip` 截到 300；空 label 视为不显示。 */
+export interface WorktreeBadge {
+  label: string;
+  tone: WorktreeBadgeTone;
+  tooltip?: string;
+}
+
+/** `ctx.ui.registerWorktreeBadges` 的句柄（0.3.22）。`list`/`onChange` 额外
+ *  需要 `host:workspace`；`set`/`clear` 只需要 `ui:worktree-badge`。
+ *  卸载时宿主清掉本插件的全部徽标与订阅，`dispose()` 可提前做同样的事。 */
+export interface WorktreeBadgeHandle {
+  /** 当前侧栏的 worktree 子行快照（需要 `host:workspace`）。 */
+  list(): WorktreeBadgeTarget[];
+  /** 跟随 worktree 子行增删或分支/PR/路径变化（需要 `host:workspace`）；
+   *  回调在插件上下文中执行。 */
+  onChange(cb: (targets: WorktreeBadgeTarget[]) => void): Disposer;
+  /** 给一行设置（替换）徽标；`null` 等于清除该行。 */
+  set(workspaceId: string, badge: WorktreeBadge | null): void;
+  /** 清掉本句柄设置的全部徽标（保留订阅）。 */
+  clear(): void;
+  /** 清掉徽标与订阅；幂等，卸载时宿主也会调用。 */
+  dispose(): void;
+}
+
 export interface PluginWindowBounds {
   /** Physical desktop coordinates; may be negative on left/top monitors. */
   x: number;
@@ -393,6 +440,121 @@ export interface PluginModelCatalogResult {
   errors: PluginModelCatalogError[];
   refreshedAt: number;
 }
+/** 用量统计（权限 `usage.read`，0.3.25 起）：宿主从本机各 CLI 自己的会话日志
+ *  增量计算，只读、不联网（`updatePrices` 除外，它只下载公开价格表）。
+ *  日期均为宿主本地日期 `YYYY-MM-DD`，时区由宿主运行时代填。 */
+export type UsageStatsBucket = "day" | "hour";
+export interface UsageStatsQuery {
+  /** 起始本地日期（含）。 */
+  from: string;
+  /** 结束本地日期（含）。 */
+  to: string;
+  /** 缺省 "day"；"hour" 的 bucket 形如 `2026-10-27T14`。 */
+  bucket?: UsageStatsBucket;
+}
+export interface UsageStatRow {
+  /** `2026-10-27`（day）或 `2026-10-27T14`（hour），本地时间。 */
+  bucket: string;
+  /** 引擎 id：claude / codex / pi / omp …（随宿主支持的日志格式增加）。 */
+  engine: string;
+  model: string;
+  /** 会话的工作目录（cwd）；日志里没有时为 null。 */
+  project: string | null;
+  /** 该分组里出现的不同会话数（跨分组相加会重复计）。 */
+  sessions: number;
+  /** 模型响应次数。 */
+  requests: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** 推理 tokens，已包含在 output 里，单列仅供参考。 */
+  reasoning: number;
+  /** 按价格表估算的美元费用；价格表里查不到该模型时为 null。 */
+  cost: number | null;
+}
+export interface UsageStatsResult {
+  rows: UsageStatRow[];
+  /** 全部数据里最早有用量的本地日期。 */
+  firstDay: string | null;
+  /** 最近一次扫描完成时间（epoch ms）。 */
+  scannedAt: number | null;
+  /** 正在扫描时为 true，此时 rows 是扫描前的数据。 */
+  scanning: boolean;
+  /** rows 中没有价格的模型。 */
+  unknownModels: string[];
+}
+export type UsageSourceState = "ok" | "missing" | "denied" | "error";
+export interface UsageSourceStatus {
+  engine: string;
+  label: string;
+  /** 扫描的根目录（已展开环境变量覆盖）。 */
+  roots: string[];
+  /** 可覆盖根目录的环境变量名。 */
+  env: string | null;
+  files: number;
+  status: UsageSourceState;
+  error: string | null;
+  lastScanAt: number | null;
+}
+export interface UsageScanSummary {
+  filesScanned: number;
+  eventsAdded: number;
+  durationMs: number;
+  scannedAt: number;
+}
+export interface UsageScanProgress {
+  done: number;
+  total: number;
+  engine: string | null;
+  finished: boolean;
+}
+export interface UsagePriceInfo {
+  source: "bundled" | "online";
+  /** 内置快照日期 `YYYY-MM-DD`。 */
+  snapshotDate: string;
+  /** 在线价格表的下载时间（epoch ms）；从未更新为 null。 */
+  updatedAt: number | null;
+  models: number;
+}
+
+/** 订阅限额（权限 `limits.read`，0.3.25 起）：宿主只读本机 CLI 的登录状态，
+ *  只请求厂商官方接口，不刷新、不改写任何凭据；插件拿不到凭据。 */
+export type UsageLimitProviderId = "claude" | "codex";
+export type UsageLimitStatus = "ok" | "signedOut" | "expired" | "rateLimited" | "offline" | "error";
+export interface UsageLimitWindow {
+  /** five_hour / seven_day / seven_day_opus / seven_day_sonnet / scoped:<model> / session / weekly */
+  id: string;
+  kind: "session" | "weekly" | "other";
+  /** 模型级窗口的模型显示名；其他为 null。 */
+  label: string | null;
+  /** 已用百分比 0–100。 */
+  usedPercent: number;
+  windowSeconds: number | null;
+  /** 重置时间（epoch ms）。 */
+  resetsAt: number | null;
+}
+export interface UsageLimitProvider {
+  id: UsageLimitProviderId;
+  status: UsageLimitStatus;
+  plan: string | null;
+  /** rateLimited / offline 时保留上一次成功的数据。 */
+  windows: UsageLimitWindow[];
+  /** 额外用量（Extra usage），账号未开启时为 null。 */
+  extra: { usedUsd: number; limitUsd: number } | null;
+  /** 所示数据的获取时间（epoch ms）。 */
+  fetchedAt: number | null;
+  /** rateLimited 时下一次自动重试的时间（epoch ms）。 */
+  retryAt: number | null;
+  /** 简短原因，不含凭据。 */
+  error: string | null;
+  /** 查询的官方接口主机名，用于提示文案。 */
+  host: string;
+}
+export interface UsageLimitsResult {
+  providers: UsageLimitProvider[];
+}
+
 export interface PluginModelCatalogEngine {
   engine: PluginEngineInfo;
   sources: PluginModelSource[];
@@ -511,6 +673,18 @@ export interface PluginContext {
       keywords?: () => string[];
       run: () => void;
     }): Disposer;
+    /** Chat file-link actions before the external editor (0.3.23).
+     * Permission: ui:file-link-menu. run receives a non-null resolvedPath
+     * for the clicked link, never the currently active editor's file.
+     * label/visible run on every menu open and see the clicked path. */
+    registerFileLinkMenuItem(def: {
+      key?: string;
+      label: (target: FileLinkMenuTarget) => string;
+      icon?: ComponentType<{ className?: string }>;
+      visible?: (target: FileLinkMenuTarget) => boolean;
+      run: (target: FileLinkMenuTarget) => void | Promise<void>;
+      order?: number;
+    }): Disposer;
     /** Sidebar session right-click menu row (permission `ui:session-menu`,
      *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 */
     registerSessionMenuItem(def: {
@@ -556,14 +730,36 @@ export interface PluginContext {
     }): Disposer;
     /** Home sidebar nav entry under the builtin 自动化 row (permission
      *  `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's
-     *  center tab via openCenterTab. */
+     *  center tab via openCenterTab. `badge` (0.3.22) is an optional trailing
+     *  count pill, re-evaluated every render; re-registering the same key
+     *  refreshes it. */
     registerSidebarNav(def: {
       key?: string;
       label: () => string;
       icon?: ComponentType<{ className?: string }>;
       order?: number;
+      badge?: () => string | number | null;
       onOpen: () => void;
     }): Disposer;
+    /** Sidebar worktree-row badges (permission `ui:worktree-badge`, 0.3.22):
+     *  push labels onto the "WORKTREES" child rows. `set`/`clear` need only
+     *  `ui:worktree-badge`; `list`/`onChange` also need `host:workspace` and
+     *  throw a readable error without it.
+     *
+     *  Shapes — target `{ workspaceId, parentWorkspaceId, path, branch,
+     *  prNumber: number | null }`, badge `{ label, tone, tooltip? }`.
+     *  Rendering rules: at most 2 badges per row (sorted by `order`, then
+     *  registration order); `tone` outside "neutral" | "blue" | "cyan" |
+     *  "green" | "lime" | "yellow" | "rose" | "purple" falls back to
+     *  "neutral"; `label` is trimmed then truncated to 6 code points (empty =
+     *  no badge); `tooltip` is plain text truncated to 300. `onClick` runs in
+     *  the plugin context and never expands the sidebar row. Unload (or
+     *  `dispose()`) clears this plugin's badges and subscriptions. */
+    registerWorktreeBadges(def: {
+      key?: string;
+      order?: number;
+      onClick?: (target: WorktreeBadgeTarget) => void;
+    }): WorktreeBadgeHandle;
     /** Center-area tab definition (permission `ui:center-tab`, 0.3.12):
      *  renders in the center tab strip like session/file/browser tabs.
      *  Opening goes through openCenterTab; multiple keys = multiple tabs. */
@@ -639,10 +835,12 @@ export interface PluginContext {
    *  `<仓库同级>/<仓库名>-worktrees/<branch>`。
    *
    *  失败/取消以 `Error` reject，message 形如 `"<errorKind>: <detail>"`
-   *  （kind 与宿主错误分类一致：not_a_repo / invalid_branch /
-   *  branch_not_found / branch_exists / branch_checked_out / dir_exists /
-   *  pr_not_found / fetch_failed / register_failed / sparse_checkout_empty /
-   *  canceled / unknown），插件据此给用户可读文案。 */
+   *  （kind 与宿主错误分类一致：not_a_repo / repo_open_failed /
+   *  invalid_branch / branch_not_found / branch_exists / branch_checked_out /
+   *  dir_exists / pr_not_found / fetch_failed / register_failed /
+   *  sparse_checkout_empty / canceled / unknown），插件据此给用户可读文案。
+   *  `repo_open_failed` = 仓库存在但打不开（如属主校验拒绝），detail 以
+   *  `GIT_UNSAFE_REPO:` / `GIT_OPEN_FAILED:` 开头并带原因。 */
   worktrees: {
     create(def: {
       /** 本地仓库路径（父工作区目录，必须是 git 仓库）。 */
@@ -747,6 +945,31 @@ export interface PluginContext {
       workspace?: string;
       refreshProviders?: boolean;
     }): Promise<PluginModelCatalogResult>;
+  };
+  /** 本机用量统计（权限 `usage.read`，0.3.25 起）。数据由宿主从各 CLI 的会话
+   *  日志计算，不上传。refresh 增量读取新内容；rescan 从头重读磁盘上全部日志
+   *  （进度经 onScanProgress），已被 CLI 清理的旧日志对应的用量保留不丢，
+   *  60 秒内重复调用会被拒绝。updatePrices 下载公开价格表（LiteLLM），应只在
+   *  用户开启自动更新或显式操作时调用；10 分钟内重复调用直接返回当前价格表。
+   *  宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。 */
+  usage: {
+    query(query: UsageStatsQuery): Promise<UsageStatsResult>;
+    sources(): Promise<UsageSourceStatus[]>;
+    refresh(): Promise<UsageScanSummary>;
+    rescan(): Promise<UsageScanSummary>;
+    prices(): Promise<UsagePriceInfo>;
+    updatePrices(): Promise<UsagePriceInfo>;
+    onChange(cb: (event: { scannedAt: number }) => void): Disposer;
+    onScanProgress(cb: (progress: UsageScanProgress) => void): Disposer;
+  };
+  /** 订阅限额（权限 `limits.read`，0.3.25 起）。缺省查询全部平台；宿主缓存
+   *  60 秒，refresh 跳过缓存但 20 秒内重复刷新仍复用上次结果，并遵守 429
+   *  退避。 */
+  limits: {
+    get(options?: {
+      providers?: UsageLimitProviderId[];
+      refresh?: boolean;
+    }): Promise<UsageLimitsResult>;
   };
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件走独立的
