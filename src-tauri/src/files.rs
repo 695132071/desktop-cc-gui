@@ -581,13 +581,17 @@ fn exclusive_rename_unsupported(_error: &std::io::Error) -> bool {
     false
 }
 
+/// `std`'s legacy limit for Windows paths: directory paths are capped at 248
+/// UTF-16 units (260 for files) unless the `\\?\` prefix lifts the limit.
+#[cfg(windows)]
+const WINDOWS_LEGACY_MAX_PATH: usize = 248;
+
 #[cfg(windows)]
 fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
 
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let from = wide_path(from)?;
+    let to = wide_path(to)?;
     // Without MOVEFILE_REPLACE_EXISTING, MoveFileExW refuses to replace an
     // existing file; existing directories are rejected either way.
     unsafe {
@@ -597,7 +601,115 @@ fn rename_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
             MOVE_FILE_FLAGS(0),
         )
     }
-    .map_err(|error| std::io::Error::other(error.to_string()))
+    .map_err(win32_io_error)
+}
+
+/// `MoveFileExW` gets the raw path, so it has neither the `\\?\` prefix nor
+/// the normalization `std::fs` applies before every call: a path near
+/// `MAX_PATH` fails with `ERROR_PATH_NOT_FOUND` even though each `std::fs`
+/// step of the same copy succeeded. Paths past the legacy limit are therefore
+/// made absolute by `GetFullPathNameW` — the verbatim prefix turns off `\..`
+/// expansion, so the absolute form must come from the API — and get the
+/// prefix; shorter absolute paths are passed through untouched.
+#[cfg(windows)]
+fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEP: u16 = b'\\' as u16;
+    const ALT_SEP: u16 = b'/' as u16;
+    const COLON: u16 = b':' as u16;
+    const DOT: u16 = b'.' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const VERBATIM: [u16; 4] = [SEP, SEP, QUERY, SEP];
+    const NT: [u16; 4] = [SEP, QUERY, QUERY, SEP];
+    const UNC: [u16; 8] = [
+        SEP,
+        SEP,
+        QUERY,
+        SEP,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        SEP,
+    ];
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.starts_with(&VERBATIM) || wide.starts_with(&NT) {
+        return Ok(nul_terminated(wide));
+    }
+    let short_and_absolute = matches!(
+        wide.as_slice(),
+        [drive, COLON, SEP | ALT_SEP, ..] if *drive != SEP && *drive != ALT_SEP
+    ) || matches!(wide.as_slice(), [SEP | ALT_SEP, SEP | ALT_SEP, ..]);
+    if short_and_absolute && wide.len() < WINDOWS_LEGACY_MAX_PATH {
+        return Ok(nul_terminated(wide));
+    }
+
+    let mut absolute = full_path(&wide)?;
+    let prefix: &[u16] = match absolute.as_slice() {
+        // C:\... => \\?\C:\...
+        [_, COLON, SEP, ..] => &VERBATIM,
+        // \\.\... => \\?\...
+        [SEP, SEP, DOT, SEP, ..] => {
+            absolute.drain(..4);
+            &VERBATIM
+        }
+        // Already verbatim.
+        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => &[],
+        // \\server\share => \\?\UNC\server\share
+        [SEP, SEP, ..] => {
+            absolute.drain(..2);
+            &UNC
+        }
+        _ => &[],
+    };
+    let mut wide = Vec::with_capacity(prefix.len() + absolute.len() + 1);
+    wide.extend_from_slice(prefix);
+    wide.extend_from_slice(&absolute);
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn nul_terminated(mut wide: Vec<u16>) -> Vec<u16> {
+    wide.push(0);
+    wide
+}
+
+/// Absolute, Windows-normalized form of `wide` (`/` becomes `\`, `.` and `..`
+/// collapse). `GetFullPathNameW` reports the needed buffer size when the one
+/// handed in is too small; a successful call returns the length without NUL.
+#[cfg(windows)]
+fn full_path(wide: &[u16]) -> std::io::Result<Vec<u16>> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetFullPathNameW;
+
+    let input = nul_terminated(wide.to_vec());
+    let mut buffer = vec![0u16; wide.len().max(WINDOWS_LEGACY_MAX_PATH)];
+    loop {
+        let len = unsafe {
+            GetFullPathNameW(PCWSTR(input.as_ptr()), Some(&mut buffer[..]), None)
+        } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buffer.len() {
+            buffer.truncate(len);
+            return Ok(buffer);
+        }
+        buffer = vec![0u16; len];
+    }
+}
+
+/// `MoveFileExW` reports Win32 failures as `HRESULT_FROM_WIN32`; unwrap them so
+/// callers see the OS error code, kind and text `std::fs` would have produced.
+#[cfg(windows)]
+fn win32_io_error(error: windows::core::Error) -> std::io::Error {
+    let code = error.code().0 as u32;
+    match code & 0xFFFF_0000 {
+        0x8007_0000 => std::io::Error::from_raw_os_error((code & 0xFFFF) as i32),
+        _ => std::io::Error::other(error.to_string()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1326,7 +1438,9 @@ mod tests {
     }
 
     /// The staged name must not grow with the source name: a 213-character
-    /// name fits the 255 limit, its staged sibling must too.
+    /// name fits the 255 limit, its staged sibling must too. On Windows the
+    /// temp dir alone makes the full path pass `MAX_PATH`, so this also pins
+    /// that the publication rename handles long paths like `std::fs` does.
     #[test]
     fn long_names_paste_and_duplicate() {
         let source = Scratch::new();
