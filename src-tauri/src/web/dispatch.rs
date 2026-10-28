@@ -219,6 +219,19 @@ struct PluginHostArgs {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginUsageQueryArgs {
+    plugin_id: String,
+    query: crate::usage_stats::QueryRequest,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginLimitsArgs {
+    plugin_id: String,
+    providers: Option<Vec<String>>,
+    refresh: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginEngineArgs {
     plugin_id: String,
     engine: String,
@@ -274,17 +287,6 @@ struct DeleteRemoteSessionArgs {
     engine: String,
     session_id: String,
     remote_path: String,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageSummaryArgs {
-    days: u32,
-    tz_offset_minutes: i32,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageRecordArgs {
-    entry: crate::usage::UsageEntry,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -764,6 +766,37 @@ pub(super) async fn dispatch(
             )
             .await)
         }
+        // Usage statistics & subscription limits: read-only data the desktop
+        // computes; the remote client renders the same plugin, and every
+        // call re-checks usage.read / limits.read in plugin_usage.
+        "plugin_usage_query" => {
+            let a: PluginUsageQueryArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_query(app.clone(), a.plugin_id, a.query).await)
+        }
+        "plugin_usage_sources" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_sources(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_refresh" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_refresh(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_rescan" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_rescan(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_prices" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_prices(app.clone(), a.plugin_id).await)
+        }
+        "plugin_usage_update_prices" => {
+            let a: PluginHostArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_usage_update_prices(app.clone(), a.plugin_id).await)
+        }
+        "plugin_limits_get" => {
+            let a: PluginLimitsArgs = parse_args(&raw)?;
+            ser(crate::plugin_usage::plugin_limits_get(a.plugin_id, a.providers, a.refresh).await)
+        }
         "save_pasted_image" => {
             let a: SavePastedImageArgs = parse_args(&raw)?;
             ser(crate::engine::images::save_pasted_image(
@@ -801,27 +834,6 @@ pub(super) async fn dispatch(
             )
             .await)
         }
-        // Usage ledger: the mobile/web client renders the same page, so the
-        // bridge must route it like every other settings surface.
-        "usage_summary" => {
-            let a: UsageSummaryArgs = parse_args(&raw)?;
-            ser(crate::usage::usage_summary(
-                app.state(),
-                a.days,
-                a.tz_offset_minutes,
-            )
-            .await)
-        }
-        "usage_record" => {
-            let a: UsageRecordArgs = parse_args(&raw)?;
-            ser(crate::usage::usage_record(
-                app.clone(),
-                app.state(),
-                a.entry,
-            )
-            .await)
-        }
-        "usage_clear" => ser(crate::usage::usage_clear(app.state()).await),
         "load_session_page" => {
             let a: LoadSessionPageArgs = parse_args(&raw)?;
             ser(crate::history::reader::load_session_page(

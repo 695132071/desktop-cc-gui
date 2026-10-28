@@ -55,6 +55,7 @@ import { registerSessionSource } from "./session-source";
 import { directoryAssetUrl, fileAssetUrl, remoteAssetUrl } from "./asset-url";
 import { usePluginTabsStore } from "./center-tabs";
 import { runAsPlugin, withAuthorizedHostInvoke } from "./hardening";
+import { createUsageCaps, type UsageBackend } from "./usage-bridge";
 
 /** Storage transport the context talks to; the loader binds the IPC-backed
  *  implementation, tests bind fakes. */
@@ -80,7 +81,7 @@ export type DocumentStorageRemoveResponse =
 
 /** Full backend seam the context needs. Every method accepts pluginId first;
  * the loader binds these calls to IPC and tests bind minimal fakes. */
-export interface PluginContextBackend extends PluginStorageBackend {
+export interface PluginContextBackend extends PluginStorageBackend, UsageBackend {
   agentCatalog?(workspacePath: string): Promise<PluginAgentCatalogEntry[]>;
   windowGetState?(id: string): Promise<PluginWindowSnapshot>;
   windowSetNormalBounds?(id: string, bounds: PluginWindowBounds): Promise<PluginWindowSnapshot>;
@@ -818,6 +819,7 @@ export function createPluginContext(
         return backend.modelCatalog(id, options);
       },
     },
+    ...createUsageCaps(id, backend, requirePermission, track),
     agent: {
       async catalog(workspacePath) {
         requirePermission("agent");

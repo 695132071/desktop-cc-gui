@@ -1,5 +1,16 @@
 # @ccgui/plugin-sdk changelog
 
+## 0.3.23 — 2026-10-28
+
+- 新增权限 `usage.read` 与 `ctx.usage`：本机用量统计，由宿主从各 CLI 自己的会话日志增量计算（首批 Claude Code / Codex / Pi / oh-my-pi），只读、不上传。
+  - `query({ from, to, bucket? })` 返回按「本地日期（或小时）× 引擎 × 模型 × 会话 cwd」分组的 `UsageStatRow[]`，含输入 / 输出 / 缓存读 / 缓存写 / 推理 tokens、请求数、会话数与按价格表估算的 `cost`（查不到价格时为 `null`，不拿别的模型价格去猜）。日期是宿主本地 `YYYY-MM-DD`，时区由宿主运行时代填；区间上限 3700 天。
+  - `sources()` 列出各数据来源的根目录、环境变量覆盖、文件数与状态（`ok` / `missing` / `denied` / `error`）；`refresh()` 增量扫描，`rescan()` 从头重读磁盘上全部日志（已被 CLI 清理的旧日志对应的用量保留，60 秒冷却），进度经 `onScanProgress`，数据变化经 `onChange`（订阅随插件卸载回收）。宿主在插件首次调用后才开始后台扫描，约 10 分钟无调用即停止。
+  - `prices()` / `updatePrices()`：内置 LiteLLM 价格快照，`updatePrices` 下载公开价格表（只下载，10 分钟冷却），应只在用户开启自动更新或显式操作时调用。价格匹配只剥离推理强度、`thinking`、`latest` 等同一模型的模式后缀，`-turbo` / `-pro` / `-mini` 这类不同型号查不到就记为未知价格。费用是估算：不区分 1 小时缓存写入与长上下文价格档。
+- 新增权限 `limits.read` 与 `ctx.limits.get({ providers?, refresh? })`：Claude / Codex 订阅限额窗口（5 小时、每周、模型级周窗口、额外用量）。宿主只读本机 CLI 的登录状态、只请求厂商官方接口，不刷新、不改写任何凭据，插件拿不到凭据；缓存 60 秒，`refresh` 20 秒内重复调用仍复用上次结果；429 按 1 → 2 → 5 → 10 分钟退避并保留上次数据；只有 401 视为登录过期（Codex 的 403 多为 Cloudflare 质询，报错误而非过期）。
+- 两组接口都在 Rust 侧按已安装 manifest 与启用状态再校验一次（`require_grant`）。
+- 宿主同步删除了「设置 → 用量」页与记账逻辑；旧 `usage_ledger` 表停写并改名为 `usage_ledger_legacy` 保留（数据可恢复，后续版本再删）。用量界面改由插件（`usage-limits`）提供。
+- `contract-check.ts` 补齐新增类型与 `usage` / `limits` 能力组的双向断言与 key 对齐。
+
 ## 0.3.22 — 2026-10-26
 
 - 新增权限 `ui:worktree-badge` 与 `ctx.ui.registerWorktreeBadges(def)`：把一块标签推到侧栏「WORKTREES」子行上，返回 `WorktreeBadgeHandle`。

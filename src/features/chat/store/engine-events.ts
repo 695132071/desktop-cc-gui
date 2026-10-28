@@ -45,7 +45,6 @@ import {
   type AskLoop,
 } from "./ask-loop";
 import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
-import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
 import type {
   RegisteredInternalMessageCapture,
 } from "@/features/plugins/runtime/hooks";
@@ -1063,12 +1062,6 @@ function onSession(
   );
 }
 
-/** Runs whose turn already wrote ledger rows report by report. Every report
- *  is one model response, so each lands in the ledger the moment it arrives —
- *  a codex turn that chats for an hour has to show up while it runs, not when
- *  it ends — and `done` must not write the same tokens again. */
-const liveLedgerRuns = new Set<string>();
-
 /** Running token totals for the reply in flight, keyed by run. `usage` keeps
  *  the newest report (the context meter needs occupancy, not a sum), while
  *  the tail indicator and the settled row show this total: what the reply has
@@ -1077,7 +1070,6 @@ const turnUsageTotals = new Map<string, ParsedUsage>();
 /** Drop a run's usage bookkeeping (settled, interrupted, or swept). */
 export function dropRunUsage(runId: string) {
   turnUsageTotals.delete(runId);
-  liveLedgerRuns.delete(runId);
 }
 
 /** Drop every trace of runs the orphan sweep reaped: their usage maps here
@@ -1132,7 +1124,6 @@ function onUsage(
     usage: mergeUsage(event.data, prev),
     ...(totals ? { turnUsage: usageSnapshot(totals) } : {}),
   });
-  if (parsed) recordUsageReport(deps, event, key, parsed);
 }
 
 /** Fold one report into its run's running total. */
@@ -1162,47 +1153,6 @@ function usageSnapshot(totals: ParsedUsage): Record<string, number> {
     cache_creation_input_tokens: totals.cacheWrite,
     ...(totals.contextWindow ? { model_context_window: totals.contextWindow } : {}),
   };
-}
-
-/** Ledger one engine report (one request) as it arrives. */
-function recordUsageReport(
-  deps: EngineEventDeps,
-  event: ChatEngineEvent,
-  key: string,
-  parsed: ParsedUsage,
-) {
-  if (!usageTrackingEnabled()) return;
-  liveLedgerRuns.add(event.runId);
-  writeUsageRow(deps, event, key, parsed, 1);
-}
-
-/** Shared writer: one ledger row for the run's model and session. */
-function writeUsageRow(
-  deps: EngineEventDeps,
-  event: ChatEngineEvent,
-  key: string,
-  parsed: ParsedUsage,
-  reports: number,
-) {
-  const state = deps.get();
-  const tab = state.openTabs.find(
-    (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
-  );
-  void ipc
-    .usageRecord({
-      ts: Date.now(),
-      engine: event.engine,
-      model: stampedModel(deps, event.engine, key),
-      sessionId: event.sessionId ?? tab?.sessionId ?? null,
-      workspacePath: tab?.workspacePath ?? state.active?.workspacePath ?? null,
-      input: parsed.input,
-      output: parsed.output,
-      cacheRead: parsed.cacheRead,
-      cacheWrite: parsed.cacheWrite,
-      reports,
-      durationMs: null,
-    })
-    .catch(() => {});
 }
 
 function onError(
@@ -1813,10 +1763,6 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   dispatchNormalized(event, { status: cancelled ? "cancelled" : "completed" });
   finishRunLifecycle(event.runId, cancelled ? "cancelled" : "completed", undefined, event.sessionId);
   untrackRun(event.runId);
-  // Ledger the turn's tokens now that it is settled: the same report that
-  // stamps the row above, so the usage page counts real engine numbers. The
-  // feature's own switch gates it (localStorage-backed, see usage-tracking.ts).
-  recordTurnUsage(deps, event, key, finalUsage);
   // Native file changed; refresh list cache in background.
   void ipc.rescanSessions().catch(() => {});
   deps.markUnseenIfBackground(key);
@@ -1839,22 +1785,6 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
       }, 400);
     }
   }
-}
-
-/** Ledger the turn's own report when it never reported live (claude sends one
- *  usage payload, the turn's totals, on its result line). Turns that streamed
- *  reports already have their rows. */
-function recordTurnUsage(
-  deps: EngineEventDeps,
-  event: ChatEngineEvent,
-  key: string,
-  usage: unknown,
-) {
-  if (!usageTrackingEnabled()) return;
-  if (liveLedgerRuns.delete(event.runId)) return;
-  const parsed = parseUsage(usage);
-  if (!parsed) return;
-  writeUsageRow(deps, event, key, parsed, 1);
 }
 
 /** A CLI that kept running after `done` (a background task was pending) opened

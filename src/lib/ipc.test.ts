@@ -107,26 +107,6 @@ describe("ordered persistence commands", () => {
     ]);
   });
 
-  it("does not let an older usage record commit after a clear", async () => {
-    const entry = {
-      ts: 1,
-      engine: "omp",
-      model: null,
-      sessionId: "s1",
-      workspacePath: "/ws",
-      input: 1,
-      output: 2,
-      cacheRead: 0,
-      cacheWrite: 0,
-      durationMs: null,
-      reports: 1,
-    };
-    await expectCommittedInCallOrder([
-      { invoke: () => ipc.usageRecord(entry), command: "usage_record" },
-      { invoke: () => ipc.usageClear(), command: "usage_clear" },
-    ]);
-  });
-
   it("persists consecutive effort choices in selection order", async () => {
     await expectCommittedInCallOrder([
       { invoke: () => ipc.rememberSessionEffort("omp", "s1", "low"), command: "remember_session_effort" },

@@ -1080,36 +1080,6 @@ export interface WebAccessInfo {
   availableIps?: LanIpEntry[];
 }
 
-/** One finished turn as it enters the usage ledger. */
-export interface UsageEntryInput {
-  /** Epoch ms when the turn settled. */
-  ts: number;
-  engine: string;
-  model: string | null;
-  sessionId: string | null;
-  workspacePath: string | null;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  durationMs: number | null;
-  /** Model responses this turn reported (>= 1). */
-  reports: number;
-}
-
-/** Ledger totals for one (local day, engine, model) bucket. */
-export interface UsageRow {
-  /** Local "YYYY-MM-DD". */
-  day: string;
-  engine: string;
-  model: string;
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** Model responses in this bucket — the request total. */
-  requests: number;
-}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -2039,11 +2009,6 @@ export const ipc = {
   webAccessStatus: () => invoke<WebAccessInfo | null>("web_access_status"),
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
-  // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invokePersisted<void>("usage-ledger", "usage_record", { entry }),
-  usageSummary: (days: number, tzOffsetMinutes: number) =>
-    invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invokePersisted<void>("usage-ledger", "usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),

@@ -26,6 +26,8 @@ const BASE_LABELS: Record<string, string> = {
   "host:worktree": "hostWorktree",
   "host:window": "hostWindow",
   "host:models": "hostModels",
+  "usage.read": "usageRead",
+  "limits.read": "limitsRead",
   "network:none": "networkNone",
 };
 

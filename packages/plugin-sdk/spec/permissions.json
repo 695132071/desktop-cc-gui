@@ -30,6 +30,8 @@
     "host:worktree",
     "host:window",
     "host:models",
+    "usage.read",
+    "limits.read",
     "session.lifecycle.read",
     "runtime.events.read",
     "runtime.switch.observe",
