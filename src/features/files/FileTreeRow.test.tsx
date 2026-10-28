@@ -31,11 +31,13 @@ describe("TreeRow tree refresh", () => {
   let root: Root;
   const refreshTree = vi.fn(async () => {});
   const onToggleDir = vi.fn();
+  const onSelectDir = vi.fn();
   const onMention = vi.fn();
 
   beforeEach(() => {
     refreshTree.mockClear();
     onToggleDir.mockClear();
+    onSelectDir.mockClear();
     onMention.mockClear();
     useFilesStore.setState({ refreshTree });
     container = document.createElement("div");
@@ -57,7 +59,7 @@ describe("TreeRow tree refresh", () => {
           isRoot={isRoot}
           onToggleDir={onToggleDir}
           onOpenFile={() => {}}
-          onSelectDir={() => {}}
+          onSelectDir={onSelectDir}
           onContextMenu={() => {}}
           onMention={onMention}
           mentionLabel="添加到聊天"
@@ -90,5 +92,69 @@ describe("TreeRow tree refresh", () => {
     });
     expect(refreshTree).toHaveBeenCalledTimes(1);
     expect(onToggleDir).not.toHaveBeenCalled();
+  });
+
+  it("合并目录行展开整条路径，选择与路径操作指向末级目录", () => {
+    render({
+      ...childNode,
+      name: "src/features/files",
+      path: "/ws/desktop-cc-gui/src/features/files",
+      compactPaths: [
+        "/ws/desktop-cc-gui/src",
+        "/ws/desktop-cc-gui/src/features",
+        "/ws/desktop-cc-gui/src/features/files",
+      ],
+    }, false);
+    act(() => container.querySelector<HTMLButtonElement>("button")?.click());
+    expect(onSelectDir).toHaveBeenCalledWith("/ws/desktop-cc-gui/src/features/files");
+    expect(onToggleDir).toHaveBeenCalledWith([
+      "/ws/desktop-cc-gui/src",
+      "/ws/desktop-cc-gui/src/features",
+      "/ws/desktop-cc-gui/src/features/files",
+    ]);
+  });
+});
+
+describe("TreeRow git-ignored entries", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  function contentButton(node: VisibleNode): HTMLButtonElement | null {
+    act(() => {
+      root.render(
+        <TreeRow
+          node={node}
+          selected={false}
+          isRoot={false}
+          onToggleDir={() => {}}
+          onOpenFile={() => {}}
+          onSelectDir={() => {}}
+          onContextMenu={() => {}}
+          onMention={() => {}}
+          mentionLabel="添加到聊天"
+        />,
+      );
+    });
+    return container.querySelector<HTMLButtonElement>(`button[title="${node.path}"]`);
+  }
+
+  it("draws an ignored entry faded (icon, name and badge together)", () => {
+    const ignored = contentButton({ ...childNode, name: ".idea", path: "/ws/desktop-cc-gui/.idea", ignored: true });
+    expect(ignored?.className).toContain("opacity-50");
+  });
+
+  it("keeps regular entries at full strength", () => {
+    expect(contentButton(childNode)?.className).not.toContain("opacity-50");
   });
 });
