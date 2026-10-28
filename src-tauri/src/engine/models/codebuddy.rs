@@ -7,42 +7,7 @@ pub(super) async fn codebuddy_catalog(bin: &str) -> EngineCatalog {
     if let Ok(stdout) = run_probe(bin, &["--help"], "help").await {
         let mut models = parse_help_models(&stdout);
         if !models.is_empty() {
-            // Prioritize the user's configured default model within its group
-            if let Some(def) = &default_model {
-                let is_custom = def.starts_with("custom:");
-                if is_custom {
-                    let split_idx = models
-                        .iter()
-                        .position(|m| m.provider == "enterprise")
-                        .unwrap_or(models.len());
-                    if let Some(pos) = models[split_idx..].iter().position(|m| m.id == *def) {
-                        let item = models.remove(split_idx + pos);
-                        models.insert(split_idx, item);
-                    } else {
-                        models.push(EngineModel {
-                            id: def.clone(),
-                            name: Some(friendly_model_name(def)),
-                            provider: "enterprise".to_string(),
-                            description: None,
-                            context_window: None,
-                        });
-                    }
-                } else if let Some(pos) = models.iter().position(|m| m.id == *def) {
-                    let item = models.remove(pos);
-                    models.insert(0, item);
-                } else {
-                    models.insert(
-                        0,
-                        EngineModel {
-                            id: def.clone(),
-                            name: Some(friendly_model_name(def)),
-                            provider: infer_provider(def).to_string(),
-                            description: None,
-                            context_window: None,
-                        },
-                    );
-                }
-            }
+            lead_with_default(&mut models, default_model.as_deref());
             return EngineCatalog::authoritative(models);
         }
     }
@@ -53,6 +18,43 @@ pub(super) async fn codebuddy_catalog(bin: &str) -> EngineCatalog {
         authoritative: false,
         remote: false,
     }
+}
+
+/// Provider key for `custom:` (enterprise) models. The model panel titles
+/// this section through i18n and sinks it below the vendor sections.
+const ENTERPRISE_PROVIDER: &str = "enterprise";
+
+fn is_enterprise(id: &str) -> bool {
+    id.starts_with("custom:")
+}
+
+fn catalog_entry(id: &str) -> EngineModel {
+    EngineModel {
+        id: id.to_string(),
+        name: Some(friendly_model_name(id)),
+        description: None,
+        provider: if is_enterprise(id) {
+            ENTERPRISE_PROVIDER.to_string()
+        } else {
+            infer_provider(id).to_string()
+        },
+        context_window: None,
+    }
+}
+
+/// The CLI's configured default leads the catalog, enterprise or not: with
+/// nothing stored the picker pins `models[0]` and every send passes it as
+/// `--model`, so the first row must be what the CLI runs unprompted. Section
+/// order on screen is the panel's job (`orderModelGroups`), not the catalog's.
+fn lead_with_default(models: &mut Vec<EngineModel>, default_model: Option<&str>) {
+    let Some(def) = default_model else {
+        return;
+    };
+    let item = match models.iter().position(|m| m.id == def) {
+        Some(pos) => models.remove(pos),
+        None => catalog_entry(def),
+    };
+    models.insert(0, item);
 }
 
 fn codebuddy_config_dir() -> std::path::PathBuf {
@@ -113,23 +115,8 @@ pub fn parse_help_models(text: &str) -> Vec<EngineModel> {
             continue;
         }
 
-        let is_custom = id.starts_with("custom:");
-        let provider = if is_custom {
-            "enterprise".to_string()
-        } else {
-            infer_provider(id).to_string()
-        };
-        let name = friendly_model_name(id);
-
-        let model = EngineModel {
-            id: id.to_string(),
-            name: Some(name),
-            description: None,
-            provider,
-            context_window: None,
-        };
-
-        if is_custom {
+        let model = catalog_entry(id);
+        if is_enterprise(id) {
             enterprise_models.push(model);
         } else {
             public_models.push(model);
@@ -234,27 +221,7 @@ fn fallback_catalog(default_model: Option<&str>) -> Vec<EngineModel> {
             context_window: Some(128_000),
         },
     ];
-    if let Some(def) = default_model {
-        if !models.iter().any(|m| m.id == def) {
-            let is_custom = def.starts_with("custom:");
-            let item = EngineModel {
-                id: def.to_string(),
-                name: Some(friendly_model_name(def)),
-                provider: if is_custom {
-                    "enterprise".to_string()
-                } else {
-                    infer_provider(def).to_string()
-                },
-                description: None,
-                context_window: None,
-            };
-            if is_custom {
-                models.push(item);
-            } else {
-                models.insert(0, item);
-            }
-        }
-    }
+    lead_with_default(&mut models, default_model);
     models
 }
 
@@ -291,13 +258,74 @@ mod tests {
             friendly_model_name("custom:vendor/glm-5.3"),
             "vendor/GLM 5.3"
         );
-        assert_eq!(
-            friendly_model_name("custom:glm-5.3"),
-            "GLM 5.3"
+        assert_eq!(friendly_model_name("custom:glm-5.3"), "GLM 5.3");
+        assert_eq!(friendly_model_name("custom:kimi-k3.1-pro"), "Kimi K3.1 Pro");
+    }
+
+    fn ids(models: &[EngineModel]) -> Vec<&str> {
+        models.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn duplicate_help_entries_collapse_to_one_row() {
+        let models = parse_help_models(
+            "Currently supported: (custom:glm-5.3, glm-5.3, custom:glm-5.3|glm-5.3)",
         );
-        assert_eq!(
-            friendly_model_name("custom:kimi-k3.1-pro"),
-            "Kimi K3.1 Pro"
+        assert_eq!(ids(&models), ["glm-5.3", "custom:glm-5.3"]);
+    }
+
+    #[test]
+    fn configured_enterprise_default_leads_the_catalog() {
+        // With nothing stored the picker pins `models[0]` and every send
+        // passes it as `--model`: an enterprise default sunk to its section
+        // made a fresh install run a public model instead.
+        let mut models = parse_help_models(
+            "Currently supported: (hy4-preview, glm-5.3, custom:glm-5.3, custom:kimi-k3.1-pro)",
         );
+        lead_with_default(&mut models, Some("custom:kimi-k3.1-pro"));
+        assert_eq!(
+            ids(&models),
+            [
+                "custom:kimi-k3.1-pro",
+                "hy4-preview",
+                "glm-5.3",
+                "custom:glm-5.3"
+            ]
+        );
+        assert_eq!(models[0].provider, "enterprise");
+    }
+
+    #[test]
+    fn unlisted_default_is_added_first_under_its_provider() {
+        let mut models = parse_help_models("Currently supported: (hy4-preview, custom:glm-5.3)");
+        lead_with_default(&mut models, Some("custom:vendor/glm-5.2"));
+        assert_eq!(models[0].id, "custom:vendor/glm-5.2");
+        assert_eq!(models[0].provider, "enterprise");
+        assert_eq!(models[0].name.as_deref(), Some("vendor/GLM 5.2"));
+
+        lead_with_default(&mut models, Some("deepseek-v4-pro"));
+        assert_eq!(models[0].id, "deepseek-v4-pro");
+        assert_eq!(models[0].provider, "deepseek");
+        assert_eq!(models.len(), 4);
+
+        lead_with_default(&mut models, None);
+        assert_eq!(models[0].id, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn fallback_catalog_leads_with_the_configured_default() {
+        let enterprise = fallback_catalog(Some("custom:glm-5.3"));
+        assert_eq!(enterprise[0].id, "custom:glm-5.3");
+        assert_eq!(enterprise[0].provider, "enterprise");
+        assert_eq!(enterprise.len(), 5);
+
+        // A default the fallback list already carries moves up (keeping its
+        // context window) instead of staying behind `hy4-preview`.
+        let listed = fallback_catalog(Some("glm-5.3"));
+        assert_eq!(listed[0].id, "glm-5.3");
+        assert_eq!(listed[0].context_window, Some(128_000));
+        assert_eq!(listed.len(), 4);
+
+        assert_eq!(fallback_catalog(None)[0].id, "hy4-preview");
     }
 }
