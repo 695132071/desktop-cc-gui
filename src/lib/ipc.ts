@@ -3,6 +3,34 @@ import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
 
+// Async Tauri commands can start out of call order. Preserve the caller's
+// order only where an older write would otherwise overwrite a newer choice.
+// Other resources and read commands remain independent.
+const persistenceTails = new Map<string, Promise<unknown>>();
+
+function invokePersisted<T>(
+  key: string,
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  const previous = persistenceTails.get(key) ?? Promise.resolve();
+  const result = previous.then(
+    () => invoke<T>(command, args),
+    () => invoke<T>(command, args),
+  );
+  // A failed request rejects its own caller, not every later write. Remove
+  // the tail once idle so session/plugin keys do not accumulate indefinitely.
+  const settled = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  persistenceTails.set(key, settled);
+  void settled.then(() => {
+    if (persistenceTails.get(key) === settled) persistenceTails.delete(key);
+  });
+  return result;
+}
+
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
 export interface SessionMeta {
@@ -1613,7 +1641,11 @@ export const ipc = {
   /** Remember the reasoning level a session ran, so reopening it — here, in
    *  another window, or on the phone — keeps that level. */
   rememberSessionEffort: (engine: string, sessionId: string, effort: string) =>
-    invoke<void>("remember_session_effort", { engine, sessionId, effort }),
+    invokePersisted<void>(`session-effort:${engine}\0${sessionId}`, "remember_session_effort", {
+      engine,
+      sessionId,
+      effort,
+    }),
   /** Remember the in-app channel a session ran, so reopening it keeps that
    *  channel without rewriting the CLI's own config file. */
   rememberSessionProvider: (engine: string, sessionId: string, providerId: string) =>
@@ -1904,9 +1936,9 @@ export const ipc = {
   pluginStorageGet: (id: string, key: string) =>
     invoke<unknown>("plugin_storage_get", { id, key }),
   pluginStorageSet: (id: string, key: string, value: unknown) =>
-    invoke<void>("plugin_storage_set", { id, key, value }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_set", { id, key, value }),
   pluginStorageDelete: (id: string, key: string) =>
-    invoke<void>("plugin_storage_delete", { id, key }),
+    invokePersisted<void>(`plugin-storage:${id}\0${key}`, "plugin_storage_delete", { id, key }),
   pluginWorkspaceMetadata: (pluginId: string, workspacePath: string) =>
     invoke<PluginWorkspaceMetadata>("workspace_metadata", { pluginId, workspacePath }),
   pluginDocumentStorageGetLocation: (pluginId: string) =>
@@ -2008,10 +2040,10 @@ export const ipc = {
   webAccessAvailableIps: () => invoke<LanIpEntry[]>("web_access_available_ips"),
   webAccessRotateToken: () => invoke<string>("web_access_rotate_token"),
   // usage ledger (settings 用量)
-  usageRecord: (entry: UsageEntryInput) => invoke<void>("usage_record", { entry }),
+  usageRecord: (entry: UsageEntryInput) => invokePersisted<void>("usage-ledger", "usage_record", { entry }),
   usageSummary: (days: number, tzOffsetMinutes: number) =>
     invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
-  usageClear: () => invoke<void>("usage_clear"),
+  usageClear: () => invokePersisted<void>("usage-ledger", "usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),
   dshHostStart: () => invoke<DshHostStatus>("dsh_host_start"),
