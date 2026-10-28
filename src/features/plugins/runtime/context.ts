@@ -14,6 +14,7 @@ import {
   panelTabRegistry,
   scopedPluginId,
   sessionMenuRegistry,
+  fileLinkMenuRegistry,
   settingsRegistry,
   statusBarRegistry,
   composerStatusRegistry,
@@ -25,6 +26,7 @@ import {
 } from "@ccgui/plugin-sdk";
 import type {
   AssetDirectoryGrant,
+  AssetFileGrant,
   Disposer,
   PluginAgentCatalogEntry,
   PluginEngineCatalog,
@@ -47,6 +49,7 @@ import { assertPluginEmitTopic, pluginBus } from "./events";
 import { setActiveComposerDraft } from "./composer-draft";
 import { dismissCenterSurfaces } from "@/features/chat/center-surfaces";
 import { addPluginWorkspace, listPluginWorkspaces, openPluginSession } from "./workspace-bridge";
+import { createWorktreeBadgeHandle } from "./worktree-badges";
 import { createPluginWorktree, removePluginWorktree } from "./worktree-bridge";
 import { interruptPluginChatRun, startPluginChatRun } from "./session-run-bridge";
 import { registerSessionSource } from "./session-source";
@@ -92,6 +95,7 @@ export interface PluginContextBackend extends PluginStorageBackend {
   bridgeInvoke(command: string, args: Record<string, unknown>): Promise<unknown>;
   workspaceMetadata(id: string): Promise<WorkspaceMetadata>;
   pickDirectory(title?: string): Promise<string | null>;
+  pickFile(title: string, filters: { name: string; extensions: string[] }[]): Promise<string | null>;
   documentStorageGetLocation(id: string): Promise<DocumentStorageLocationResponse>;
   documentStorageSelectLocation(
     id: string,
@@ -332,6 +336,16 @@ export function createPluginContext(
           "plugin_asset_grant_directory", { pluginId: id, path },
         )) as Promise<AssetDirectoryGrant>;
       },
+      async grantFile(options) {
+        requirePermission("assets:directory");
+        const title = options?.title ?? i18n.t("plugins.assetFilePickTitle");
+        const filters = options?.filters ?? [];
+        const path = await withAuthorizedHostInvoke(() => backend.pickFile(title, filters));
+        if (path === null) return null;
+        return withAuthorizedHostInvoke(() => backend.bridgeInvoke(
+          "plugin_asset_grant_file", { pluginId: id, path },
+        )) as Promise<AssetFileGrant>;
+      },
       async listDirectories() {
         requirePermission("assets:directory");
         return withAuthorizedHostInvoke(() => backend.bridgeInvoke(
@@ -461,6 +475,19 @@ export function createPluginContext(
           }),
         );
       },
+      registerFileLinkMenuItem(def) {
+        requirePermission("ui:file-link-menu");
+        return track(fileLinkMenuRegistry.register({
+          id: scopedPluginId(id, def.key),
+          label: (target) => runAsPlugin(() => def.label(target)),
+          icon: def.icon,
+          visible: def.visible
+            ? (target) => runAsPlugin(() => def.visible!(target))
+            : undefined,
+          run: (target) => runAsPlugin(() => def.run(target)),
+          order: def.order,
+        }));
+      },
       registerSessionMenuItem(def) {
         requirePermission("ui:session-menu");
         return track(
@@ -527,15 +554,38 @@ export function createPluginContext(
       },
       registerSidebarNav(def) {
         requirePermission("ui:sidebar-entry");
+        const badge = def.badge;
         return track(
           sidebarNavRegistry.register({
             id: scopedPluginId(id, def.key),
             label: def.label,
             icon: def.icon,
             order: def.order,
+            // 徽标 getter 在每次渲染时求值；插件抛错只让它的计数消失，
+            // 不能连带整条侧栏（同 ui:worktree-badge 的隔离策略）。
+            badge:
+              badge &&
+              (() => {
+                try {
+                  return runAsPlugin(badge);
+                } catch {
+                  return null;
+                }
+              }),
             onOpen: () => runAsPlugin(def.onOpen),
           }),
         );
+      },
+      registerWorktreeBadges(def) {
+        requirePermission("ui:worktree-badge");
+        return createWorktreeBadgeHandle({
+          pluginId: id,
+          sourceKey: scopedPluginId(id, def.key),
+          canReadWorkspaces: manifest.permissions.includes("host:workspace"),
+          order: def.order,
+          onClick: def.onClick,
+          track,
+        });
       },
       registerCenterTab(def) {
         requirePermission("ui:center-tab");

@@ -292,7 +292,12 @@ export function NativeTitleTooltip() {
     <div
       ref={tooltipRef}
       role="tooltip"
-      className="pointer-events-none fixed z-[130] w-max max-w-[min(360px,calc(100vw-32px))] rounded-lg border border-border-button-default bg-background-primary-default px-2 py-1 text-caption-1-medium text-text-secondary shadow-dropdown whitespace-pre-line break-words transition duration-150 ease-out starting:opacity-0 starting:scale-95 data-[placement=bottom]:origin-top data-[placement=top]:origin-bottom"
+      // react-aria-components 的弹层自带 z-index: 100000（实测；出处是 react-aria 的
+      // private/overlays/useOverlayPosition.js 里写死的 `zIndex: 100000`，不是 CSS
+      // 变量，所以这里只能取一个比它大的常数），而气泡原先用 z-[130]：只要气泡与弹层
+      // 重叠就被弹层盖住——弹层里的行（例如状态栏分支列表）悬停时提示完全看不见，
+      // 弹层外的元素却正常。气泡是 pointer-events-none 的临时浮层，必须压在所有弹层之上。
+      className="pointer-events-none fixed z-[100001] w-max max-w-[min(360px,calc(100vw-32px))] rounded-lg border border-border-button-default bg-background-primary-default px-2 py-1 text-caption-1-medium text-text-secondary shadow-dropdown whitespace-pre-line break-words transition duration-150 ease-out starting:opacity-0 starting:scale-95 data-[placement=bottom]:origin-top data-[placement=top]:origin-bottom"
       data-placement={visible.placement}
       style={{ left: visible.x, top: visible.y, transform }}
     >

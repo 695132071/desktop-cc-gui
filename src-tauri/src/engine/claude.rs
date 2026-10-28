@@ -21,6 +21,11 @@ pub struct ClaudeEngine {
     /// Post-compaction remaining context tokens from `compact_boundary` event,
     /// used to report accurate post-compaction usage instead of the turn's billing usage.
     compact_post_tokens: Mutex<Option<i64>>,
+    /// A `task_notification` with status `stopped` was just seen: a resumed
+    /// process stops its predecessor's background task and reports that as an
+    /// empty zero-turn `result` before it answers the new message. That result
+    /// ends nothing the user asked for.
+    stopped_task_result_pending: Mutex<bool>,
 }
 
 struct PendingTool {
@@ -37,6 +42,7 @@ impl ClaudeEngine {
             tool_names: Mutex::new(HashMap::new()),
             tool_paths: Mutex::new(HashMap::new()),
             compact_post_tokens: Mutex::new(None),
+            stopped_task_result_pending: Mutex::new(false),
         }
     }
 }
@@ -281,6 +287,18 @@ impl Engine for ClaudeEngine {
                             .unwrap_or_default();
                         out.push(EngineEvent::McpServers { servers, tools });
                     }
+                } else if subtype == Some("task_notification") {
+                    if value.get("status").and_then(Value::as_str) == Some("stopped") {
+                        if let Ok(mut lock) = self.stopped_task_result_pending.lock() {
+                            *lock = true;
+                        }
+                    }
+                } else if subtype == Some("background_tasks_changed") {
+                    let pending = value
+                        .get("tasks")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len);
+                    out.push(EngineEvent::BackgroundTasks { pending });
                 } else if subtype == Some("compact_boundary") {
                     if let Some(post_tokens) = value
                         .get("compactMetadata")
@@ -412,6 +430,23 @@ impl Engine for ClaudeEngine {
                 }
             }
             "result" => {
+                let stopped_task_result = self
+                    .stopped_task_result_pending
+                    .lock()
+                    .map(|mut lock| std::mem::take(&mut *lock))
+                    .unwrap_or(false);
+                if stopped_task_result
+                    && value.get("num_turns").and_then(Value::as_u64) == Some(0)
+                    && value.get("is_error").and_then(Value::as_bool) != Some(true)
+                    // Absent or blank: a CLI variant that omits `result` on
+                    // this bookkeeping line must not resurrect the old bug.
+                    && value
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map_or(true, |text| text.trim().is_empty())
+                {
+                    return;
+                }
                 // Structured fallback: the final result lists every denial
                 // of the turn. The frontend dedupes against the tool_result
                 // signal above (same path), so double-reporting is harmless.
@@ -1276,6 +1311,72 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Live wire: TaskCreate and TaskGet both answer with a `toolUseResult`
+    /// of `{task:{id,subject,...}}`. Only the creation names a new todo id;
+    /// reading a task must not patch the list (it used to reset it to pending).
+    #[test]
+    fn task_create_result_carries_the_id_and_task_get_patches_nothing() {
+        let engine = ClaudeEngine::new();
+        let start = |id: &str, name: &str| {
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                }
+            })
+            .to_string()
+        };
+        let answer = |id: &str, envelope: Value, text: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": { "content": [
+                    { "type": "tool_result", "tool_use_id": id, "content": text }
+                ]},
+                "toolUseResult": envelope
+            })
+            .to_string()
+        };
+        let result_todos = |out: &[EngineEvent]| {
+            out.iter()
+                .find_map(|e| match e {
+                    EngineEvent::Message { patch: true, result: Some(_), todos, .. } => Some(todos.clone()),
+                    _ => None,
+                })
+                .expect("expected a tool result patch")
+        };
+
+        let mut out = Vec::new();
+        engine.parse_line(&start("toolu_c", "TaskCreate"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_c",
+                serde_json::json!({"task": {"id": "1", "subject": "A"}}),
+                "Task #1 created successfully: A",
+            ),
+            &mut out,
+        );
+        let created = result_todos(&out).expect("TaskCreate result is a todo fact");
+        assert_eq!(created.items[0].id.as_deref(), Some("1"));
+        assert_eq!(created.items[0].content, "A");
+
+        out.clear();
+        engine.parse_line(&start("toolu_g", "TaskGet"), &mut out);
+        out.clear();
+        engine.parse_line(
+            &answer(
+                "toolu_g",
+                serde_json::json!({"task": {"id": "1", "subject": "A", "description": "",
+                    "status": "completed", "blocks": [], "blockedBy": []}}),
+                "Task #1: A\nStatus: completed\nDescription: ",
+            ),
+            &mut out,
+        );
+        assert!(result_todos(&out).is_none(), "TaskGet must not patch the todo list");
     }
 
     #[test]

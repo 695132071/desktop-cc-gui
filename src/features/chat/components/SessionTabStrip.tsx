@@ -94,8 +94,12 @@ interface SessionTabStripProps {
   onClose: (key: string) => void;
   /** Tab right-click menu entry: close every tab. Omit to hide the menu. */
   onCloseAll?: () => void;
-  /** Tab right-click menu entry: close every tab but the one in view. */
-  onCloseInactive?: () => void;
+  /** Tab right-click menu entry: close every tab but the target. */
+  onCloseInactive?: (targetKey?: string) => void;
+  /** Tab right-click menu entry: close all tabs to the left of the target tab. */
+  onCloseLeft?: (targetKey: string) => void;
+  /** Tab right-click menu entry: close all tabs to the right of the target tab. */
+  onCloseRight?: (targetKey: string) => void;
   closeLabel: string;
   /** Drag-reorder: dragged tab key dropped before/after a target tab key. */
   onReorder?: (draggedKey: string, targetKey: string, before: boolean) => void;
@@ -129,6 +133,8 @@ export function SessionTabStrip({
   onClose,
   onCloseAll,
   onCloseInactive,
+  onCloseLeft,
+  onCloseRight,
   closeLabel,
   onReorder,
   actions,
@@ -166,7 +172,10 @@ export function SessionTabStrip({
   const titlebarStyle = useTitlebarStyle();
   // 左侧红绿灯区：macOS 系统原生红绿灯 或 Windows 仿 mac 自绘按钮。
   const customControls = needsWindowControls(titlebarStyle);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; tab: SessionTabItem } | null>(null);
+  const handleShowTabMenu = useCallback((tab: SessionTabItem, position: { x: number; y: number }) => {
+    setMenu({ ...position, tab });
+  }, []);
   // "+" button right-click menu (新建会话 / 新建浏览器), separate anchor
   // state from the tab menu.
   const [newMenu, setNewMenu] = useState<{ x: number; y: number } | null>(null);
@@ -217,7 +226,7 @@ export function SessionTabStrip({
           dragged={dropTarget?.draggedKey === tab.key}
           dropBefore={dropTarget?.key === tab.key ? dropTarget.before : null}
           closeLabel={closeLabel}
-          onShowMenu={onCloseAll || onCloseInactive ? setMenu : undefined}
+          onShowMenu={handleShowTabMenu}
           onSelect={onSelect}
           onClose={onClose}
           onPointerDown={onReorder ? handleTabPointerDown(tab) : undefined}
@@ -240,8 +249,11 @@ export function SessionTabStrip({
       )}
       <TabStripContextMenu
         menu={menu}
+        tabs={tabs}
         onCloseAll={onCloseAll}
         onCloseInactive={onCloseInactive}
+        onCloseLeft={onCloseLeft}
+        onCloseRight={onCloseRight}
         onDismiss={() => setMenu(null)}
       />
       {newMenu && onNewBrowser && onNew && (

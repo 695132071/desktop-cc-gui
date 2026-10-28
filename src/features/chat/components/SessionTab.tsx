@@ -128,7 +128,7 @@ export function SessionTab({
   dropBefore: boolean | null;
   closeLabel: string;
   /** Right-click menu anchor; omitted when the strip has no tab menu. */
-  onShowMenu?: (position: { x: number; y: number }) => void;
+  onShowMenu?: (tab: SessionTabItem, position: { x: number; y: number }) => void;
   onSelect: (key: string) => void;
   onClose: (key: string) => void;
   onPointerDown?: (e: ReactPointerEvent<HTMLDivElement>) => void;
@@ -142,7 +142,7 @@ export function SessionTab({
       onContextMenu={(e) => {
         if (!onShowMenu) return;
         e.preventDefault();
-        onShowMenu({ x: e.clientX, y: e.clientY });
+        onShowMenu(tab, { x: e.clientX, y: e.clientY });
       }}
       className={cx(
         "group relative flex h-7 max-w-48 shrink-0 cursor-default items-center gap-1.5 rounded-lg px-2.5 text-body-medium transition-colors",

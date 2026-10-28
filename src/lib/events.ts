@@ -24,7 +24,10 @@ export interface EngineEventPayload {
     | "model"
     | "effort"
     | "launch"
-    | "served";
+    | "served"
+    /** The CLI opened a follow-up turn on its own after `done` (a background
+     *  task finished): reopen the settled run. Carries no data. */
+    | "turn_resumed";
   data: unknown;
   /** Emit-side timestamp (Unix ms), stamped in TurnState::push. Absent from
    *  payloads produced before SDK 0.3.8. */

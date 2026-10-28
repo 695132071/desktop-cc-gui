@@ -113,6 +113,57 @@ describe("Markdown markdownRegistry merge (plan §4.2 #5)", () => {
   });
 });
 
+describe("large document rendering", () => {
+  const largeText = Array.from(
+    { length: 320 },
+    (_, i) => `## 段${i}\n\n内容 ${"字".repeat(40)} **粗体${i}**`,
+  ).join("\n\n");
+  async function settleLargeRender() {
+    // The plain snapshot paints first, then a transition mounts the chunks.
+    for (let i = 0; i < 5; i += 1) {
+      await act(async () => {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, 30);
+        await promise;
+      });
+    }
+  }
+
+  it("mounts a settled historical large reply (>16k chars) progressively after a plain-text first paint", async () => {
+    expect(largeText.length).toBeGreaterThan(16_000);
+    expect(largeText.length).toBeLessThan(24_000);
+    await renderMarkdown(largeText);
+    // First paint stays plain text so opening a historical session never blocks input.
+    expect(container.querySelectorAll(".md-chunk")).toHaveLength(0);
+    expect(container.querySelectorAll("strong")).toHaveLength(0);
+
+    await settleLargeRender();
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).toContain("粗体319");
+    expect(container.textContent).not.toContain("**粗体319**");
+  });
+
+  it("keeps a large live reply formatted as memoized Markdown chunks during streaming and on settle", async () => {
+    await act(async () => {
+      root.render(<Markdown text={largeText} workspacePath="/ws" streaming />);
+    });
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).toContain("粗体319");
+    expect(container.textContent).not.toContain("**粗体319**");
+
+    // Settling a live stream must keep all formatted chunks mounted immediately
+    // without flashing back to plain text on the settle commit.
+    await act(async () => {
+      root.render(<Markdown text={largeText} workspacePath="/ws" />);
+    });
+    expect(container.querySelectorAll(".md-chunk").length).toBeGreaterThan(1);
+    expect(container.querySelectorAll("strong").length).toBe(320);
+    expect(container.textContent).not.toContain("**粗体319**");
+  });
+});
+
 describe("math rendering", () => {
   it("typesets inline math instead of leaving the source literal", async () => {
     await renderMarkdown("能量守恒 $E = mc^2$ 收尾");

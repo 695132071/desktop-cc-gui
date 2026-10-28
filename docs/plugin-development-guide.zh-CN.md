@@ -250,6 +250,7 @@ interface PluginContext {
     registerOverlay(d: Omit<OverlayDef, "id"> & { key?: string }): Disposer;
     registerCommand(d: CommandDef): Disposer;
     registerSessionMenuItem(d: Omit<SessionMenuItemDef, "id"> & { key?: string }): Disposer;
+    registerFileLinkMenuItem(d: Omit<FileLinkMenuItemDef, "id"> & { key?: string }): Disposer; // 聊天文件链接右键（0.3.23 起）
     openSettings(key?: string): void; // 跳转到本插件设置页（0.3.6 起）
     registerMarkdownRenderer(d: MarkdownRendererDef): Disposer;
     registerPage(d: PageDef): Disposer;
@@ -290,7 +291,8 @@ interface PluginContext {
 |---|---|---|
 | `usage://updated` | 完整 EngineEventPayload `{ runId, sessionId, engine, seq, kind: "usage", data, ts?, genMs? }`；`data` 为引擎原始 usage JSON（字段因引擎而异，如 claude 的 `cache_read_input_tokens`、codex 的 `cached_input_tokens`、pi/omp 的 `cacheRead`）；`ts` 为宿主发射时刻 Unix 毫秒（SDK 0.3.8 起）；`genMs` 为宿主实测的生成窗口毫秒（SDK 0.3.15 起，仅 `usage`/`done` 事件携带，工具执行与等待不计入） | `events` |
 | `usage://done`（SDK 0.3.8 起） | 同上形状，`kind: "done"`；`data.usage` 携带该轮最终用量——claude/grok 等不发独立 usage 事件的引擎只经此上报，其它引擎用作轮结束信号；`genMs` 为该轮生成窗口合计 | `events` |
-| `session://activated`（SDK 0.3.8 起） | `{ engine, sessionId }`；pending 标签 `sessionId` 为 null，无活动标签两者皆 null | `events` |
+| `session://activated`（SDK 0.3.8 起；`provider` / `model` 自 0.3.24 起） | `{ engine, sessionId, provider, model }`；`provider` 为会话所用渠道 id，引擎使用自身配置时为 null；`model` 为输入框显示的模型（picker 选择器如 `deepseek/deepseek-flash`，或引擎回报的实际模型），CLI 默认且无记录时为 null；pending 标签 `sessionId` 为 null，无活动标签全为 null | `events` |
+| `session://selection-changed`（SDK 0.3.24 起） | 当前会话的 `provider` / `model` 变化：输入框选择、设置页改默认渠道、历史加载出会话模型、其他窗口修改、引擎回报实际模型都会触发，同值不重发；切换会话只发 `session://activated`。payload 同上，`session://activated` 的保留值同步更新 | `events` |
 | `composer://draft` | `{ text }`；草稿变化/清空/会话切换均发射 | `events` |
 
 SDK 0.4.2 起，`RuntimeSwitchEvent` 包含必填 `switchId`，同一次启动的 `beforeSwitch` 与 `afterSwitch` 共享此身份。插件应同时核对切换身份与原生命周期，不能让停用前的迟到完成覆盖重新启用后的切换状态。
@@ -302,6 +304,10 @@ SDK 0.4.2 起，`RuntimeSwitchEvent` 包含必填 `switchId`，同一次启动�
 `ctx.ui.registerWorkspaceMenuItem`（权限 `ui:workspace-menu`）的 `label`、`visible` 和 `onSelect` 接收右键目标 `{ workspaceId, archived }`，不是当前活动工作区。菜单项应绑定用户看到的动作，避免异步保存完成后把旧的“停用”选择反转成“启用”。返回的 Disposer 及插件卸载均会移除菜单项。
 
 `ctx.ui.registerSessionMenuItem`（权限 `ui:session-menu`，0.3.5 起）向侧栏会话右键菜单追加行；`run` 接收打开菜单的目标会话 `{ engine, sessionId }`，`label` 是随语言切换重新求值的函数。它与工作区菜单是独立的扩展点。`ctx.ui.openSettings(key?)`（复用权限 `ui:settings-section`，0.3.6 起）跳转到本插件设置页；`key` 对应 `registerSettingsSection` 的子 key，省略时打开主 section。SDK 0.4.1 同时保留这两项能力和工作区菜单。
+
+`ctx.ui.registerFileLinkMenuItem({ key?, label(target), icon?, visible?(target), run(target), order? })`（权限 `ui:file-link-menu`，0.3.23 起）向聊天消息里文件链接的右键菜单追加行。宿主把插件项放在「打开文件」「在浏览器中打开」（仅 HTML）之后、所选外部编辑器之前；`order` 只在插件项之间排序，同序再按 scoped id。`target` 是冻结快照 `{ path, resolvedPath, workspacePath }`：`path` 为消息里的原始链接文本（可能带 `:12` 行号），`workspacePath` 为该消息所在会话的工作区，不是当前编辑器或活动工作区。不可解析的链接（`~/`、`../`）插件项可见但禁用；点击后宿主按「打开文件」同一链路重新解析，只在得到非 null 路径时调用 `run`，解析沿用候选路径回退，不保证文件存在。`label` 必须返回非空字符串；`label`/`visible` 抛错、`run` 抛错或 Promise 拒绝都只影响本插件项，图标包在 PluginBoundary 内。返回的 Disposer 及插件卸载均会移除菜单项，解析期间被卸载或同 key 重新注册的旧回调不再派发。同一插件注册多项时各给一个 `key`，否则后注册的会覆盖前一项（都落在 `plugin:<id>`）。
+
+注意两点：`label`/`visible` 在每次打开菜单时求值，用户不点该项插件也会收到被右键的路径与会话工作区路径，不要把它们记录或外传；web 访问模式下插件项照常显示而动作在宿主机执行，需要时在 `visible` 里用 `ctx.host.isWeb` 隐藏。本接口不带任何应用或进程能力，启动外部应用仍须声明并使用 `exec:<bin>` bridge。依赖它的插件声明 `sdkVersion: ">=0.3.23"`：0.3.22 宿主（1.1.8）没有该接口。
 
 `ctx.documentStorage` 是 `ctx.storage` KV 之外的受控 UTF-8 文档存储：根目录固定隔离在 `<所选位置>/plugin-data/<plugin-id>/`，路径必须相对且不能逃逸；`writeTextAtomic(path, content, expectedVersion)` 使用不透明版本做 CAS，`expectedVersion: null` 表示要求文件尚不存在。`selectLocation('custom')` 由宿主打开目录选择器；SDK 不接受插件提供的路径，IPC 边界另对敏感根做纵深防护（`$HOME` 本身、文件系统根、`.ssh`/`.aws`/`.gnupg`/`.ccgui-next` 及其祖先一律拒绝）。该黑名单不是与选择器结果的加密绑定：绕过 SDK 直接调用 IPC 提交路径属审核违规，宿主不承诺拦截任意非黑名单目录。
 
@@ -331,11 +337,17 @@ SDK 0.4.2 起，`RuntimeSwitchEvent` 包含必填 `switchId`，同一次启动�
 
 ```ts
 interface AssetDirectoryGrant { grantId: string; path: string }
+interface AssetFileGrant extends AssetDirectoryGrant { relativePath: string }
+interface AssetFilePickerOptions {
+  title?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
 interface PluginAssets {
   bundleUrl(relativePath: string): string;
   documentUrl(relativePath: string): string;
   remoteUrl(url: string): string;
   grantDirectory(): Promise<AssetDirectoryGrant>;
+  grantFile(options?: AssetFilePickerOptions): Promise<AssetFileGrant | null>;
   listDirectories(): Promise<AssetDirectoryGrant[]>;
   revokeDirectory(grantId: string): Promise<void>;
   directoryUrl(grantId: string, relativePath: string): string;
@@ -346,6 +358,7 @@ interface PluginAssets {
 - `documentUrl`：权限 `plugin.storage`，始终解析到本插件当前选择的 documentStorage 根。写入仍走原有 CAS 文档接口。
 - `remoteUrl`：只接受无用户名/密码的 HTTP(S) URL；复用精确 `network:<host>[:port或范围]` 授权，子域不会自动获得权限。远程重定向的每个目标也必须已授权。没有运行时动态域名授权。
 - `grantDirectory` / `listDirectories` / `revokeDirectory` / `directoryUrl`：权限 `assets:directory`；选择器只能由明确用户操作触发，不能在插件激活期弹出。取消选择会 reject。每插件最多 16 个目录，重复选同一规范目录复用 grant；授权不会放开宿主的通用文件访问。路径用 `/` 分隔且相对于授权根，不能带绝对路径、`.` 或 `..` 段。IPC 边界复核与 documentStorage 同一份敏感目录黑名单（资产协议 deny 基线）；同上是纵深防护而非选择器结果的加密绑定，绕过 SDK 直接提交路径属审核违规。
+- `grantFile(options?)`（SDK ≥ 0.3.21）：权限 `assets:directory`，从用户操作打开文件选择器，成功后**授权整个父目录**并返回 `{ grantId, path, relativePath }`；`path` 是规范父目录，`relativePath` 是选中文件名，可直接传入 `directoryUrl`。取消返回 `null`、不授权；选择器和路径校验错误会 reject。`title` 可自定义，须说明父目录读取授权；`filters` 是文件类型筛选，不是内容校验或授权边界。默认标题明确父目录授权，未提供筛选时可选择任意普通文件。后端在探测前检查插件状态 / 权限，并拒绝不存在的文件、目录、敏感父目录以及符号链接 / reparse 路径；目录上限、去重与撤权与 `grantDirectory` 共用。Web 无宿主原生对话框，输入的是**宿主绝对文件路径**，不是浏览器本地上传。
 - `ctx.shell.revealPath(path)`：只在文件管理器中定位真实存在的本插件 documentStorage 路径或已授权目录内路径；分别要求 `plugin.storage` / `assets:directory`。不提供任意文件打开、进程启动或目录外探测能力。
 
 返回的 URL 可用于 `fetch`、图片、音频及描述文件的相对依赖加载；资源内容按字节传递，不经文本或 base64 转换。桌面使用 `pluginasset` 协议，Web 使用带鉴权路径前缀的宿主路由，因此相对资源请求仍携带凭据；这些 URL 是临时能力地址，不应记录到日志或分享给外部站点。
@@ -361,7 +374,7 @@ interface PluginAssets {
 | 权限 | 能力 | 审核强度 |
 |---|---|---|
 | `storage` | 使用 `ctx.storage` KV | 低 |
-| `ui:*`（`ui:settings-section`、`ui:add-menu`、`ui:composer-status`、`ui:panel-tab`、`ui:status-bar`、`ui:page`、`ui:command`、`ui:markdown`、`ui:timeline-row`、`ui:workspace-menu`、`ui:session-menu`） | 对应 UI 扩展点；`registerComposerSlot` 与 `registerComposerStatusItem` 共享 `ui:composer-status`，`openSettings` 复用 `ui:settings-section` | 低 |
+| `ui:*`（`ui:settings-section`、`ui:add-menu`、`ui:composer-status`、`ui:panel-tab`、`ui:status-bar`、`ui:page`、`ui:command`、`ui:markdown`、`ui:timeline-row`、`ui:workspace-menu`、`ui:session-menu`、`ui:file-link-menu`、`ui:sidebar-entry`、`ui:center-tab`、`ui:worktree-badge`） | 对应 UI 扩展点；`registerComposerSlot` 与 `registerComposerStatusItem` 共享 `ui:composer-status`，`openSettings` 复用 `ui:settings-section`。`ui:worktree-badge` 只推文字/颜色/纯文本 tooltip，渲染由宿主负责；`ui:file-link-menu` 的 `label`/`visible` 每次打开菜单都会收到被右键的文件路径与会话工作区路径 | 低 |
 | `ui:overlay` | 常驻视口悬浮内容；不得遮挡宿主关键操作 | 中 |
 | `assets:bundle` | 读取本插件包内二进制资源和已审核脚本 | 中 |
 | `assets:directory` | 用户选择的每插件只读目录与范围内 reveal | 高（必须明确告知目录范围） |
