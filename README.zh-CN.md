@@ -285,9 +285,11 @@ perf(chat): reveal streamed text per frame without reparsing markdown
 ## 怎么提交你的代码（贡献流程）
 
 1. **Fork** 本仓库，clone 到本地。
-2. 从 `main` 切一个分支，名字按 `feat/xxx`、`fix/xxx` 这种风格起。
+2. 从版本号最高的 **`vX.Y.Z` 开发分支**切一个分支，名字按 `feat/xxx`、`fix/xxx` 这种风格起。
 3. 改代码，本地把 `pnpm build` + `pnpm test` 跑绿。
-4. 提 PR 到本仓库的 **`main` 分支**。标题按 commit 格式写，描述里说清楚：改了什么、为什么改、怎么验证的。
+4. 提 PR 到这个 **`vX.Y.Z` 分支**（不要提到 `main`，`main` 只接收发版合并）。标题按 commit 格式写，描述里说清楚：改了什么、为什么改、怎么验证的。
+
+完整的分支规则、自测清单和 PR 要求见 [CONTRIBUTING.md](CONTRIBUTING.md)；安全问题请按 [SECURITY.md](SECURITY.md) 私密报告。
 
 不知道从哪下手？看看 [Issues](https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues)，挑一个感兴趣的开干。发现 Bug 或有新点子，也欢迎直接开 Issue 聊。
 

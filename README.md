@@ -287,9 +287,11 @@ No emoji in commit messages, and no AI-generated signatures.
 ## Submitting your code (contribution flow)
 
 1. **Fork** the repo and clone it locally.
-2. Branch off `main`, named like `feat/xxx` or `fix/xxx`.
+2. Branch off the **`vX.Y.Z` development branch** with the highest version number, named like `feat/xxx` or `fix/xxx`.
 3. Make your changes and get `pnpm build` + `pnpm test` green locally.
-4. Open a PR against this repo's **`main` branch**. Title in commit format; in the description, explain what changed, why, and how you verified it.
+4. Open a PR against that **`vX.Y.Z` branch** (not `main`, which only receives release merges). Title in commit format; in the description, explain what changed, why, and how you verified it.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full branch rules, checks and PR expectations, and [SECURITY.md](SECURITY.md) for reporting security issues privately.
 
 Not sure where to start? Browse the [Issues](https://github.com/zhukunpenglinyutong/desktop-cc-gui/issues) and pick one that interests you. Found a bug or have an idea? Open an issue and let's talk.
 
