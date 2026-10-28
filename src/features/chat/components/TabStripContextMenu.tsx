@@ -17,7 +17,7 @@ import type { SessionTabItem } from "./SessionTab";
 
 /**
  * Tab right-click context menu offering:
- * - Batch close actions: Close Inactive, Close Left, Close Right, Close All
+ * - Batch close actions: Close Others, Close Left, Close Right, Close All
  * - Conversation split actions (for session tabs): Split Right, Split Down, Unsplit
  * - File actions (for file tabs): Copy Path, Send Path to Composer, Reveal in Explorer/Finder
  */
@@ -64,12 +64,10 @@ export function TabStripContextMenu({
       id: "close-inactive",
       label: t("chat.closeInactiveTabs"),
       icon: <CircleX className="size-4" aria-hidden />,
-      disabled: tabs.length <= 1,
-      onSelect: () => {
-        const latestIndex = tabs.findIndex((item) => item.key === targetTab.key);
-        if (latestIndex < 0) return;
-        onCloseInactive(targetTab.key);
-      },
+      // A target missing from `tabs` would leave nothing to keep, so the
+      // entry greys out like Close Left / Close Right do.
+      disabled: targetIndex < 0 || tabs.length <= 1,
+      onSelect: () => onCloseInactive(targetTab.key),
     });
   }
   if (onCloseLeft) {
@@ -78,11 +76,7 @@ export function TabStripContextMenu({
       label: t("chat.closeLeftTabs"),
       icon: <ArrowLeftToLine className="size-4" aria-hidden />,
       disabled: targetIndex <= 0,
-      onSelect: () => {
-        const latestIndex = tabs.findIndex((item) => item.key === targetTab.key);
-        if (latestIndex <= 0) return;
-        onCloseLeft(targetTab.key);
-      },
+      onSelect: () => onCloseLeft(targetTab.key),
     });
   }
   if (onCloseRight) {
@@ -91,11 +85,7 @@ export function TabStripContextMenu({
       label: t("chat.closeRightTabs"),
       icon: <ArrowRightToLine className="size-4" aria-hidden />,
       disabled: targetIndex < 0 || targetIndex >= tabs.length - 1,
-      onSelect: () => {
-        const latestIndex = tabs.findIndex((item) => item.key === targetTab.key);
-        if (latestIndex < 0 || latestIndex >= tabs.length - 1) return;
-        onCloseRight(targetTab.key);
-      },
+      onSelect: () => onCloseRight(targetTab.key),
     });
   }
   if (onCloseAll) {
