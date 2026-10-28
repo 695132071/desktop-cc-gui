@@ -396,7 +396,9 @@ export const en: Messages = {
     checkUnknownAria: "Response verification: unable to verify",
     checkUnreported: "Not reported",
     checkMismatch: "Mismatch",
+    checkSnapshot: "Different build",
     checkOkAria: "Response check: matches the response",
+    checkSnapshotAria: "Response check: different build version",
     checkMismatchAria: "Response check: differs from the response",
   },
   settings: {

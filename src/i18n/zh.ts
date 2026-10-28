@@ -381,7 +381,9 @@ export const zh = {
     checkUnknownAria: "响应校验：无法确认",
     checkUnreported: "未上报",
     checkMismatch: "不一致",
+    checkSnapshot: "构建版本不同",
     checkOkAria: "响应校验：与响应一致",
+    checkSnapshotAria: "响应校验：构建版本不同",
     checkMismatchAria: "响应校验：与响应不一致",
   },
   settings: {

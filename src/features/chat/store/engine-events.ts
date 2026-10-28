@@ -649,11 +649,17 @@ function selectionFields(event: ChatEngineEvent): {
 function onLaunch(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   const { model, effort } = selectionFields(event);
   if (!model && !effort) return;
-  const data = event.data as { comparisonModel?: string | null };
+  const data = event.data as {
+    comparisonModel?: string | null;
+    reportsServed?: unknown;
+  };
   const comparison =
     data.comparisonModel === undefined
       ? {}
       : { comparisonModel: data.comparisonModel };
+  // Only an explicit true: older hosts never send the flag, and their
+  // request-only check stays hidden as it always was.
+  const reportsServed = data.reportsServed === true ? { reportsServed: true } : {};
   if (model) applyModelDisplay(model, key, deps);
   if (effort) applyEffortDisplay(effort, key, deps);
   deps.set((s) => {
@@ -667,6 +673,7 @@ function onLaunch(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
           responseCheck: {
             requested: { model, effort, ...comparison },
             served: { model: null, effort: null },
+            ...reportsServed,
           },
         },
       },
@@ -696,7 +703,7 @@ function onServed(
         [key]: {
           ...cur,
           responseCheck: {
-            requested: prev.requested,
+            ...prev,
             served: {
               model: model ?? prev.served.model,
               effort: effort ?? prev.served.effort,

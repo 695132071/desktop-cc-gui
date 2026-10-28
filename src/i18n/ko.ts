@@ -378,7 +378,9 @@ export const ko: Messages = {
     checkUnknownAria: "응답 검증: 확인할 수 없음",
     checkUnreported: "보고되지 않음",
     checkMismatch: "불일치",
+    checkSnapshot: "빌드 버전 다름",
     checkOkAria: "응답 확인: 응답과 일치",
+    checkSnapshotAria: "응답 확인: 빌드 버전 다름",
     checkMismatchAria: "응답 확인: 응답과 불일치"
   },
   settings: {
